@@ -14,6 +14,7 @@ from rest_framework.response import Response
 
 from kairos.core.exceptions import NotFoundError, PolicyValidationError
 from kairos.core.idempotency import run_idempotent_write
+from kairos.core.models import AuditActorType, AuditLog
 from kairos.core.pagination import decode_cursor, encode_cursor, parse_limit
 from kairos.core.views import KairosAPIView
 from kairos.identity.authorization import is_operations, is_resource_admin
@@ -61,6 +62,30 @@ def _request_id(request: Request) -> str:
     return getattr(django_request, "request_id", "") or ""
 
 
+def _compute_changes(
+    before: dict[str, Any] | None, after: dict[str, Any] | None
+) -> dict[str, list[Any]]:
+    """Field-level diff between an audit row's `before_state`/`after_state`
+    snapshots (Spec v1.0 §5.3's `changes` shape). A full diff, not just a
+    status transition: Phase 7's edit changes `time_range` while leaving
+    `status` untouched entirely, so a history that only ever surfaced
+    status changes would show NOTHING for an edit event — the one thing
+    AUD-04's "full lifecycle reconstruction" actually needs to see. `None`
+    stands in for a genuinely absent side (insert has no before, delete has
+    no after), never a field's own null value, which the trigger stores as
+    JSON `null` inside the snapshot dict itself.
+    """
+    before = before or {}
+    after = after or {}
+    changed = {}
+    for field in before.keys() | after.keys():
+        old_value = before.get(field)
+        new_value = after.get(field)
+        if old_value != new_value:
+            changed[field] = [old_value, new_value]
+    return changed
+
+
 class BookingCollectionView(KairosAPIView):
     """POST /api/v1/bookings (Spec v1.0 §5.1) and GET /api/v1/bookings
     (Spec v1.0 §5.4) — the collection endpoint for both actions."""
@@ -98,6 +123,7 @@ class BookingCollectionView(KairosAPIView):
             endpoint="POST /api/v1/bookings",
             body=dict(request.data),
             request_id=request_id,
+            actor_type=AuditActorType.USER,
             perform_write=perform_write,
         )
 
@@ -249,6 +275,7 @@ class BookingDetailView(KairosAPIView):
             # genuinely different request.
             body={"booking_id": str(pk), **dict(request.data)},
             request_id=request_id,
+            actor_type=AuditActorType.USER,
             perform_write=perform_write,
         )
 
@@ -281,12 +308,22 @@ class BookingCancelView(KairosAPIView):
         serializer.is_valid(raise_exception=True)
         reason = serializer.validated_data["reason"]
 
+        # Self-cancel is a 'user' action; a resource-admin override is an
+        # 'admin' one (RFC v1.0 §12) — computed once, here, from the SAME
+        # is_owner the permission check and the reason-required validation
+        # above already used, not re-derived downstream.
+        actor_type = AuditActorType.USER if is_owner else AuditActorType.ADMIN
+
         request_id = _request_id(request)
 
         def perform_write() -> tuple[int, dict[str, Any]]:
             result = cancel_booking(
                 BookingCancelRequest(
-                    booking=booking, actor=user, reason=reason, request_id=request_id
+                    booking=booking,
+                    actor=user,
+                    actor_type=actor_type,
+                    reason=reason,
+                    request_id=request_id,
                 )
             )
             return status.HTTP_200_OK, dict(BookingResponseSerializer(result.booking).data)
@@ -301,6 +338,8 @@ class BookingCancelView(KairosAPIView):
             # body would misread as a replay across two different bookings.
             body={"booking_id": str(pk), **dict(request.data)},
             request_id=request_id,
+            actor_type=actor_type,
+            reason=reason,
             perform_write=perform_write,
         )
 
@@ -308,3 +347,60 @@ class BookingCancelView(KairosAPIView):
         if result.is_replay:
             response["Idempotent-Replay"] = "true"
         return response
+
+
+class BookingHistoryView(KairosAPIView):
+    """GET /api/v1/bookings/{id}/history (Spec v1.0 §5.3; PRD FR42)."""
+
+    def get(self, request: Request, pk: uuid.UUID) -> Response:
+        user = cast(AppUser, request.user)
+        try:
+            booking = Booking.objects.select_related("resource").get(id=pk)
+        except Booking.DoesNotExist as exc:
+            raise NotFoundError from exc
+
+        # Same permission model as GET (Spec v1.0 §5.3: "Permission: same
+        # as 5.2") — owner, resource admin, or operations; 404 otherwise,
+        # not 403, so a booking's existence isn't confirmed to someone
+        # without access to it.
+        is_owner = booking.user_id == user.id
+        if not (is_owner or is_resource_admin(user, booking.resource_id) or is_operations(user)):
+            raise NotFoundError
+
+        events = list(
+            AuditLog.objects.filter(entity_type="booking", entity_id=pk).order_by(
+                "occurred_at", "id"
+            )
+        )
+
+        # Resolved in ONE batched query, not per event (RFC v1.0 §7.2's
+        # N+1 guard, same principle Phase 6's availability view already
+        # applies) — display_name isn't stored on audit_log itself, only
+        # actor_id, so it has to be looked up separately regardless.
+        actor_ids = {e.actor_id for e in events if e.actor_id is not None}
+        display_names = dict(
+            AppUser.objects.filter(id__in=actor_ids).values_list("id", "display_name")
+        )
+
+        return Response(
+            {
+                "booking_id": str(pk),
+                "events": [
+                    {
+                        "occurred_at": e.occurred_at.isoformat().replace("+00:00", "Z"),
+                        "action": e.action,
+                        "actor": {
+                            "id": str(e.actor_id) if e.actor_id is not None else None,
+                            "display_name": (
+                                display_names.get(e.actor_id) if e.actor_id is not None else None
+                            ),
+                            "type": e.actor_type,
+                        },
+                        "reason": e.reason,
+                        "request_id": e.request_id,
+                        "changes": _compute_changes(e.before_state, e.after_state),
+                    }
+                    for e in events
+                ],
+            }
+        )

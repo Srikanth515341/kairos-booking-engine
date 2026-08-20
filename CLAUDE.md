@@ -42,22 +42,28 @@ kairos-booking-engine/
 │   ├── kairos/
 │   │   ├── settings/      # base.py, dev.py, test.py, prod.py — DRF + logging wired in (Phase 4)
 │   │   ├── core/           # constants.py, exceptions.py, drf.py, logging.py, middleware.py,
-│   │   │                   # db.py (write-path session settings), idempotency.py (Phase 5),
-│   │   │                   # models.py (IdempotencyKey — a real Django app since Phase 5),
+│   │   │                   # db.py (write-path session settings + audit actor propagation,
+│   │   │                   # ONE shared apply_write_path_session_settings — Phase 8),
+│   │   │                   # idempotency.py (Phase 5), models.py (IdempotencyKey since Phase 5,
+│   │   │                   # AuditLog since Phase 8), migrations/0002-0003 (audit_log table,
+│   │   │                   # kairos_app role + grants, write_audit_log() trigger — Phase 8),
 │   │   │                   # management/commands/cleanup_idempotency_keys.py
-│   │   ├── identity/       # app_user, resource_admin, authentication.py (# STUB, Phase 4),
+│   │   ├── identity/       # app_user, resource_admin (UUID surrogate PK since Phase 8 —
+│   │   │                   # was an implicit BigAutoField), authentication.py (# STUB, Phase 4),
 │   │   │                   # authorization.py (is_resource_admin/is_operations, Phase 6)
 │   │   ├── resources/      # resource, serializers.py, views.py, urls.py (list/detail/
 │   │   │                   # availability — Phase 6; writes are Phase 19)
 │   │   ├── bookings/       # booking, services.py (create/edit/cancel — Phase 7), serializers.py,
-│   │   │                   # views.py, urls.py
+│   │   │                   # views.py (BookingHistoryView — Phase 8), urls.py
 │   │   ├── urls.py, wsgi.py
 │   ├── tests/
 │   │   ├── test_booking_exclusion_smoke.py
 │   │   ├── test_schema_assertion.py   # RECON-05 CI form — fails if the predicate is narrowed
+│   │   ├── test_audit_trail.py        # AUD-01, AUD-02, grant/trigger-existence checks (Phase 8)
 │   │   ├── conftest.py                # app_user / active_resource fixtures, shared
 │   │   ├── bookings/                  # test_services.py, test_views.py, test_idempotency.py,
-│   │   │                              # test_read_endpoints.py (Phase 6), test_cancel_edit.py (Phase 7)
+│   │   │                              # test_read_endpoints.py (Phase 6), test_cancel_edit.py
+│   │   │                              # (Phase 7), test_history.py (AUD-03/04/05 — Phase 8)
 │   │   ├── resources/                 # test_views.py (Phase 6 — list/detail/availability)
 │   │   └── concurrency/               # Milestone 1 — the project's central proof
 │   │       ├── harness.py             # barrier-released, independent-connection harness
@@ -76,15 +82,25 @@ kairos-booking-engine/
 ```
 
 Endpoints live (Phase 6 added the read path, Phase 7 the remaining single-booking mutations,
-to Phase 4/5's write path): `POST`/`GET /api/v1/bookings`, `GET`/`PATCH /api/v1/bookings/{id}`,
-`POST /api/v1/bookings/{id}/cancel`, `GET /api/v1/resources`, `GET /api/v1/resources/{id}`,
+Phase 8 the history endpoint, to Phase 4/5's write path): `POST`/`GET /api/v1/bookings`,
+`GET`/`PATCH /api/v1/bookings/{id}`, `POST /api/v1/bookings/{id}/cancel`,
+`GET /api/v1/bookings/{id}/history`, `GET /api/v1/resources`, `GET /api/v1/resources/{id}`,
 `GET /api/v1/resources/{id}/availability`. Every mutation (create, edit, cancel) is idempotent
 (Phase 5/7 — `Idempotency-Key` is required; missing it is 400). Edit is owner-only, no admin
 override; cancel is owner-or-resource-admin, with a reason required for the admin-override
 case (400 otherwise). Cancelling an already-cancelled booking is a 200 no-op, independent of
 idempotency key. No real auth (Phase 9 — currently a dev-only `X-Dev-User-Id` header stub,
-clearly marked `# STUB` in `kairos/identity/authentication.py`). `backend/.venv/` is local and
-gitignored; recreate with `python -m venv .venv && pip install -e ".[dev]"` from `backend/`.
+clearly marked `# STUB` in `kairos/identity/authentication.py`).
+
+Every state transition on `booking`/`resource`/`resource_admin` is audited (Phase 8): the
+`write_audit_log()` trigger fires on every INSERT/UPDATE/DELETE against those three tables,
+unconditionally — including a raw SQL write that never touches the service layer at all.
+The RUNNING APPLICATION connects as `kairos_app`, a least-privilege role (ordinary DML on
+every app table; `INSERT`/`SELECT`-only, never `UPDATE`/`DELETE`, on `audit_log` — enforced
+by Postgres grants, not application code). Migrations still require the `kairos` superuser
+DSN (`kairos_app` deliberately has no DDL rights) — see "Running Locally" below.
+`backend/.venv/` is local and gitignored; recreate with
+`python -m venv .venv && pip install -e ".[dev]"` from `backend/`.
 
 ## Completed Phases
 
@@ -97,33 +113,42 @@ gitignored; recreate with `python -m venv .venv && pip install -e ".[dev]"` from
 | 4 | Service Layer & Booking Creation API | DRF wired up (`/api/v1`, JSON only); `POST /api/v1/bookings` live with policy validation (bookable hours, max duration, past-dating, 365-day horizon), stub `X-Dev-User-Id` auth, `X-Request-Id` on every response, structured JSON logging, and the Spec §6 error envelope on every error path; `BookingService.create_booking` catches all four write-path SQLSTATEs specifically (23P01→409, 55P03/40P01/57014→503+Retry-After); verified live against the real dev server (not just the test client); all Phase 2/3 tests still pass | Pending (on branch `phase-04-booking-creation-api`) |
 | 5 | Idempotency — The Transaction Boundary ⚠️ Subtle | `idempotency_key` table with a genuine composite `(user_id, key)` PRIMARY KEY (Django 6.1's `CompositePrimaryKey` — no surrogate-key workaround needed here, unlike Phase 2's `resource_admin`); `run_idempotent_write` (generic, in `core`, reused by every future write path) claims the key and runs the protected write in one transaction per RFC §11.2, recording a 409 outcome in its own follow-up transaction after rollback, and recording nothing at all for a 503 (outcome genuinely unknown); IDEM-01–04, 06 (100 reps), 09, 10, 11 all pass; verified live (replay returns the original booking, not a 409) | Pending (on branch `phase-05-idempotency`) |
 | 6 | Read Path & Availability View | `GET /bookings/{id}` (owner/admin/operations, else 404 per Spec §1) and `GET /bookings` (cursor pagination, `idx_booking_user_starts`-shaped, held rows always excluded); `GET /resources`, `GET /resources/{id}` (read-only; writes are Phase 19); `GET /resources/{id}/availability` bounded to 92 days, `booking_id`/`owner` omitted entirely (not nulled) unless the requester owns the booking or administers the resource, held slots never reveal them to anyone (SEC-05); keyset (not offset) pagination proven stable under a concurrent insert between page fetches; N+1 guard verified via `django_assert_max_num_queries`; all prior tests still green (see the `MAX_ROUND_ATTEMPTS` finding below) | Pending (on branch `phase-06-read-path-availability`) |
-| 7 | Cancellation & Editing | `PATCH /bookings/{id}` (owner only, evaluated against `no_overlapping_bookings` exactly as a create) and `POST /bookings/{id}/cancel` (owner or resource-admin override with a required reason, double-cancel idempotent at 200 regardless of idempotency key) — both share `_handle_write_database_error`'s SQLSTATE translation with create; the `transaction.on_commit()` waitlist-check stub registered inside cancel's nested atomic, correctly deferred to the outer (idempotency) transaction's commit; `BookingResponseSerializer` extended with `cancelled_at`/`cancelled_by`/`cancellation_reason`; idempotency fingerprints for both endpoints fold in `booking_id` (a real gap the body alone doesn't cover — see Key Technical Decisions); CONC-03 (edit-vs-create) and CONC-04 (edit-vs-edit), 10 runs each, loser verified unchanged at its original range. Also caught and fixed a real regression while doing this: Phase 5's session-settings fix had never actually been wired into `run_idempotent_write` — the key-claim INSERT was running with NO `lock_timeout` (proven via a spy test, then fixed, then proven fixed by reverting and watching the new test fail). Full suite (83 tests) green, including three concurrency runs back-to-back in one session | Pending (on branch `phase-07-cancel-edit`) |
+| 7 | Cancellation & Editing | `PATCH /bookings/{id}` (owner only, evaluated against `no_overlapping_bookings` exactly as a create) and `POST /bookings/{id}/cancel` (owner or resource-admin override with a required reason, double-cancel idempotent at 200 regardless of idempotency key) — both share `_handle_write_database_error`'s SQLSTATE translation with create; the `transaction.on_commit()` waitlist-check stub registered inside cancel's nested atomic, correctly deferred to the outer (idempotency) transaction's commit; `BookingResponseSerializer` extended with `cancelled_at`/`cancelled_by`/`cancellation_reason`; idempotency fingerprints for both endpoints fold in `booking_id` (a real gap the body alone doesn't cover — see Key Technical Decisions); CONC-03 (edit-vs-create) and CONC-04 (edit-vs-edit), 10 runs each, loser verified unchanged at its original range. Also caught and fixed a real regression while doing this: Phase 5's session-settings fix had never actually been wired into `run_idempotent_write` — the key-claim INSERT was running with NO `lock_timeout` (proven via a spy test, then fixed, then proven fixed by reverting and watching the new test fail). Full suite (83 tests) green, including three concurrency runs back-to-back in one session | Merged (PR #7) |
+| 8 | Audit Trail — Triggers & Grants ⚠️ Subtle | `audit_log` table + `write_audit_log()` trigger on `booking`/`resource`/`resource_admin`, firing unconditionally on every INSERT/UPDATE/DELETE — proven by a raw SQL write that never touches the service layer (AUD-02); a dedicated `kairos_app` database role holds ordinary DML on every app table but only `INSERT`/`SELECT` (never `UPDATE`/`DELETE`) on `audit_log`, enforced at the grant level and proven by actually connecting AS that role (AUD-01) — the RUNNING APPLICATION now connects as `kairos_app`, not the superuser, verified live via `manage.py runserver` and a full create→edit→cancel→history round trip over real HTTP; `app.actor_type`/`app.reason` propagate through the SAME shared `apply_write_path_session_settings` call as the write-path timeouts (not a second context manager), per explicit instruction after Phase 7's regression — verified by extending that exact regression test, not adding a parallel one; `GET /bookings/{id}/history` reconstructs full lifecycles via a genuine before/after field-level diff (`_compute_changes`), not just status transitions, since Phase 7's edit changes `time_range` while leaving `status` untouched — AUD-03(a)(b), AUD-04, AUD-05 all pass; AUD-03(d)'s "system-initiated write" has no real worker yet (Phase 16), so the underlying mechanism is proven directly instead. Three real bugs found and fixed via hands-on verification, not just passing tests: (1) `occurred_at` used `auto_now_add` (Python-side only) instead of a genuine `db_default`, so the trigger's raw INSERT — which never goes through Django's ORM — hit a NOT NULL violation; (2) `resource_admin`'s implicit `BigAutoField` surrogate PK couldn't satisfy the trigger's `COALESCE(NEW.id, OLD.id)` into `audit_log.entity_id UUID`, so it's now an explicit UUID PK like every other entity table; (3) `kairos_app` had no grant on Django's own `django_migrations` table, so the app failed to even START under the new role until caught by actually running `manage.py runserver`, not only the test suite. Full suite (96 tests) green | Pending (on branch `phase-08-audit-trail`) |
 
 ## Current Phase In Progress
 
-None. Phase 7 is complete pending review and merge. Phase 8 (Audit Trail — Triggers &
-Grants) is next.
+None. Phase 8 is complete pending review and merge. Phase 9 (Authentication & Scoped
+Authorization) is next.
 
 ## NOT Yet Built
 
 No real authentication (Phase 9 — `X-Dev-User-Id` is an explicitly marked stub), no
 Celery/Redis, no frontend, no hold reclamation (booking creation does not yet run the
 cleanup-on-write DELETE from Spec §4.1 step 2, since `held` rows don't exist until Phase 15),
-no `recurring_series`/`waitlist_entry`/`waitlist_offer`/`audit_log`/`system_check_run` tables
-(each arrives with the phase that needs it — see the Key Technical Decisions and Phase Index
-in `docs/06-implementation-plan.md`). No replica routing (Phase 30 — `data_freshness` is
-hardcoded `"primary"`, always true today since no replica exists). `GET /bookings/{id}/history`
-is Phase 8, along with the audit trail itself — Phase 7's cancel/edit produce no audit rows
-yet. The Phase 7 cancel endpoint's `on_commit()` hook only logs "would enqueue waitlist
-check" — the real worker dispatch is Phase 16, and there is no `waitlist_entry` table yet for
-anything to be eligible against. Resource CRUD (create/update/admin grants) is Phase 19 — the
-Phase 6 resource endpoints are read-only. IDEM-05 (recurring replay) needs Phase 12's
-endpoint; IDEM-07/08 (fault injection — process kill mid-transaction, proxy-level response
-drop) need tooling that arrives in Phase 28; idempotency coverage on waitlist join/offer
-confirm arrives with those endpoints (Phases 14, 16). `booking.series_id` does not exist
-yet — it cannot, since `recurring_series` (Phase 11) doesn't exist; it is added in Phase 11,
-not retrofitted early. CONC-01's full 100-run + N=500 escalation and CONC-06 (throughput
-characterization) are deferred to Phase 28/29 respectively; CI only runs the 10-run CI-tier
+no `recurring_series`/`waitlist_entry`/`waitlist_offer`/`system_check_run` tables (each
+arrives with the phase that needs it — see the Key Technical Decisions and Phase Index in
+`docs/06-implementation-plan.md`). No replica routing (Phase 30 — `data_freshness` is
+hardcoded `"primary"`, always true today since no replica exists). The audit trail covers
+`booking`/`resource`/`resource_admin` only — `waitlist_entry`/`waitlist_offer` triggers arrive
+with those tables (Phases 14/16), and `actor_type='unknown'` alerting (as opposed to just
+recording the row) is Phase 21. The Phase 7 cancel endpoint's `on_commit()` hook still only
+logs "would enqueue waitlist check" — the real worker dispatch is Phase 16, and there is no
+`waitlist_entry` table yet for anything to be eligible against; correspondingly, AUD-03(d)'s
+"system-initiated write" has no real worker to exercise yet (see Phase 8's row above — the
+underlying trigger mechanism is proven directly instead). Resource CRUD (create/update/admin
+grants) is Phase 19 — the Phase 6 resource endpoints are read-only, and no live code path
+writes `resource_admin` yet (Phase 8's `ResourceAdmin` rows in tests are created directly via
+the ORM, not through any endpoint). IDEM-05 (recurring replay) needs Phase 12's endpoint;
+IDEM-07/08 (fault injection — process kill mid-transaction, proxy-level response drop) need
+tooling that arrives in Phase 28; idempotency coverage on waitlist join/offer confirm arrives
+with those endpoints (Phases 14, 16). `booking.series_id` does not exist yet — it cannot,
+since `recurring_series` (Phase 11) doesn't exist; it is added in Phase 11, not retrofitted
+early. `kairos_app`'s password is a hardcoded dev-only literal (Phase 8, matching
+`infra/docker-compose.yml`'s own precedent) — Rollout (Phase 30) must replace it with a real
+managed secret before any deployment. CONC-01's full 100-run + N=500 escalation and CONC-06
+(throughput characterization) are deferred to Phase 28/29 respectively; CI only runs the
+10-run CI-tier
 reduction for every CONC test. The throwaway spike table `spike_booking` may still exist in
 `kairos_dev`, created/dropped repeatedly by `scripts/spike/common.py` — unrelated to the real
 schema. Do not assume any of the above exist in a fresh session — verify against this file
@@ -172,6 +197,11 @@ and `git log` first.
 | `_handle_write_database_error` (shared by create/edit/cancel) is typed to return `NoReturn` and is used uniformly across all three, even though cancel's UPDATE can never actually trigger SQLSTATE 23P01 | A partial EXCLUDE constraint only fires on rows satisfying its predicate (`status IN ('confirmed','held')`); cancel's UPDATE moves a row OUT of that set, so Postgres never evaluates the constraint against it. The branch is unreachable for cancel specifically, but keeping one shared function — rather than a cancel-specific subset — is what RFC v1.0 §17 asks for ("every future write path... gets consistent SQLSTATE translation... for free"), and an unreachable branch costs nothing | `kairos/bookings/services.py` |
 | `BookingResponseSerializer` gained `cancelled_at`/`cancelled_by`/`cancellation_reason` as one shared extension, not a cancel-only response variant | Spec v1.0 §5.2 already promises GET's shape matches §5.1's exactly regardless of booking status, and a cancelled booking now genuinely exists post-Phase-7 — a GET that omitted why/when it was cancelled would be a real product gap, not just an unused field. One serializer keeps every endpoint (create, GET, edit, cancel) returning the identical shape rather than diverging per endpoint | `kairos/bookings/serializers.py` (`BookingResponseSerializer`) |
 | ⚠️ **Regression found and fixed in Phase 7**: `run_idempotent_write`'s key-claim INSERT was NOT calling `apply_write_path_session_settings` before it ran, despite this file's own Phase 5 entry claiming the fix was "moved into a shared `core/db.py` helper applied once at the top of the outer transaction" | Verified directly: `kairos/core/idempotency.py` had no cursor/session-settings call at all — the Phase 5 report described the intended fix, but it was never actually wired into `run_idempotent_write` (only each write function's own NESTED transaction called it, which runs strictly AFTER the key-claim INSERT has already executed under Postgres's untimed defaults). Confirmed empirically before fixing: a spy on the key-claim `.create()` call observed `SHOW lock_timeout` = `'0'` (no timeout) at that exact statement. Fixed by adding the same `apply_write_path_session_settings(cursor, ...)` call at the top of `run_idempotent_write`'s outer `transaction.atomic()`, before the key-claim INSERT — verified the same spy now observes `3s`/`10s`, and that reverting the fix makes the new test fail (confirming the test is a real regression guard, not incidental). IDEM-06 (100 concurrent-replay reps) and all five CONC tests still pass | `kairos/core/idempotency.py`, `tests/bookings/test_idempotency.py` (`test_session_settings_are_active_at_the_key_claim_insert_itself`) |
+| `app.actor_type`/`app.reason` (Phase 8) are applied through the SAME `apply_write_path_session_settings` call as the write-path timeouts and `app.actor_id`/`app.request_id` — not a second, separate context manager for "audit settings" | Explicit instruction after Phase 7's session-settings regression: two categories of `SET LOCAL`-equivalent value sharing one mechanism and one call site is what makes a repeat of that exact regression structurally harder — a second mechanism would need its own correctness proof and could regress independently. Extended (not duplicated) Phase 7's own regression test to assert BOTH categories are visible at the key-claim INSERT together | `kairos/core/db.py` (`apply_write_path_session_settings`), `tests/bookings/test_idempotency.py` |
+| `_compute_changes()` diffs EVERY field in an audit row's before/after JSONB snapshots, not just `status` | Spec v1.0 §5.3's example `changes` bodies both happen to show only a `status` transition (create, admin-cancel) — but Phase 7's edit changes `time_range` while leaving `status` completely untouched. A narrower "just show status changes" reading would make an edit's history entry show NOTHING, failing AUD-04's actual requirement (full lifecycle reconstruction) | `kairos/bookings/views.py` (`BookingHistoryView`, `_compute_changes`) |
+| ⚠️ **Bug caught by AUD-02 itself, before merge**: `AuditLog.occurred_at` used Django's `auto_now_add=True`, which is Python-side only — the trigger's raw `INSERT INTO audit_log` (no ORM involved) hit a NOT NULL violation the first time a write bypassed Django entirely | Spec v1.0 §3's DDL declares `occurred_at TIMESTAMPTZ NOT NULL DEFAULT now()` — a genuine column-level default, which `auto_now_add` does not create. Fixed with Django 5+'s `db_default=Now()`, which does. Reproduced with a raw SQL insert into `resource` before the fix (failed), confirmed the identical insert succeeds after it | `kairos/core/models.py` (`AuditLog.occurred_at`), `kairos/core/migrations/0002_auditlog.py` |
+| ⚠️ **Bug caught by the test suite, before merge**: `resource_admin`'s surrogate `id` was Django's implicit `BigAutoField` (bigint) — the audit trigger's `COALESCE(NEW.id, OLD.id)` into `audit_log.entity_id UUID` failed with a type mismatch the first time a test wrote a `ResourceAdmin` row after the trigger was attached | Every other entity table (`app_user`/`resource`/`booking`) declares an explicit `UUIDField` PK; `resource_admin` was the one exception, an oversight from Phase 2 rather than a deliberate choice. Fixed via a hand-written `RunSQL` migration (Django's auto-generated `AlterField` SQL assumes a bigint→uuid CAST exists, which Postgres doesn't have — confirmed empirically, `cannot cast type bigint to uuid`) with `state_operations` keeping Django's migration state in sync. Safe only because `resource_admin` carries no production data yet (Phase 19 is the first phase to write it via a real endpoint) | `kairos/identity/models.py` (`ResourceAdmin.id`), `kairos/identity/migrations/0003_alter_resourceadmin_id.py` |
+| The RUNNING APPLICATION's default `DATABASE_URL` now points at `kairos_app` (least-privilege), not the `kairos` superuser docker-compose provisions — `manage.py migrate` requires a temporary override to the superuser DSN | AUD-01's entire premise — that the app role literally CANNOT violate the append-only guarantee — is only true if the app actually connects as that role, not merely if the role exists. Caught mid-phase: `manage.py runserver` under the new default crashed at startup (`permission denied for table django_migrations`) because every management command's `check_migrations()` queries that table — kairos_app needed an explicit `SELECT` grant on Django's own bookkeeping table, not just the application tables, before the app could even start. Verified live: full create→edit→cancel→history round trip over real HTTP with the dev server running as `kairos_app` (`SELECT current_user` confirmed) | `kairos/settings/base.py`, `.env.example`, `kairos/core/migrations/0003_audit_trail_triggers_and_grants.py` |
 
 ## Running Locally
 
@@ -184,8 +214,14 @@ cd ../backend
 python -m venv .venv
 .venv/Scripts/activate      # Windows; `source .venv/bin/activate` on macOS/Linux
 pip install -e ".[dev]"
-python manage.py migrate    # DATABASE_URL defaults to the docker-compose credentials above
-python manage.py runserver  # POST /api/v1/bookings is live — see README.md for a curl example
+
+# Migrations need DDL privileges the app's own kairos_app role deliberately
+# doesn't have (Phase 8) — override DATABASE_URL to the superuser DSN for
+# this ONE command only:
+DATABASE_URL=postgresql://kairos:kairos@localhost:5432/kairos_dev python manage.py migrate
+
+python manage.py runserver  # now defaults to kairos_app — POST /api/v1/bookings is live,
+                             # see README.md for a curl example
 ```
 
 The frontend starts Phase 23.
@@ -208,26 +244,38 @@ SQL directly through the same barrier-released harness as the others, not throug
 service/view layer — proving the constraint itself, independent of Phase 7's application
 code. `tests/test_schema_assertion.py` (RECON-05 CI form) fails the moment
 `no_overlapping_bookings`'s predicate is narrowed — verified by hand during Phase 3 (narrowed
-it, watched the test fail, reverted). `tests/bookings/` covers `BookingService` (session-
-settings assertion, all four SQLSTATE translations — 55P03 forced genuinely via a real held
-row, 40P01/57014 forced by simulation since natural reproduction isn't controllable on
-demand), the write API (every Test Plan §10 policy-validation row, 409, 404, 401,
-`X-Request-Id`), idempotency (`test_idempotency.py`) — IDEM-01–04, 06 (100 barrier-released
-repetitions), 09, 10, 11, the composite-PK schema check, the cleanup command, and (Phase 7)
+it, watched the test fail, reverted). `tests/test_audit_trail.py` (Phase 8) — AUD-01
+(connecting AS `kairos_app` via a dedicated psycopg connection, not the test session's own
+DB role, and watching `UPDATE`/`DELETE` on `audit_log` fail with `InsufficientPrivilege`; a
+direct grant-catalog inspection too, so a future migration can't silently widen them
+unnoticed), AUD-02 (a raw SQL write to `booking` still produces an audit row; all three
+Phase 8 triggers exist), and the `actor_type='system'` attribution mechanism (no real worker
+exists yet to exercise this — Phase 16 — so the trigger's handling of that session variable
+is proven directly). `tests/bookings/` covers `BookingService` (session-settings assertion,
+all four SQLSTATE translations — 55P03 forced genuinely via a real held row, 40P01/57014
+forced by simulation since natural reproduction isn't controllable on demand), the write API
+(every Test Plan §10 policy-validation row, 409, 404, 401, `X-Request-Id`), idempotency
+(`test_idempotency.py`) — IDEM-01–04, 06 (100 barrier-released repetitions), 09, 10, 11, the
+composite-PK schema check, the cleanup command, and (Phase 7, extended in Phase 8)
 `test_session_settings_are_active_at_the_key_claim_insert_itself` — a spy on the key-claim
-INSERT itself proving `lock_timeout`/`statement_timeout` are active at that exact statement,
-added after finding `run_idempotent_write` had silently regressed on the Phase 5 fix it
-claimed to have (see Key Technical Decisions) — the
-read path (`test_read_endpoints.py`, Phase 6): detail/list authorization, held-row exclusion,
-and cursor-pagination stability under a concurrent insert — and cancel/edit
+INSERT itself proving `lock_timeout`/`statement_timeout` AND `app.actor_type`/`app.reason`
+are all active together at that exact statement, added after finding `run_idempotent_write`
+had silently regressed on the Phase 5 fix it claimed to have (see Key Technical Decisions) —
+the read path (`test_read_endpoints.py`, Phase 6): detail/list authorization, held-row
+exclusion, and cursor-pagination stability under a concurrent insert; cancel/edit
 (`test_cancel_edit.py`, Phase 7): every Spec §5.5/§5.6 failure case from the Test Plan §10
 matrix, double-cancel idempotence, self-conflict-on-edit, and the two same-key-different-
 booking tests proving the idempotency-fingerprint gap described in Key Technical Decisions is
-actually closed (422 conflict, not a silent wrong-booking replay). `tests/resources/`
-(Phase 6) covers resource list/detail and availability — the 92/93-day boundary, SEC-05's
-key-absence assertion, held-slot opacity even to admins, and the bounded query-count guard.
+actually closed (422 conflict, not a silent wrong-booking replay); and (Phase 8)
+`test_history.py` — AUD-03(a)/(b) (actor attribution and reason through the real
+create/admin-cancel API, correlated to the same `X-Request-Id`), AUD-04 (create→edit→
+admin-cancel reconstructs in order via `GET /bookings/{id}/history`, including a genuine
+field-level diff — not just status transitions — proving the edit event actually shows what
+changed), and AUD-05 (cancellation doesn't remove history). `tests/resources/` (Phase 6)
+covers resource list/detail and availability — the 92/93-day boundary, SEC-05's key-absence
+assertion, held-slot opacity even to admins, and the bounded query-count guard.
 Also runnable: `cd backend && ruff check . && ruff format --check . && mypy kairos` (all pass
-with zero findings as of Phase 7). CI (`.github/workflows/ci.yml`) runs all of this as three
+with zero findings as of Phase 8). CI (`.github/workflows/ci.yml`) runs all of this as three
 jobs — `lint`, `test`, `concurrency` — on every PR. The spike scripts under `scripts/spike/`
 are runnable but are diagnostic, not a test suite — see
 `docs/spikes/S1-postgres-verification.md` for what each one does and its recorded output.

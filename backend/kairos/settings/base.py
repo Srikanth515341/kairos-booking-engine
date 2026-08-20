@@ -65,11 +65,20 @@ TEMPLATES: list[dict[str, object]] = []
 
 WSGI_APPLICATION = "kairos.wsgi.application"
 
-# DATABASE_URL / DATABASE_URL_TEST — see .env.example.
+# DATABASE_URL / DATABASE_URL_TEST — see .env.example. The default here is
+# `kairos_app`, the least-privilege role Phase 8 provisions (grant-level
+# append-only on audit_log; ordinary DML everywhere else) — the RUNNING
+# APPLICATION must never connect as the superuser (Spec v1.0 §3; AUD-01's
+# entire premise is that the app role literally *cannot* violate the
+# append-only guarantee, which is only true if the app actually connects as
+# that role). Migrations need DDL privileges `kairos_app` deliberately
+# doesn't have — override DATABASE_URL to the superuser DSN for
+# `manage.py migrate` specifically (see README.md "Running Locally"), not
+# by widening this default.
 DATABASES = {
     "default": dj_database_url.config(
         env="DATABASE_URL",
-        default="postgresql://kairos:kairos@localhost:5432/kairos_dev",
+        default="postgresql://kairos_app:kairos_app@localhost:5432/kairos_dev",
     )
 }
 

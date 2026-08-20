@@ -41,7 +41,10 @@ def test_write_path_session_settings_applied() -> None:
     with transaction.atomic():
         with connection.cursor() as cursor:
             core_db.apply_write_path_session_settings(
-                cursor, actor_id=str(uuid.uuid4()), request_id="req-session-settings"
+                cursor,
+                actor_id=str(uuid.uuid4()),
+                actor_type="user",
+                request_id="req-session-settings",
             )
             cursor.execute("SHOW lock_timeout")
             assert cursor.fetchone()[0] == "3s"

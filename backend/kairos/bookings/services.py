@@ -17,6 +17,7 @@ from django.utils import timezone
 from kairos.bookings.models import Booking, BookingStatus
 from kairos.core.db import apply_write_path_session_settings
 from kairos.core.exceptions import ServiceUnavailableError, SlotUnavailableError
+from kairos.core.models import AuditActorType
 from kairos.identity.models import AppUser
 from kairos.resources.models import Resource
 
@@ -86,8 +87,13 @@ def create_booking(req: BookingCreateRequest) -> Booking:
     try:
         with transaction.atomic():
             with connection.cursor() as cursor:
+                # Always the booker themselves in Phase 8's scope — there
+                # is no admin-create-on-behalf-of-another-user path yet.
                 apply_write_path_session_settings(
-                    cursor, actor_id=str(req.user.id), request_id=req.request_id
+                    cursor,
+                    actor_id=str(req.user.id),
+                    actor_type=AuditActorType.USER,
+                    request_id=req.request_id,
                 )
             booking = Booking.objects.create(
                 resource=req.resource,
@@ -135,8 +141,13 @@ def edit_booking(req: BookingEditRequest) -> Booking:
     try:
         with transaction.atomic():
             with connection.cursor() as cursor:
+                # Owner-only (Spec v1.0 §5.5) — no admin override for
+                # edit, so the actor is always the booking's own owner.
                 apply_write_path_session_settings(
-                    cursor, actor_id=str(req.booking.user_id), request_id=req.request_id
+                    cursor,
+                    actor_id=str(req.booking.user_id),
+                    actor_type=AuditActorType.USER,
+                    request_id=req.request_id,
                 )
             Booking.objects.filter(id=req.booking.id).update(time_range=(req.start, req.end))
             booking = Booking.objects.get(id=req.booking.id)
@@ -151,6 +162,7 @@ def edit_booking(req: BookingEditRequest) -> Booking:
 class BookingCancelRequest:
     booking: Booking
     actor: AppUser
+    actor_type: str
     reason: str | None
     request_id: str
 
@@ -179,8 +191,17 @@ def cancel_booking(req: BookingCancelRequest) -> BookingCancelResult:
     try:
         with transaction.atomic():
             with connection.cursor() as cursor:
+                # actor_type distinguishes a self-cancel from a resource-
+                # admin override (Spec v1.0 §5.6) — the view already knows
+                # which this is (that's what decides whether `reason` is
+                # required at all) and passes it through rather than this
+                # function re-deriving it.
                 apply_write_path_session_settings(
-                    cursor, actor_id=str(req.actor.id), request_id=req.request_id
+                    cursor,
+                    actor_id=str(req.actor.id),
+                    actor_type=req.actor_type,
+                    request_id=req.request_id,
+                    reason=req.reason,
                 )
             updated = Booking.objects.filter(
                 id=req.booking.id, status=BookingStatus.CONFIRMED
