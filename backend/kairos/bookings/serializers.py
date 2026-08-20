@@ -17,6 +17,7 @@ from rest_framework import serializers
 from kairos.bookings.models import Booking
 from kairos.core.constants import MAX_ADVANCE_HORIZON_DAYS
 from kairos.core.exceptions import NotFoundError, PolicyValidationError
+from kairos.identity.authorization import AuthorizationService
 from kairos.resources.models import Resource, ResourceStatus
 
 
@@ -66,6 +67,13 @@ class BookingCreateSerializer(serializers.Serializer[None]):
             # An inactive resource is treated identically to a nonexistent
             # one (Spec v1.0 §5.1) — not a distinct error, so its existence
             # isn't leaked.
+            raise NotFoundError
+        # PRD FR46: a restricted resource's non-members "may neither book
+        # nor join its waitlist" — same 404 as inactive/nonexistent, so a
+        # booker outside the group can't distinguish "restricted" from
+        # "doesn't exist" (SEC-06's premise applies here too, not just to
+        # the read endpoints).
+        if not AuthorizationService.can_view_resource(self.context["user"], resource):
             raise NotFoundError
 
         _validate_range_policy(resource, attrs["start"], attrs["end"])

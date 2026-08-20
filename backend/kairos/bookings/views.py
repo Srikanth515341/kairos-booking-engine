@@ -17,7 +17,7 @@ from kairos.core.idempotency import run_idempotent_write
 from kairos.core.models import AuditActorType, AuditLog
 from kairos.core.pagination import decode_cursor, encode_cursor, parse_limit
 from kairos.core.views import KairosAPIView
-from kairos.identity.authorization import is_operations, is_resource_admin
+from kairos.identity.authorization import AuthorizationService
 from kairos.identity.models import AppUser
 
 from .models import Booking, BookingStatus
@@ -93,17 +93,19 @@ class BookingCollectionView(KairosAPIView):
     def post(self, request: Request) -> Response:
         idempotency_key = _require_idempotency_key(request)
 
-        serializer = BookingCreateSerializer(data=request.data)
+        # IsAuthenticated already guarantees request.user is a real AppUser,
+        # never AnonymousUser/None — DRF's stubs type request.user against
+        # Django's standard auth model, which AppUser deliberately isn't
+        # (Phase 2). Resolved before the serializer runs (Phase 9) because
+        # BookingCreateSerializer needs it in context to apply PRD FR46's
+        # restricted-resource check during resource lookup.
+        user = cast(AppUser, request.user)
+
+        serializer = BookingCreateSerializer(data=request.data, context={"user": user})
         serializer.is_valid(raise_exception=True)
         attrs = serializer.validated_data
 
         request_id = _request_id(request)
-
-        # IsAuthenticated already guarantees request.user is a real AppUser,
-        # never AnonymousUser/None — DRF's stubs type request.user against
-        # Django's standard auth model, which AppUser deliberately isn't
-        # (Phase 2).
-        user = cast(AppUser, request.user)
 
         def perform_write() -> tuple[int, dict[str, Any]]:
             booking = create_booking(
@@ -148,7 +150,9 @@ class BookingCollectionView(KairosAPIView):
                 raise PolicyValidationError("resource_id", "must be a valid UUID") from exc
             # The resource is browsable, so its existence isn't secret —
             # 403, not 404 (Spec v1.0 §1 convention).
-            if not (is_resource_admin(user, resource_id) or is_operations(user)):
+            if not AuthorizationService.can_administer_resource(
+                user, resource_id
+            ) and not AuthorizationService.is_operations(user):
                 raise drf_exceptions.PermissionDenied()
             qs = qs.filter(resource_id=resource_id)
         else:
@@ -223,8 +227,7 @@ class BookingDetailView(KairosAPIView):
         except Booking.DoesNotExist as exc:
             raise NotFoundError from exc
 
-        is_owner = booking.user_id == user.id
-        if not (is_owner or is_resource_admin(user, booking.resource_id) or is_operations(user)):
+        if not AuthorizationService.can_view_booking(user, booking):
             # 404, not 403 (Spec v1.0 §1) — protects existence, not only
             # the action, since an arbitrary booking id isn't otherwise
             # discoverable/browsable the way a resource id is.
@@ -243,7 +246,7 @@ class BookingDetailView(KairosAPIView):
 
         # Owner only (Spec v1.0 §5.5) — unlike cancel, edit has no
         # resource-admin override. 404, not 403, matching GET's convention.
-        if booking.user_id != user.id:
+        if not AuthorizationService.can_edit_booking(user, booking):
             raise NotFoundError
 
         serializer = BookingEditSerializer(data=request.data, context={"booking": booking})
@@ -297,22 +300,24 @@ class BookingCancelView(KairosAPIView):
         except Booking.DoesNotExist as exc:
             raise NotFoundError from exc
 
-        is_owner = booking.user_id == user.id
-        if not (is_owner or is_resource_admin(user, booking.resource_id)):
+        allowed, is_override = AuthorizationService.can_cancel_booking(user, booking)
+        if not allowed:
             # 404, not 403 (Spec v1.0 §1) — same object-level convention as
-            # GET. Cancel's override is resource-admin only (PRD FR47);
+            # GET. Cancel's override is scoped-admin only (PRD FR47);
             # `operations` has no cancel authority per Spec v1.0 §5.6.
             raise NotFoundError
 
-        serializer = BookingCancelSerializer(data=request.data, context={"is_owner": is_owner})
+        serializer = BookingCancelSerializer(
+            data=request.data, context={"is_owner": not is_override}
+        )
         serializer.is_valid(raise_exception=True)
         reason = serializer.validated_data["reason"]
 
-        # Self-cancel is a 'user' action; a resource-admin override is an
+        # Self-cancel is a 'user' action; a scoped-admin override is an
         # 'admin' one (RFC v1.0 §12) — computed once, here, from the SAME
-        # is_owner the permission check and the reason-required validation
-        # above already used, not re-derived downstream.
-        actor_type = AuditActorType.USER if is_owner else AuditActorType.ADMIN
+        # is_override the permission check above already resolved, not
+        # re-derived downstream.
+        actor_type = AuditActorType.ADMIN if is_override else AuditActorType.USER
 
         request_id = _request_id(request)
 
@@ -363,8 +368,7 @@ class BookingHistoryView(KairosAPIView):
         # as 5.2") — owner, resource admin, or operations; 404 otherwise,
         # not 403, so a booking's existence isn't confirmed to someone
         # without access to it.
-        is_owner = booking.user_id == user.id
-        if not (is_owner or is_resource_admin(user, booking.resource_id) or is_operations(user)):
+        if not AuthorizationService.can_view_booking(user, booking):
             raise NotFoundError
 
         events = list(

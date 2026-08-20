@@ -125,3 +125,45 @@ class ResourceAdmin(models.Model):
 
     def __str__(self) -> str:
         return f"user={self.user_id} admin_of_resource={self.resource_id}"
+
+
+class UserGroup(models.Model):
+    """PRD FR46 ("a resource may be restricted to a user group") and RFC
+    v1.0 §8.2 both require a group concept, but Spec v1.0 §3's actual DDL
+    never defines one — it predates Phase 9. This is the minimal schema
+    that makes FR46/SEC-06 concretely buildable: a named group, membership
+    as a plain many-to-many, and `Resource.restricted_group` (see
+    kairos.resources.models) as the nullable FK a resource opts into. No
+    resource is restricted unless it explicitly sets that FK — every
+    existing resource and test is unaffected by this table's mere
+    existence.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    name = models.TextField(unique=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "user_group"
+
+    def __str__(self) -> str:
+        return self.name
+
+
+class UserGroupMembership(models.Model):
+    group = models.ForeignKey(
+        UserGroup, on_delete=models.CASCADE, db_column="group_id", related_name="memberships"
+    )
+    user = models.ForeignKey(
+        AppUser, on_delete=models.CASCADE, db_column="user_id", related_name="group_memberships"
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "user_group_membership"
+        constraints = [
+            models.UniqueConstraint(fields=["group", "user"], name="user_group_membership_unique"),
+        ]
+
+    def __str__(self) -> str:
+        return f"user={self.user_id} member_of={self.group_id}"

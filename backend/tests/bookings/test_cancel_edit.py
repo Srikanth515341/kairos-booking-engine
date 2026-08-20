@@ -15,6 +15,7 @@ from rest_framework.test import APIClient
 
 from kairos.bookings.models import Booking, BookingStatus
 from kairos.identity.models import AppUser, ResourceAdmin
+from kairos.identity.oidc import issue_session_token
 from kairos.resources.models import Resource
 
 BOOKINGS_URL = "/api/v1/bookings"
@@ -27,6 +28,19 @@ def _iso(dt: datetime) -> str:
 def _headers(user: AppUser, idempotency_key: uuid.UUID | None = None) -> dict[str, str]:
     return {
         "HTTP_X_DEV_USER_ID": str(user.id),
+        "HTTP_IDEMPOTENCY_KEY": str(idempotency_key or uuid.uuid4()),
+    }
+
+
+def _bearer_headers(user: AppUser, idempotency_key: uuid.UUID | None = None) -> dict[str, str]:
+    """A REAL minted session token (Phase 9), verified by the REAL
+    OIDCSessionAuthentication class — see tests/bookings/test_views.py's
+    identical helper for the full rationale. Used on a representative
+    subset of this file's tests to prove edit/cancel's write path (Phase
+    7) works correctly under real auth, not just via the stub."""
+    token, _ = issue_session_token(user.id)
+    return {
+        "HTTP_AUTHORIZATION": f"Bearer {token}",
         "HTTP_IDEMPOTENCY_KEY": str(idempotency_key or uuid.uuid4()),
     }
 
@@ -60,6 +74,10 @@ def owned_booking(app_user: AppUser, active_resource: Resource) -> Booking:
 def test_edit_by_owner_to_free_target_returns_200(
     client: APIClient, app_user: AppUser, owned_booking: Booking
 ) -> None:
+    """Real minted session token (Phase 9) — proves edit_booking's write
+    path (session settings, the EXCLUDE-constraint-on-UPDATE check, audit
+    attribution) is unaffected by which authenticator resolved the actor.
+    """
     new_start = timezone.now() + timedelta(hours=5)
     new_end = new_start + timedelta(hours=1)
 
@@ -67,7 +85,7 @@ def test_edit_by_owner_to_free_target_returns_200(
         f"{BOOKINGS_URL}/{owned_booking.id}",
         data={"start": _iso(new_start), "end": _iso(new_end)},
         format="json",
-        **_headers(app_user),
+        **_bearer_headers(app_user),
     )
 
     assert response.status_code == 200
@@ -274,8 +292,16 @@ def test_edit_same_key_across_two_bookings_is_conflict_not_replay(
 def test_self_cancel_without_reason_returns_200(
     client: APIClient, app_user: AppUser, owned_booking: Booking
 ) -> None:
+    """Real minted session token (Phase 9) — proves cancel_booking's write
+    path, including its `transaction.on_commit()` waitlist-check stub and
+    audit attribution, is unaffected by which authenticator resolved the
+    actor.
+    """
     response = client.post(
-        f"{BOOKINGS_URL}/{owned_booking.id}/cancel", data={}, format="json", **_headers(app_user)
+        f"{BOOKINGS_URL}/{owned_booking.id}/cancel",
+        data={},
+        format="json",
+        **_bearer_headers(app_user),
     )
     assert response.status_code == 200
     body = response.json()
@@ -308,6 +334,11 @@ def test_admin_override_without_reason_returns_400(
 def test_admin_override_with_reason_returns_200_and_persists_reason(
     client: APIClient, app_user: AppUser, active_resource: Resource, owned_booking: Booking
 ) -> None:
+    """Real minted session token (Phase 9) for the ADMIN's request
+    specifically — proves the scoped-admin override path (actor_type
+    correctly resolved as 'admin', reason persisted) works under real
+    auth, not just the stub.
+    """
     admin = AppUser.objects.create(email="cancel-admin2@example.com", display_name="Cancel Admin 2")
     ResourceAdmin.objects.create(resource=active_resource, user=admin, granted_by=app_user)
 
@@ -315,7 +346,7 @@ def test_admin_override_with_reason_returns_200_and_persists_reason(
         f"{BOOKINGS_URL}/{owned_booking.id}/cancel",
         data={"reason": "Room offline for maintenance"},
         format="json",
-        **_headers(admin),
+        **_bearer_headers(admin),
     )
     assert response.status_code == 200
     body = response.json()

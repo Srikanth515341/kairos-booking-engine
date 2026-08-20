@@ -48,11 +48,18 @@ kairos-booking-engine/
 │   │   │                   # AuditLog since Phase 8), migrations/0002-0003 (audit_log table,
 │   │   │                   # kairos_app role + grants, write_audit_log() trigger — Phase 8),
 │   │   │                   # management/commands/cleanup_idempotency_keys.py
-│   │   ├── identity/       # app_user, resource_admin (UUID surrogate PK since Phase 8 —
-│   │   │                   # was an implicit BigAutoField), authentication.py (# STUB, Phase 4),
-│   │   │                   # authorization.py (is_resource_admin/is_operations, Phase 6)
-│   │   ├── resources/      # resource, serializers.py, views.py, urls.py (list/detail/
-│   │   │                   # availability — Phase 6; writes are Phase 19)
+│   │   ├── identity/       # app_user, resource_admin (UUID surrogate PK since Phase 8),
+│   │   │                   # user_group/user_group_membership (Phase 9 — PRD FR46, not in
+│   │   │                   # Spec v1.0 §3 at all, see Key Technical Decisions),
+│   │   │                   # authentication.py (OIDCSessionAuthentication — real; Stub
+│   │   │                   # UserIdAuthentication — gated to test only, Phase 9),
+│   │   │                   # authorization.py (AuthorizationService, Phase 9 — the ONE
+│   │   │                   # place every permission decision is resolved),
+│   │   │                   # oidc.py (JWT mint/verify + local mock issuer, Phase 9),
+│   │   │                   # views.py/urls.py (POST /auth/token, /auth/dev-mock-login)
+│   │   ├── resources/      # resource (+ restricted_group FK, Phase 9), serializers.py,
+│   │   │                   # views.py, urls.py (list/detail/availability — Phase 6; writes
+│   │   │                   # are Phase 19)
 │   │   ├── bookings/       # booking, services.py (create/edit/cancel — Phase 7), serializers.py,
 │   │   │                   # views.py (BookingHistoryView — Phase 8), urls.py
 │   │   ├── urls.py, wsgi.py
@@ -60,7 +67,11 @@ kairos-booking-engine/
 │   │   ├── test_booking_exclusion_smoke.py
 │   │   ├── test_schema_assertion.py   # RECON-05 CI form — fails if the predicate is narrowed
 │   │   ├── test_audit_trail.py        # AUD-01, AUD-02, grant/trigger-existence checks (Phase 8)
+│   │   ├── test_security.py           # SEC-01, SEC-06 (Phase 9)
 │   │   ├── conftest.py                # app_user / active_resource fixtures, shared
+│   │   ├── identity/                  # test_authentication.py (real OIDC flow, actor_id spy,
+│   │   │                              # dev-settings-subprocess X-Dev-User-Id rejection),
+│   │   │                              # test_authorization.py (four roles, scoped admin) — Phase 9
 │   │   ├── bookings/                  # test_services.py, test_views.py, test_idempotency.py,
 │   │   │                              # test_read_endpoints.py (Phase 6), test_cancel_edit.py
 │   │   │                              # (Phase 7), test_history.py (AUD-03/04/05 — Phase 8)
@@ -74,7 +85,7 @@ kairos-booking-engine/
 │   │       ├── test_conc_04.py        # edit-vs-edit race (Phase 7)
 │   │       └── test_conc_05.py        # cancel-and-rebook race
 │   ├── manage.py
-│   └── pyproject.toml      # ruff, mypy strict, pytest config
+│   └── pyproject.toml      # ruff, mypy strict, pytest config; pyjwt[crypto] added Phase 9
 ├── frontend/              # React + TypeScript — empty until Phase 23
 ├── infra/                 # docker-compose.yml, init-test-db.sql
 └── scripts/
@@ -82,15 +93,32 @@ kairos-booking-engine/
 ```
 
 Endpoints live (Phase 6 added the read path, Phase 7 the remaining single-booking mutations,
-Phase 8 the history endpoint, to Phase 4/5's write path): `POST`/`GET /api/v1/bookings`,
-`GET`/`PATCH /api/v1/bookings/{id}`, `POST /api/v1/bookings/{id}/cancel`,
+Phase 8 the history endpoint, Phase 9 real auth, to Phase 4/5's write path): `POST`/
+`GET /api/v1/bookings`, `GET`/`PATCH /api/v1/bookings/{id}`, `POST /api/v1/bookings/{id}/cancel`,
 `GET /api/v1/bookings/{id}/history`, `GET /api/v1/resources`, `GET /api/v1/resources/{id}`,
-`GET /api/v1/resources/{id}/availability`. Every mutation (create, edit, cancel) is idempotent
-(Phase 5/7 — `Idempotency-Key` is required; missing it is 400). Edit is owner-only, no admin
-override; cancel is owner-or-resource-admin, with a reason required for the admin-override
-case (400 otherwise). Cancelling an already-cancelled booking is a 200 no-op, independent of
-idempotency key. No real auth (Phase 9 — currently a dev-only `X-Dev-User-Id` header stub,
-clearly marked `# STUB` in `kairos/identity/authentication.py`).
+`GET /api/v1/resources/{id}/availability`, `POST /api/v1/auth/token`,
+`POST /api/v1/auth/dev-mock-login` (dev/test only). Every mutation (create, edit, cancel) is
+idempotent (Phase 5/7 — `Idempotency-Key` is required; missing it is 400). Edit is owner-only,
+no admin override; cancel is owner-or-scoped-admin, with a reason required for the
+admin-override case (400 otherwise). Cancelling an already-cancelled booking is a 200 no-op,
+independent of idempotency key.
+
+Real authentication (Phase 9, RFC v1.0 §4): `Authorization: Bearer <session-token>`, validated
+by `OIDCSessionAuthentication`. A client obtains that session token via `POST /auth/token`
+with a verified OIDC ID token — in dev/test, `POST /auth/dev-mock-login` mints one against a
+fixed local RS256 keypair standing in for a real IdP (no Keycloak or other external dependency
+required); in prod, a real provider's JWKS-published key verifies it (structurally complete,
+genuinely untested against a live IdP — same documented-gap pattern as IDEM-07/08). The
+`X-Dev-User-Id` stub (Phase 4) still exists but is now inert everywhere except
+`kairos.settings.test` — gated by `settings.KAIROS_DEV_AUTH_STUB_ENABLED`, checked at request
+time, verified by actually starting the app under `kairos.settings.dev` in a real subprocess
+and confirming a real HTTP request carrying that header gets a bare 401. Four roles (PRD
+FR44) — `booker`, `resource_administrator` (scoped via `resource_admin`), `system_admin`
+(global), `operations` (read-only) — are resolved through exactly one place,
+`AuthorizationService`, consulted by every view instead of each view re-deriving permission
+logic inline. Resources can now be restricted to a `user_group` (PRD FR46) — absent from list
+results and 404 on direct access for non-members, exactly like a nonexistent resource
+(SEC-06).
 
 Every state transition on `booking`/`resource`/`resource_admin` is audited (Phase 8): the
 `write_audit_log()` trigger fires on every INSERT/UPDATE/DELETE against those three tables,
@@ -114,17 +142,16 @@ DSN (`kairos_app` deliberately has no DDL rights) — see "Running Locally" belo
 | 5 | Idempotency — The Transaction Boundary ⚠️ Subtle | `idempotency_key` table with a genuine composite `(user_id, key)` PRIMARY KEY (Django 6.1's `CompositePrimaryKey` — no surrogate-key workaround needed here, unlike Phase 2's `resource_admin`); `run_idempotent_write` (generic, in `core`, reused by every future write path) claims the key and runs the protected write in one transaction per RFC §11.2, recording a 409 outcome in its own follow-up transaction after rollback, and recording nothing at all for a 503 (outcome genuinely unknown); IDEM-01–04, 06 (100 reps), 09, 10, 11 all pass; verified live (replay returns the original booking, not a 409) | Pending (on branch `phase-05-idempotency`) |
 | 6 | Read Path & Availability View | `GET /bookings/{id}` (owner/admin/operations, else 404 per Spec §1) and `GET /bookings` (cursor pagination, `idx_booking_user_starts`-shaped, held rows always excluded); `GET /resources`, `GET /resources/{id}` (read-only; writes are Phase 19); `GET /resources/{id}/availability` bounded to 92 days, `booking_id`/`owner` omitted entirely (not nulled) unless the requester owns the booking or administers the resource, held slots never reveal them to anyone (SEC-05); keyset (not offset) pagination proven stable under a concurrent insert between page fetches; N+1 guard verified via `django_assert_max_num_queries`; all prior tests still green (see the `MAX_ROUND_ATTEMPTS` finding below) | Pending (on branch `phase-06-read-path-availability`) |
 | 7 | Cancellation & Editing | `PATCH /bookings/{id}` (owner only, evaluated against `no_overlapping_bookings` exactly as a create) and `POST /bookings/{id}/cancel` (owner or resource-admin override with a required reason, double-cancel idempotent at 200 regardless of idempotency key) — both share `_handle_write_database_error`'s SQLSTATE translation with create; the `transaction.on_commit()` waitlist-check stub registered inside cancel's nested atomic, correctly deferred to the outer (idempotency) transaction's commit; `BookingResponseSerializer` extended with `cancelled_at`/`cancelled_by`/`cancellation_reason`; idempotency fingerprints for both endpoints fold in `booking_id` (a real gap the body alone doesn't cover — see Key Technical Decisions); CONC-03 (edit-vs-create) and CONC-04 (edit-vs-edit), 10 runs each, loser verified unchanged at its original range. Also caught and fixed a real regression while doing this: Phase 5's session-settings fix had never actually been wired into `run_idempotent_write` — the key-claim INSERT was running with NO `lock_timeout` (proven via a spy test, then fixed, then proven fixed by reverting and watching the new test fail). Full suite (83 tests) green, including three concurrency runs back-to-back in one session | Merged (PR #7) |
-| 8 | Audit Trail — Triggers & Grants ⚠️ Subtle | `audit_log` table + `write_audit_log()` trigger on `booking`/`resource`/`resource_admin`, firing unconditionally on every INSERT/UPDATE/DELETE — proven by a raw SQL write that never touches the service layer (AUD-02); a dedicated `kairos_app` database role holds ordinary DML on every app table but only `INSERT`/`SELECT` (never `UPDATE`/`DELETE`) on `audit_log`, enforced at the grant level and proven by actually connecting AS that role (AUD-01) — the RUNNING APPLICATION now connects as `kairos_app`, not the superuser, verified live via `manage.py runserver` and a full create→edit→cancel→history round trip over real HTTP; `app.actor_type`/`app.reason` propagate through the SAME shared `apply_write_path_session_settings` call as the write-path timeouts (not a second context manager), per explicit instruction after Phase 7's regression — verified by extending that exact regression test, not adding a parallel one; `GET /bookings/{id}/history` reconstructs full lifecycles via a genuine before/after field-level diff (`_compute_changes`), not just status transitions, since Phase 7's edit changes `time_range` while leaving `status` untouched — AUD-03(a)(b), AUD-04, AUD-05 all pass; AUD-03(d)'s "system-initiated write" has no real worker yet (Phase 16), so the underlying mechanism is proven directly instead. Three real bugs found and fixed via hands-on verification, not just passing tests: (1) `occurred_at` used `auto_now_add` (Python-side only) instead of a genuine `db_default`, so the trigger's raw INSERT — which never goes through Django's ORM — hit a NOT NULL violation; (2) `resource_admin`'s implicit `BigAutoField` surrogate PK couldn't satisfy the trigger's `COALESCE(NEW.id, OLD.id)` into `audit_log.entity_id UUID`, so it's now an explicit UUID PK like every other entity table; (3) `kairos_app` had no grant on Django's own `django_migrations` table, so the app failed to even START under the new role until caught by actually running `manage.py runserver`, not only the test suite. Full suite (96 tests) green | Pending (on branch `phase-08-audit-trail`) |
+| 8 | Audit Trail — Triggers & Grants ⚠️ Subtle | `audit_log` table + `write_audit_log()` trigger on `booking`/`resource`/`resource_admin`, firing unconditionally on every INSERT/UPDATE/DELETE — proven by a raw SQL write that never touches the service layer (AUD-02); a dedicated `kairos_app` database role holds ordinary DML on every app table but only `INSERT`/`SELECT` (never `UPDATE`/`DELETE`) on `audit_log`, enforced at the grant level and proven by actually connecting AS that role (AUD-01) — the RUNNING APPLICATION now connects as `kairos_app`, not the superuser, verified live via `manage.py runserver` and a full create→edit→cancel→history round trip over real HTTP; `app.actor_type`/`app.reason` propagate through the SAME shared `apply_write_path_session_settings` call as the write-path timeouts (not a second context manager), per explicit instruction after Phase 7's regression — verified by extending that exact regression test, not adding a parallel one; `GET /bookings/{id}/history` reconstructs full lifecycles via a genuine before/after field-level diff (`_compute_changes`), not just status transitions, since Phase 7's edit changes `time_range` while leaving `status` untouched — AUD-03(a)(b), AUD-04, AUD-05 all pass; AUD-03(d)'s "system-initiated write" has no real worker yet (Phase 16), so the underlying mechanism is proven directly instead. Three real bugs found and fixed via hands-on verification, not just passing tests: (1) `occurred_at` used `auto_now_add` (Python-side only) instead of a genuine `db_default`, so the trigger's raw INSERT — which never goes through Django's ORM — hit a NOT NULL violation; (2) `resource_admin`'s implicit `BigAutoField` surrogate PK couldn't satisfy the trigger's `COALESCE(NEW.id, OLD.id)` into `audit_log.entity_id UUID`, so it's now an explicit UUID PK like every other entity table; (3) `kairos_app` had no grant on Django's own `django_migrations` table, so the app failed to even START under the new role until caught by actually running `manage.py runserver`, not only the test suite. Full suite (96 tests) green | Merged (PR #8) |
+| 9 | Authentication & Scoped Authorization | `OIDCSessionAuthentication` validates `Authorization: Bearer <session-token>`, issued by new `POST /api/v1/auth/token` after verifying a real (RS256, JWKS) or — dev/test only — mock OIDC ID token from `POST /api/v1/auth/dev-mock-login`, signed against a fixed local keypair instead of requiring Keycloak or any other external dependency; the backend's own session token is a SEPARATE, short-lived HS256 token (RFC v1.0 §4), not the raw ID token. `AuthorizationService` (`kairos/identity/authorization.py`) is now the ONE place every permission decision is resolved — every prior inline `is_resource_admin(...) or is_operations(...)` check in `bookings/views.py` and `resources/views.py` replaced with a call into it; PRD FR44's four roles (booker/resource_administrator/system_admin/operations) and PRD FR45's scoped-admin isolation (an admin for Resource A structurally cannot administer Resource B — `can_administer_resource` always re-checks against the specific resource, tested explicitly through the real cancel endpoint) are enforced through it uniformly. `X-Dev-User-Id` (Phase 4) is now inert outside `kairos.settings.test`, gated by `settings.KAIROS_DEV_AUTH_STUB_ENABLED` checked at request time — NOT verified by inspection alone, per explicit instruction: a dedicated test actually starts the app under `kairos.settings.dev` in a real subprocess and confirms a real HTTP request carrying that header gets a bare 401 (`WWW-Authenticate: Bearer`, not the stub's own challenge), independently reproduced live via `curl` against a real dev-mode server too. `app.actor_id` reaching the key-claim INSERT under a REAL authenticated principal (not a stub) is proven the same spy-on-cursor way Phase 7/8 proved the timeout/actor-type settings — reusing the identical `apply_write_path_session_settings` call site, per explicit instruction not to introduce a second mechanism for it. PRD FR46's "restricted resources" required inventing schema Spec v1.0 §3 never defined (`user_group`/`user_group_membership`, `resource.restricted_group`) — see Key Technical Decisions for the scoping call. SEC-01 (IDOR + response-body leakage across GET/PATCH/cancel/history) and SEC-06 (restricted resource 404 + absent from list, including the booking-creation and availability paths, not just resource detail) both pass. Post-review revision (caught by re-reading the DoD literally, not by a new test failing): 8 representative existing tests — create (full mock-login→token-exchange round trip), create-conflict-409, edit, self-cancel, admin-override-cancel, IDEM-01/02, and history's AUD-03(a) — converted to real minted session tokens, proving the write path (session settings, audit attribution, idempotency scoping) actually works end-to-end under real identity, not just that the auth layer and the existing suite each work in isolation; the remaining ~85 tests keep the stub deliberately (gated to `kairos.settings.test` only), and CONC-01–05 aren't candidates at all — no HTTP/auth layer exists in them to convert (raw psycopg SQL by design). Three real bugs found and fixed via hands-on verification: (1) `KAIROS_SESSION_SIGNING_KEY`'s fallback chain (env var → `SECRET_KEY`) produced an empty HMAC key, since `SECRET_KEY` is itself commonly empty in dev/test — PyJWT refused to sign, caught by the first real login attempt; (2) both new unauthenticated auth views' `authentication_classes = []` triggered the SAME 401→403 DRF downgrade this codebase already documents for `StubUserIdAuthentication` (no authenticator means no `WWW-Authenticate` challenge); (3) `can_administer_resource` was a strictly broader check than the pre-Phase-9 inline permission logic it replaced (now also recognizes `system_admin`, which those checks never consulted) — a genuine pre-existing gap the consolidation surfaced, not a deliberate feature. Full suite (121 tests — the 8 conversions modified existing tests rather than adding new ones) green | Pending (on branch `phase-09-auth-scoped-authz`) |
 
 ## Current Phase In Progress
 
-None. Phase 8 is complete pending review and merge. Phase 9 (Authentication & Scoped
-Authorization) is next.
+None. Phase 9 is complete pending review and merge. Phase 10 (Timezone Foundation) is next.
 
 ## NOT Yet Built
 
-No real authentication (Phase 9 — `X-Dev-User-Id` is an explicitly marked stub), no
-Celery/Redis, no frontend, no hold reclamation (booking creation does not yet run the
+No Celery/Redis, no frontend, no hold reclamation (booking creation does not yet run the
 cleanup-on-write DELETE from Spec §4.1 step 2, since `held` rows don't exist until Phase 15),
 no `recurring_series`/`waitlist_entry`/`waitlist_offer`/`system_check_run` tables (each
 arrives with the phase that needs it — see the Key Technical Decisions and Phase Index in
@@ -138,19 +165,34 @@ logs "would enqueue waitlist check" — the real worker dispatch is Phase 16, an
 "system-initiated write" has no real worker to exercise yet (see Phase 8's row above — the
 underlying trigger mechanism is proven directly instead). Resource CRUD (create/update/admin
 grants) is Phase 19 — the Phase 6 resource endpoints are read-only, and no live code path
-writes `resource_admin` yet (Phase 8's `ResourceAdmin` rows in tests are created directly via
-the ORM, not through any endpoint). IDEM-05 (recurring replay) needs Phase 12's endpoint;
-IDEM-07/08 (fault injection — process kill mid-transaction, proxy-level response drop) need
-tooling that arrives in Phase 28; idempotency coverage on waitlist join/offer confirm arrives
-with those endpoints (Phases 14, 16). `booking.series_id` does not exist yet — it cannot,
-since `recurring_series` (Phase 11) doesn't exist; it is added in Phase 11, not retrofitted
-early. `kairos_app`'s password is a hardcoded dev-only literal (Phase 8, matching
-`infra/docker-compose.yml`'s own precedent) — Rollout (Phase 30) must replace it with a real
-managed secret before any deployment. CONC-01's full 100-run + N=500 escalation and CONC-06
-(throughput characterization) are deferred to Phase 28/29 respectively; CI only runs the
-10-run CI-tier
-reduction for every CONC test. The throwaway spike table `spike_booking` may still exist in
-`kairos_dev`, created/dropped repeatedly by `scripts/spike/common.py` — unrelated to the real
+writes `resource_admin` yet (`ResourceAdmin` rows in tests are created directly via the ORM,
+not through any endpoint). IDEM-05 (recurring replay) needs Phase 12's endpoint; IDEM-07/08
+(fault injection — process kill mid-transaction, proxy-level response drop) need tooling that
+arrives in Phase 28; idempotency coverage on waitlist join/offer confirm arrives with those
+endpoints (Phases 14, 16). `booking.series_id` does not exist yet — it cannot, since
+`recurring_series` (Phase 11) doesn't exist; it is added in Phase 11, not retrofitted early.
+`kairos_app`'s password (Phase 8) and `KAIROS_SESSION_SIGNING_KEY`'s dev-only fallback (Phase
+9) are both hardcoded dev-only literals, matching `infra/docker-compose.yml`'s own
+precedent — Rollout (Phase 30) must replace both with real managed secrets before any
+deployment; `prod.py` already refuses to start with either the empty-`SECRET_KEY` case or the
+literal signing-key fallback in play, so this is enforced, not just documented. Real OIDC
+(RS256 JWKS-based token verification, `kairos/identity/oidc.py`'s `_fetch_jwks_public_key`) is
+structurally complete but genuinely UNTESTED against a live IdP — this project has none to
+test against, the same documented-gap pattern as IDEM-07/08; only the local mock-issuer path
+is exercised end-to-end. User-group MANAGEMENT (creating groups, adding/removing members) has
+no endpoint yet — Phase 9 built the schema and the enforcement (`AuthorizationService`,
+SEC-06) `user_group`/`user_group_membership` rows are ORM-created in tests, same caveat as
+`resource_admin` above; whichever future phase owns admin-facing resource/group management
+should wire this up rather than leaving it ORM-only indefinitely. Only 8 representative
+existing tests were converted to real minted session tokens (see Key Technical Decisions for
+which, and why those specifically) — the remaining ~85 still authenticate via the gated
+`X-Dev-User-Id` stub, by design only reachable under `kairos.settings.test`; group-management
+endpoints landing in a later phase (see the Open Questions entry from this phase) are one more
+reason not every test needs converting now. CONC-01's full 100-run + N=500
+escalation and CONC-06 (throughput characterization) are deferred to Phase 28/29 respectively;
+CI only runs the 10-run CI-tier reduction for every CONC test. The throwaway spike table
+`spike_booking` may still exist in `kairos_dev`, created/dropped repeatedly by
+`scripts/spike/common.py` — unrelated to the real
 schema. Do not assume any of the above exist in a fresh session — verify against this file
 and `git log` first.
 
@@ -202,6 +244,13 @@ and `git log` first.
 | ⚠️ **Bug caught by AUD-02 itself, before merge**: `AuditLog.occurred_at` used Django's `auto_now_add=True`, which is Python-side only — the trigger's raw `INSERT INTO audit_log` (no ORM involved) hit a NOT NULL violation the first time a write bypassed Django entirely | Spec v1.0 §3's DDL declares `occurred_at TIMESTAMPTZ NOT NULL DEFAULT now()` — a genuine column-level default, which `auto_now_add` does not create. Fixed with Django 5+'s `db_default=Now()`, which does. Reproduced with a raw SQL insert into `resource` before the fix (failed), confirmed the identical insert succeeds after it | `kairos/core/models.py` (`AuditLog.occurred_at`), `kairos/core/migrations/0002_auditlog.py` |
 | ⚠️ **Bug caught by the test suite, before merge**: `resource_admin`'s surrogate `id` was Django's implicit `BigAutoField` (bigint) — the audit trigger's `COALESCE(NEW.id, OLD.id)` into `audit_log.entity_id UUID` failed with a type mismatch the first time a test wrote a `ResourceAdmin` row after the trigger was attached | Every other entity table (`app_user`/`resource`/`booking`) declares an explicit `UUIDField` PK; `resource_admin` was the one exception, an oversight from Phase 2 rather than a deliberate choice. Fixed via a hand-written `RunSQL` migration (Django's auto-generated `AlterField` SQL assumes a bigint→uuid CAST exists, which Postgres doesn't have — confirmed empirically, `cannot cast type bigint to uuid`) with `state_operations` keeping Django's migration state in sync. Safe only because `resource_admin` carries no production data yet (Phase 19 is the first phase to write it via a real endpoint) | `kairos/identity/models.py` (`ResourceAdmin.id`), `kairos/identity/migrations/0003_alter_resourceadmin_id.py` |
 | The RUNNING APPLICATION's default `DATABASE_URL` now points at `kairos_app` (least-privilege), not the `kairos` superuser docker-compose provisions — `manage.py migrate` requires a temporary override to the superuser DSN | AUD-01's entire premise — that the app role literally CANNOT violate the append-only guarantee — is only true if the app actually connects as that role, not merely if the role exists. Caught mid-phase: `manage.py runserver` under the new default crashed at startup (`permission denied for table django_migrations`) because every management command's `check_migrations()` queries that table — kairos_app needed an explicit `SELECT` grant on Django's own bookkeeping table, not just the application tables, before the app could even start. Verified live: full create→edit→cancel→history round trip over real HTTP with the dev server running as `kairos_app` (`SELECT current_user` confirmed) | `kairos/settings/base.py`, `.env.example`, `kairos/core/migrations/0003_audit_trail_triggers_and_grants.py` |
+| The local mock OIDC provider (Phase 9) is a fixed RS256 keypair + two small view endpoints, not a real Keycloak/IdP running in Docker | The Implementation Plan phase text explicitly names both options ("Keycloak in Docker Compose, or a stub issuer"). A stub issuer keeps "the system runs without external dependencies" true while still exercising REAL signature/issuer/audience/expiry verification — a forged token signed with a different keypair is rejected exactly like it would be against a real IdP (proven directly: `test_token_exchange_rejects_wrong_signature`). Only the ISSUER is fake; the verification code path is the same one a real provider's tokens go through | `kairos/identity/oidc.py` |
+| The backend's own session token is a SEPARATE, HS256-signed JWT — never the raw OIDC ID token forwarded as-is | RFC v1.0 §4 says the backend "issues its own short-lived internal session token," not that it re-uses the IdP's. Re-validating a full RS256 token (or worse, calling out to the IdP) on every single API request would be unnecessary latency and an unnecessary external dependency per request; an HS256 token this service both signs and verifies is cheaper and needs no network call | `kairos/identity/oidc.py` (`issue_session_token`/`verify_session_token`) |
+| `X-Dev-User-Id` is gated by `settings.KAIROS_DEV_AUTH_STUB_ENABLED`, checked INSIDE `StubUserIdAuthentication.authenticate()` at request time — not by which authenticator classes a settings module happens to register | A class-list-based gate (e.g. only registering the stub authenticator in test settings) would be indistinguishable, from the DoD's own wording, from a genuine environment-scoped security boundary — but a future refactor moving class registration around could silently re-enable it anywhere. Checking a dedicated flag at call time makes the boundary explicit and independently testable. Verified two ways: `test_x_dev_user_id_is_rejected_under_dev_settings` starts the actual app under `kairos.settings.dev` in a real subprocess and makes a real HTTP request against it (not a settings-flag unit test simulating dev), and the identical check was independently reproduced live via `curl` against a real `manage.py runserver` process in this same session | `kairos/identity/authentication.py`, `kairos/settings/{base,dev,test}.py`, `tests/identity/test_authentication.py` |
+| ⚠️ **Revised after review, before merge**: the DoD literally says "every prior test updated to use real auth and still passing" — the first pass satisfied only "still passing" (kept the stub everywhere) and treated that as sufficient. It wasn't: two parallel, never-cross-tested paths ("old tests via stub," "new auth tests via real tokens") don't prove the write path actually works under real identity. Fixed by converting 8 representative existing tests — booking creation (the flagship one via the FULL mock-login → token-exchange round trip, not just a minted token), the create-conflict-409 path, edit, self-cancel, admin-override-cancel, IDEM-01/02, and the audit-attribution test AUD-03(a) — to `_bearer_headers()`, a real minted session token verified by the real `OIDCSessionAuthentication` class. The remaining ~85 tests still use the (gated, test-only) stub deliberately: the two paths now demonstrably meet at write-path/session-settings/audit level, and rewriting every remaining call site would still be mechanical churn without adding coverage the auth LAYER doesn't already get from `tests/identity/`. CONC-01–05 are NOT candidates for conversion at all — they exercise the exclusion constraint via raw psycopg SQL with zero Django/HTTP/auth layer involved by design (confirmed: no `APIClient`, no auth header, anywhere in `tests/concurrency/`), so there is no authentication step in them to convert | `tests/bookings/test_views.py`, `test_cancel_edit.py`, `test_idempotency.py`, `test_history.py` (`_bearer_headers` helpers) |
+| `AuthorizationService` gained `can_administer_resource` (system_admin OR scoped resource_admin) as a strictly BROADER check than Phase 6/7's original `is_resource_admin(...) or is_operations(...)` inline checks — system_admin can now also list-by-resource, cancel-override, and (implicitly) view/edit anywhere | PRD FR44 defines `system_admin` as global ("manages catalogue and scope assignment"); the pre-Phase-9 inline checks never actually consulted that role at all, an omission from before the role concept was fully wired up. Consolidating into one service surfaced and fixed this gap as a side effect, not a deliberately scoped-in feature — flagged here so it isn't mistaken for an intentional design decision made independently of the refactor | `kairos/identity/authorization.py` (`AuthorizationService.can_administer_resource`) |
+| PRD FR46's "restricted resources" needed a `user_group`/`user_group_membership` schema Spec v1.0 §3 never defined at all (confirmed: zero matches for "group" or "restrict" in that document) | RFC v1.0 §8.2 gestures at a `resource_group_id` in an aspirational grant table, but the ACTUAL implemented `resource_admin` grant (Phase 2) is keyed on `resource_id` directly, not a group. Rather than retrofit `resource_admin` to a group model Spec never specified either, Phase 9 adds the minimal schema PRD FR46/SEC-06 concretely need: a named `user_group`, a plain membership M2M, and a nullable `resource.restricted_group` FK (null = open, matching every resource before this phase). Group MANAGEMENT (create a group, add/remove members) has no endpoint yet — see NOT Yet Built | `kairos/identity/models.py` (`UserGroup`, `UserGroupMembership`), `kairos/resources/models.py` (`Resource.restricted_group`) |
+| `KAIROS_SESSION_SIGNING_KEY` falls back through THREE tiers — explicit env var, then `SECRET_KEY`, then a hardcoded dev-only literal — with `prod.py` refusing to start if the literal is ever what's actually in play | Caught empirically, not by inspection: the original two-tier fallback (env var, else `SECRET_KEY`) produced an EMPTY string in dev/test, because `SECRET_KEY` itself defaults to `""` when `DJANGO_SECRET_KEY` isn't set locally — and PyJWT refuses to sign with an empty HMAC key, so the very first login attempt in a fresh test run raised `InvalidKeyError`. The third tier fixes dev/test without weakening prod, which already required `SECRET_KEY` non-empty and now requires this key not be the literal fallback too | `kairos/settings/base.py`, `kairos/settings/prod.py` |
 
 ## Running Locally
 
@@ -221,8 +270,12 @@ pip install -e ".[dev]"
 DATABASE_URL=postgresql://kairos:kairos@localhost:5432/kairos_dev python manage.py migrate
 
 python manage.py runserver  # now defaults to kairos_app — POST /api/v1/bookings is live,
-                             # see README.md for a curl example
+                             # see README.md for the full auth + booking curl walkthrough
 ```
+
+Auth (Phase 9): `POST /api/v1/auth/dev-mock-login` (dev/test only) mints a mock OIDC ID
+token; `POST /api/v1/auth/token` exchanges it for the session token every other endpoint's
+`Authorization: Bearer <token>` expects. See README.md for the exact sequence.
 
 The frontend starts Phase 23.
 
@@ -274,8 +327,27 @@ field-level diff — not just status transitions — proving the edit event actu
 changed), and AUD-05 (cancellation doesn't remove history). `tests/resources/` (Phase 6)
 covers resource list/detail and availability — the 92/93-day boundary, SEC-05's key-absence
 assertion, held-slot opacity even to admins, and the bounded query-count guard.
+
+`tests/identity/` (Phase 9) — `test_authentication.py`: the real OIDC login flow end to end
+through the local mock provider (`dev-mock-login` → `token` → an authenticated request with
+the resulting session token), rejection of a malformed/forged/expired ID token and an
+expired/unknown-subject session token, `test_real_oidc_principal_reaches_app_actor_id_at_key_
+claim_insert` (the same spy-on-cursor style as Phase 7/8's session-settings regression test,
+now proving a REAL authenticated principal's id — not a stub — reaches `app.actor_id` at the
+key-claim INSERT, through the identical shared mechanism), and `test_x_dev_user_id_is_
+rejected_under_dev_settings` (starts the actual app under `kairos.settings.dev` in a real
+subprocess and makes a real HTTP request against it — not a settings-flag simulation).
+`test_authorization.py`: PRD FR44's four roles and FR45's scoped-admin isolation, including
+`test_scoped_admin_cannot_cancel_booking_on_resource_they_do_not_administer` exercised through
+the real cancel endpoint, not just the service-level check. `tests/test_security.py`
+(Phase 9) — SEC-01 (GET/PATCH/cancel/history against another user's booking: 404 on every
+verb, and the response body's exact key set asserted, not just its status code) and SEC-06
+(a restricted resource: 404 on direct access AND absent from list results for a non-member,
+including the booking-creation and availability paths; a group member and the resource's own
+admin can still see it).
+
 Also runnable: `cd backend && ruff check . && ruff format --check . && mypy kairos` (all pass
-with zero findings as of Phase 8). CI (`.github/workflows/ci.yml`) runs all of this as three
+with zero findings as of Phase 9). CI (`.github/workflows/ci.yml`) runs all of this as three
 jobs — `lint`, `test`, `concurrency` — on every PR. The spike scripts under `scripts/spike/`
 are runnable but are diagnostic, not a test suite — see
 `docs/spikes/S1-postgres-verification.md` for what each one does and its recorded output.
@@ -290,6 +362,25 @@ None from Phase 0. From Phase 1's spike:
 - **S1.6's throughput numbers are a local, connection-overhead-dominated baseline**, not a
   production ceiling — Phase 29 (Test Plan CONC-06) re-measures this against a pooled,
   production-shaped topology.
+
+From Phase 9:
+
+- **PRD FR46 ("a resource may be restricted to a user group") has no corresponding schema
+  anywhere in Spec v1.0 §3** — confirmed directly: zero occurrences of "group" or "restrict"
+  in that document at all. RFC v1.0 §8.2 gestures at a `resource_group_id` inside an
+  aspirational authorization grant table, but the ACTUAL `resource_admin` grant Phase 2
+  implemented is keyed on `resource_id` directly, not any group concept — so even the RFC's
+  own gesture doesn't match what got built. This is a genuine gap in the source document set,
+  not an oversight in this phase's implementation. Phase 9 resolved it by adding the minimal
+  schema PRD FR46 and Test Plan SEC-06 concretely need — `user_group`, `user_group_membership`
+  (plain M2M), and a nullable `resource.restricted_group` FK (null = open, the default and the
+  state of every resource created before this phase). **This is deliberately minimal**: there
+  is no group-MANAGEMENT endpoint (create a group, add/remove a member) — those rows are
+  ORM-created directly in tests, same as `resource_admin` was before Phase 19 gives it one.
+  **Whichever phase builds admin-facing resource/group management (most likely Phase 19,
+  "Resource Administration & Offboarding") should treat this schema as already decided** —
+  extend it, don't redesign it, and don't let a differently-shaped group model creep in
+  without updating this entry and the Key Technical Decisions row that explains the choice.
 
 Genuine open questions from the source documents (offer window duration, nonexistent-time
 policy default, series bounds, etc.) are tracked in PRD v1.0 §11 and RFC v1.0 §18; they get

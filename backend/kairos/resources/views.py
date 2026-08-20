@@ -15,7 +15,7 @@ from kairos.core.constants import MAX_AVAILABILITY_QUERY_DAYS
 from kairos.core.exceptions import NotFoundError, PolicyValidationError
 from kairos.core.pagination import decode_cursor, encode_cursor, parse_limit
 from kairos.core.views import KairosAPIView
-from kairos.identity.authorization import is_operations, is_resource_admin
+from kairos.identity.authorization import AuthorizationService
 from kairos.identity.models import AppUser
 
 from .models import Resource
@@ -48,12 +48,15 @@ class ResourceCollectionView(KairosAPIView):
     is Phase 19."""
 
     def get(self, request: Request) -> Response:
+        user = cast(AppUser, request.user)
         try:
             limit = parse_limit(request.query_params.get("limit"))
         except ValueError as exc:
             raise PolicyValidationError("limit", str(exc)) from exc
 
-        qs = Resource.objects.all()
+        # PRD FR46 / SEC-06: a restricted resource must be ABSENT from list
+        # results for a non-member, not merely 404 on direct access.
+        qs = AuthorizationService.visible_resources_queryset(user)
 
         cursor_param = request.query_params.get("cursor")
         if cursor_param:
@@ -83,10 +86,15 @@ class ResourceDetailView(KairosAPIView):
     """GET /api/v1/resources/{id} (Spec v1.0 §5.14)."""
 
     def get(self, request: Request, pk: uuid.UUID) -> Response:
+        user = cast(AppUser, request.user)
         try:
             resource = Resource.objects.get(id=pk)
         except Resource.DoesNotExist as exc:
             raise NotFoundError from exc
+        if not AuthorizationService.can_view_resource(user, resource):
+            # 404, not 403 — SEC-06: existence itself is the secret for a
+            # restricted resource's non-members.
+            raise NotFoundError
         return Response(ResourceSerializer(resource).data)
 
 
@@ -102,6 +110,10 @@ class ResourceAvailabilityView(KairosAPIView):
             resource = Resource.objects.get(id=pk)
         except Resource.DoesNotExist as exc:
             raise NotFoundError from exc
+        if not AuthorizationService.can_view_resource(user, resource):
+            # 404 — RFC v1.0 §8.2: "Restricted resources must not leak
+            # existence through availability views either."
+            raise NotFoundError
 
         from_param = request.query_params.get("from")
         to_param = request.query_params.get("to")
@@ -129,7 +141,9 @@ class ResourceAvailabilityView(KairosAPIView):
         # Computed once, not per row — the N+1 guard RFC v1.0 §7.2 asks
         # for. Whether the requester can see identifying fields depends
         # only on (requester, resource), never on which booking.
-        privileged = is_resource_admin(user, resource.id) or is_operations(user)
+        privileged = AuthorizationService.can_administer_resource(
+            user, resource.id
+        ) or AuthorizationService.is_operations(user)
 
         bookings = (
             Booking.objects.filter(
