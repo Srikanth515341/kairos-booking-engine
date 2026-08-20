@@ -40,16 +40,19 @@ Implementation Plan — all committed under [`docs/`](docs/).
 
 ## Status
 
-🚧 **Early construction.** Repository scaffolding and the six planning documents are in
-place (Phase 0), and the core architectural bet — a PostgreSQL exclusion constraint as the
-correctness mechanism — has been verified against a real PostgreSQL 16 instance (Phase 1
-spike; see [`docs/spikes/S1-postgres-verification.md`](docs/spikes/S1-postgres-verification.md)).
-The Django project and the core schema now exist (Phase 2): `app_user`, `resource`,
-`resource_admin`, and `booking`, with the `no_overlapping_bookings` `EXCLUDE` constraint
-enforced at the database level. No API, no service layer, and no concurrency proof yet —
-those are Phase 3 onward. See [`CLAUDE.md`](CLAUDE.md) for exactly what is and isn't built,
-and [`docs/06-implementation-plan.md`](docs/06-implementation-plan.md) for the full
-31-phase build plan.
+🏁 **Milestone 1 reached.** The core guarantee is proven under genuine concurrency: 200
+independently-connected clients, released simultaneously against one identical slot,
+exactly one succeeds — verified 10 consecutive times and running in CI on every commit
+(Phase 3). Repository scaffolding and the six planning documents are in place (Phase 0);
+the architectural bet — a PostgreSQL exclusion constraint as the correctness mechanism —
+was verified against a real PostgreSQL 16 instance (Phase 1 spike; see
+[`docs/spikes/S1-postgres-verification.md`](docs/spikes/S1-postgres-verification.md)); the
+Django project and core schema exist (Phase 2): `app_user`, `resource`, `resource_admin`,
+and `booking`, with the `no_overlapping_bookings` `EXCLUDE` constraint enforced at the
+database level. No API, no service layer, no auth yet — those are Phase 4 onward. See
+[`CLAUDE.md`](CLAUDE.md) for exactly what is and isn't built, and
+[`docs/06-implementation-plan.md`](docs/06-implementation-plan.md) for the full 31-phase
+build plan.
 
 ## Tech stack
 
@@ -117,26 +120,36 @@ No API and no frontend exist yet — see Status above and [`CLAUDE.md`](CLAUDE.m
 
 ## Running the test suite
 
-A schema-level smoke test exists today, confirming the `EXCLUDE` constraint rejects a
-sequential overlapping insert with SQLSTATE `23P01`:
+**This is the command that matters most in this repository.** 200 independently-connected
+clients (their own threads, their own psycopg connections — never a shared pool), released
+simultaneously via a `threading.Barrier` against one identical time slot, with production
+write-path session settings applied. Asserts exactly one succeeds, verified against ground
+truth in the database, not just response codes — 10 consecutive times:
+
+```bash
+cd backend
+pytest tests/concurrency -v
+```
+
+This is Milestone 1: the project's central claim, proven under genuine concurrency, running
+in CI on every commit as its own named `concurrency` job. If you're reviewing this project,
+that's the command to run first.
+
+The full suite, including the schema-level smoke test and the schema-assertion check that
+fails the moment anyone narrows the `EXCLUDE` predicate:
 
 ```bash
 cd backend
 pytest
 ```
 
-This is **not** the project's centerpiece test. That's a **concurrency stress test**: 200
-independently-connected clients, released simultaneously via a synchronization barrier
-against the same contested time slot, asserting that exactly one succeeds — run 100
-consecutive times before release. It is introduced in Phase 3 and will be documented here
-as a single, highlighted command once it exists. If you're reviewing this project once it
-lands, that's the command to run first.
+`ruff check . && ruff format --check . && mypy kairos` also passes with zero findings.
 
 ## Feature status
 
 | Feature | Status |
 |---|---|
-| Core exclusion-constraint guarantee | Schema in place (Phase 1–2); concurrency proof pending (Phase 3) |
+| Core exclusion-constraint guarantee | **Proven under concurrency — Milestone 1** (Phase 1–3) |
 | Booking creation / edit / cancel | Not started (Phase 4–7) |
 | Idempotent writes | Not started (Phase 5) |
 | Audit trail | Not started (Phase 8) |

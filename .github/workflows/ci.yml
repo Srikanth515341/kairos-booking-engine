@@ -1,9 +1,8 @@
 name: CI
 
-# Placeholder pipeline. Real jobs (lint, test, concurrency) are added in
-# Phase 3 — see docs/06-implementation-plan.md. This file exists from
-# Phase 0 so that every PR from Phase 1 onward has a status check attached
-# to it from the very first one.
+# Phase 3 (Implementation Plan §3): three jobs. `concurrency` is separate and
+# named so a reviewer browsing PRs sees "concurrency ✓" on every single one —
+# this project's central proof runs on every commit, not just at release time.
 
 on:
   push:
@@ -11,10 +10,86 @@ on:
   pull_request:
     branches: [main]
 
+defaults:
+  run:
+    working-directory: backend
+
 jobs:
-  placeholder:
+  lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Placeholder — real jobs land in Phase 3
-        run: echo "CI skeleton only. lint / test / concurrency jobs are added in Phase 3."
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+      - name: ruff check
+        run: ruff check .
+      - name: ruff format --check
+        run: ruff format --check .
+      - name: mypy (strict, kairos package)
+        run: mypy kairos
+
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        # The standard postgres:16 image ships contrib modules compiled in;
+        # btree_gist just needs `CREATE EXTENSION`, which the bookings
+        # migration already does (BtreeGistExtension()) — no extra service
+        # setup required beyond the image itself.
+        image: postgres:16
+        env:
+          POSTGRES_USER: kairos
+          POSTGRES_PASSWORD: kairos
+          POSTGRES_DB: kairos_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL_TEST: postgresql://kairos:kairos@localhost:5432/kairos_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+      - name: Run unit + integration tests
+        run: pytest --ignore=tests/concurrency -v
+
+  concurrency:
+    name: concurrency
+    runs-on: ubuntu-latest
+    env:
+      DATABASE_URL_TEST: postgresql://kairos:kairos@localhost:5432/kairos_test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Start Postgres (max_connections=600)
+        # A plain `docker run`, not the `services:` block above: GitHub
+        # Actions services can't override the container's startup command,
+        # and CONC-01 alone opens 200 simultaneous connections — well past
+        # Postgres's default max_connections=100. Same setting as
+        # infra/docker-compose.yml, for the same reason (spike/test-scale
+        # concurrency, not a production sizing decision).
+        run: |
+          docker run -d --name kairos_ci_postgres \
+            -e POSTGRES_USER=kairos -e POSTGRES_PASSWORD=kairos -e POSTGRES_DB=kairos_test \
+            -p 5432:5432 \
+            postgres:16 -c max_connections=600
+          for i in $(seq 1 30); do
+            docker exec kairos_ci_postgres pg_isready -U kairos && break
+            sleep 1
+          done
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+      - name: Run the concurrency proof suite (CONC-01, CONC-02, CONC-05)
+        run: pytest tests/concurrency -v
