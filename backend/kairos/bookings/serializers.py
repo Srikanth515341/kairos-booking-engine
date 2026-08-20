@@ -151,9 +151,11 @@ class BookingResponseSerializer(serializers.Serializer[Booking]):
     def get_user_id(self, obj: Booking) -> str:
         return str(obj.user_id)
 
-    def get_series_id(self, obj: Booking) -> None:
-        # `booking.series_id` doesn't exist until Phase 11 (recurring_series).
-        return None
+    def get_series_id(self, obj: Booking) -> str | None:
+        # `booking.series_id` exists since Phase 11 (recurring_series) but
+        # no write path sets it yet (Phase 12 is the first to create
+        # occurrence rows) — every existing booking has it NULL today.
+        return str(obj.series_id) if obj.series_id else None
 
     def get_cancelled_by(self, obj: Booking) -> str | None:
         return str(obj.cancelled_by_id) if obj.cancelled_by_id else None
