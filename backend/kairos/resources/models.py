@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import uuid
+from typing import Any
 
 from django.db import models
 
+from kairos.core.timezones import validate_iana_zone
 from kairos.identity.models import AppUser, UserGroup
 
 
@@ -74,3 +76,11 @@ class Resource(models.Model):
 
     def __str__(self) -> str:
         return self.name
+
+    def save(self, *args: Any, **kwargs: Any) -> None:
+        # Implementation Plan Phase 10 (PRD FR8): validated at the model
+        # layer, not only at a future write-endpoint's serializer, so no
+        # write path — including the direct ORM writes every resource goes
+        # through until Phase 19 adds a real endpoint — can bypass it.
+        validate_iana_zone(self.timezone)
+        super().save(*args, **kwargs)

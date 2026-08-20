@@ -9,6 +9,12 @@ dependencies = [
     "dj-database-url>=2.3,<3",
     "djangorestframework>=3.18,<3.19",
     "pyjwt[crypto]>=2.10,<3",
+    # Pinned exactly, not a range (Implementation Plan Phase 10; Test Plan
+    # TZ-03 Test A) — staleness must be a tracked, deliberate quantity, not
+    # "whatever the base image/interpreter happened to ship." Windows and
+    # many minimal Linux images have no system IANA database at all, so
+    # `zoneinfo` depends on this package being present, not optional.
+    "tzdata==2026.3",
 ]
 
 [project.optional-dependencies]
