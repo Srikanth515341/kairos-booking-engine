@@ -45,15 +45,19 @@ kairos-booking-engine/
 │   │   │                   # db.py (write-path session settings), idempotency.py (Phase 5),
 │   │   │                   # models.py (IdempotencyKey — a real Django app since Phase 5),
 │   │   │                   # management/commands/cleanup_idempotency_keys.py
-│   │   ├── identity/       # app_user, resource_admin, authentication.py (# STUB, Phase 4)
-│   │   ├── resources/      # resource
+│   │   ├── identity/       # app_user, resource_admin, authentication.py (# STUB, Phase 4),
+│   │   │                   # authorization.py (is_resource_admin/is_operations, Phase 6)
+│   │   ├── resources/      # resource, serializers.py, views.py, urls.py (list/detail/
+│   │   │                   # availability — Phase 6; writes are Phase 19)
 │   │   ├── bookings/       # booking, services.py, serializers.py, views.py, urls.py
 │   │   ├── urls.py, wsgi.py
 │   ├── tests/
 │   │   ├── test_booking_exclusion_smoke.py
 │   │   ├── test_schema_assertion.py   # RECON-05 CI form — fails if the predicate is narrowed
 │   │   ├── conftest.py                # app_user / active_resource fixtures, shared
-│   │   ├── bookings/                  # test_services.py, test_views.py, test_idempotency.py
+│   │   ├── bookings/                  # test_services.py, test_views.py, test_idempotency.py,
+│   │   │                              # test_read_endpoints.py (Phase 6)
+│   │   ├── resources/                 # test_views.py (Phase 6 — list/detail/availability)
 │   │   └── concurrency/               # Milestone 1 — the project's central proof
 │   │       ├── harness.py             # barrier-released, independent-connection harness
 │   │       ├── conftest.py
@@ -68,11 +72,13 @@ kairos-booking-engine/
     └── spike/             # throwaway S1 spike scripts — will NOT be extended after Phase 1
 ```
 
-`POST /api/v1/bookings` is live and idempotent (Phase 5 — `Idempotency-Key` is required;
-missing it is 400). No other endpoints, no real auth (Phase 9 — currently a dev-only
-`X-Dev-User-Id` header stub, clearly marked `# STUB` in
-`kairos/identity/authentication.py`). `backend/.venv/` is local and gitignored; recreate with
-`python -m venv .venv && pip install -e ".[dev]"` from `backend/`.
+Endpoints live (Phase 6 adds the read path to Phase 4/5's write path):
+`POST`/`GET /api/v1/bookings`, `GET /api/v1/bookings/{id}`, `GET /api/v1/resources`,
+`GET /api/v1/resources/{id}`, `GET /api/v1/resources/{id}/availability`. Booking creation is
+idempotent (Phase 5 — `Idempotency-Key` is required; missing it is 400). No edit/cancel
+(Phase 7), no real auth (Phase 9 — currently a dev-only `X-Dev-User-Id` header stub, clearly
+marked `# STUB` in `kairos/identity/authentication.py`). `backend/.venv/` is local and
+gitignored; recreate with `python -m venv .venv && pip install -e ".[dev]"` from `backend/`.
 
 ## Completed Phases
 
@@ -84,21 +90,25 @@ missing it is 400). No other endpoints, no real auth (Phase 9 — currently a de
 | 3 | Concurrency Proof & CI Pipeline 🏁 Milestone 1 | Barrier-released concurrency harness (`tests/concurrency/harness.py`); CONC-01 (N=200, 10 runs), CONC-02 (partial + 5-way chained overlap), CONC-05 (cancel-and-rebook race) all pass reliably; RECON-05 CI-form schema assertion added and verified to fail on a manually narrowed predicate; full CI pipeline (`lint`, `test`, `concurrency` — three separate jobs) wired up; two new empirical findings beyond the carried-forward 40P01 one (see Key Technical Decisions) | Pending (on branch `phase-03-concurrency-proof-ci`) |
 | 4 | Service Layer & Booking Creation API | DRF wired up (`/api/v1`, JSON only); `POST /api/v1/bookings` live with policy validation (bookable hours, max duration, past-dating, 365-day horizon), stub `X-Dev-User-Id` auth, `X-Request-Id` on every response, structured JSON logging, and the Spec §6 error envelope on every error path; `BookingService.create_booking` catches all four write-path SQLSTATEs specifically (23P01→409, 55P03/40P01/57014→503+Retry-After); verified live against the real dev server (not just the test client); all Phase 2/3 tests still pass | Pending (on branch `phase-04-booking-creation-api`) |
 | 5 | Idempotency — The Transaction Boundary ⚠️ Subtle | `idempotency_key` table with a genuine composite `(user_id, key)` PRIMARY KEY (Django 6.1's `CompositePrimaryKey` — no surrogate-key workaround needed here, unlike Phase 2's `resource_admin`); `run_idempotent_write` (generic, in `core`, reused by every future write path) claims the key and runs the protected write in one transaction per RFC §11.2, recording a 409 outcome in its own follow-up transaction after rollback, and recording nothing at all for a 503 (outcome genuinely unknown); IDEM-01–04, 06 (100 reps), 09, 10, 11 all pass; verified live (replay returns the original booking, not a 409) | Pending (on branch `phase-05-idempotency`) |
+| 6 | Read Path & Availability View | `GET /bookings/{id}` (owner/admin/operations, else 404 per Spec §1) and `GET /bookings` (cursor pagination, `idx_booking_user_starts`-shaped, held rows always excluded); `GET /resources`, `GET /resources/{id}` (read-only; writes are Phase 19); `GET /resources/{id}/availability` bounded to 92 days, `booking_id`/`owner` omitted entirely (not nulled) unless the requester owns the booking or administers the resource, held slots never reveal them to anyone (SEC-05); keyset (not offset) pagination proven stable under a concurrent insert between page fetches; N+1 guard verified via `django_assert_max_num_queries`; all prior tests still green (see the `MAX_ROUND_ATTEMPTS` finding below) | Pending (on branch `phase-06-read-path-availability`) |
 
 ## Current Phase In Progress
 
-None. Phase 5 is complete pending review and merge. Phase 6 (Read Path & Availability View)
-is next.
+None. Phase 6 is complete pending review and merge. Phase 7 (Cancellation & Editing) is
+next.
 
 ## NOT Yet Built
 
-No read endpoints (Phase 6), no edit/cancel (Phase 7), no real authentication (Phase 9 —
+No edit/cancel (Phase 7), no real authentication (Phase 9 —
 `X-Dev-User-Id` is an explicitly marked stub), no Celery/Redis, no frontend, no hold
 reclamation (booking creation does not yet run the cleanup-on-write DELETE from Spec §4.1
 step 2, since `held` rows don't exist until Phase 15), no
 `recurring_series`/`waitlist_entry`/`waitlist_offer`/`audit_log`/`system_check_run` tables
 (each arrives with the phase that needs it — see the Key Technical Decisions and Phase Index
-in `docs/06-implementation-plan.md`). IDEM-05 (recurring replay) needs Phase 12's endpoint;
+in `docs/06-implementation-plan.md`). No replica routing (Phase 30 — `data_freshness` is
+hardcoded `"primary"`, always true today since no replica exists). `GET /bookings/{id}/history`
+is Phase 8. Resource CRUD (create/update/admin grants) is Phase 19 — the Phase 6 resource
+endpoints are read-only. IDEM-05 (recurring replay) needs Phase 12's endpoint;
 IDEM-07/08 (fault injection — process kill mid-transaction, proxy-level response drop) need
 tooling that arrives in Phase 28; idempotency coverage on cancel/edit/waitlist/confirm
 arrives with those endpoints (Phases 7, 14, 16). `booking.series_id` does not
@@ -137,7 +147,13 @@ and `git log` first.
 | `REST_FRAMEWORK["UNAUTHENTICATED_USER"]` is explicitly `None` | DRF's default is the string path to `django.contrib.auth.models.AnonymousUser` — importing that module pulls in `ContentType`, which fails because `contenttypes` isn't installed (Phase 2's deliberate decision). `None` makes DRF leave `request.user` as `None` for anonymous requests instead, which `IsAuthenticated` already handles correctly without needing `contenttypes` at all | `kairos/settings/base.py` |
 | `StubUserIdAuthentication.authenticate_header()` returns `"X-Dev-User-Id"` instead of the `BaseAuthentication` default of `None` | Without a `WWW-Authenticate` challenge available, DRF's `APIView.handle_exception()` silently downgrades `NotAuthenticated` from 401 to 403 (HTTP requires a challenge header alongside a bare 401). Spec v1.0 §5.1 documents 401 specifically for `unauthorized` | `kairos/identity/authentication.py` |
 | `BookingService.create_booking` calls `booking.refresh_from_db()` immediately after `Booking.objects.create(...)` | `.create()` leaves fields exactly as assigned in Python — `time_range` stays the plain tuple passed in, not the `Range` object a fresh `SELECT` returns, which broke response serialization (`AttributeError: 'tuple' object has no attribute 'lower'`) until this was added. Also correctly picks up the generated `starts_at` column and the DB-stored `created_at` precision | `kairos/bookings/services.py` |
-| CONC-01/02/05's `MAX_ROUND_ATTEMPTS` raised from 3 to 6 | Phase 4's "confirm all CONC tests still pass" check caught real flakiness: at N=200 the per-attempt zero-success rate is ~15-20%, so 3 consecutive zero-success attempts (retry budget exhausted) happened in a live run during this phase — a ~5% chance of flaking any given 10-run suite at the old value. 6 pushes that below ~0.1%. **Relevant to Phase 28**: the full 100-run CONC-01 exercise multiplies this same per-run risk by 10×; revisit this budget (or the underlying timeout tuning RFC v1.0 §18 already flags) before that phase, not after it flakes | `tests/concurrency/test_conc_01.py`, `test_conc_02.py`, `test_conc_05.py` |
+| CONC-01/02/05's `MAX_ROUND_ATTEMPTS` raised 3 → 6 (Phase 4), then 6 → 10 (Phase 6) | Phase 4's "confirm all CONC tests still pass" check caught real flakiness: at N=200 the per-attempt zero-success rate is ~15-20%, so 3 consecutive zero-success attempts (retry budget exhausted) happened in a live run — a ~5% chance of flaking any given 10-run suite at the old value; 6 pushed that below ~0.1% *assuming independent attempts*. Phase 6's own "confirm all prior tests still pass" check then directly observed a genuine 6-in-a-row exhaustion when CONC-01 ran immediately after ~55 other tests in the same session (including Phase 5's IDEM-06 with its own 100 threaded requests) — re-running in isolation immediately after showed the ordinary ~15% rate. This means the failures are somewhat CORRELATED under sustained system load, not the cleanly independent trials the original estimate assumed; 10 adds headroom against that. **Relevant to Phase 28**: the full 100-run CONC-01 exercise multiplies whichever risk remains by 10×, and a real CI runner's load profile may differ from this dev machine's — revisit this budget (or the underlying timeout tuning RFC v1.0 §18 already flags) before that phase, not after it flakes | `tests/concurrency/test_conc_01.py`, `test_conc_02.py`, `test_conc_05.py` |
+| `NotFoundError` (renamed from Phase 4's `ResourceNotFoundError`) is used for every 404 `not_found` case — missing/inactive resource, missing booking, and a booking the requester can't view | Phase 6 added booking-not-found and view-permission-denied cases that map to the identical 404 `not_found` code Phase 4's resource-lookup already used. Reusing one exception (renamed to drop the resource-specific name) avoids two exception classes with identical HTTP behavior | `kairos/core/exceptions.py` |
+| A non-owner, non-admin `GET /bookings/{id}` returns 404, not 403, exactly like a nonexistent booking | Spec v1.0 §1's convention: object-level protection is 404 so a caller can't distinguish "doesn't exist" from "exists but isn't yours" — unlike `resource_id`-scoped `GET /bookings` (403), where the resource's existence is already known/browsable, so only the *action* is gated | `kairos/bookings/views.py` (`BookingDetailView`) |
+| `KairosAPIView` (shared base class in `core`) declares `authentication_classes`/`permission_classes` once | By Phase 6 there are five view classes needing the identical stub-auth + IsAuthenticated configuration Phase 4 first wrote inline on `BookingCreateView` — worth extracting once real duplication exists, not before | `kairos/core/views.py` |
+| Availability's `booking_id`/`owner` reveal check (`is_resource_admin`/`is_operations`) is computed ONCE per request, outside the per-booking loop | The N+1 guard RFC v1.0 §7.2 asks for: whether a field is revealed depends only on (requester, resource), never on which specific booking, so computing it once and reusing it for every busy block keeps the query count constant regardless of how many bookings are in range | `kairos/resources/views.py` (`ResourceAvailabilityView`) |
+| Held slots omit `booking_id`/`owner` unconditionally in the availability view — even from a resource admin | Spec v1.0 §5.7: exposing which booking a hold corresponds to would leak waitlist queue state to anyone, admin included. This is a separate rule from the ownership-based omission, and stricter — no privilege level reveals a hold's identity through this endpoint | `kairos/resources/views.py` |
+| Cursor pagination on `GET /bookings` and `GET /resources` uses keyset filtering (`Q(sort_key__gt=...) \| Q(sort_key=..., id__gt=...)`), never `OFFSET` | Spec v1.0 §8: an offset shifts under concurrent inserts/deletes, silently skipping or duplicating rows — every list endpoint here is concurrently written. Proven directly: a test inserts a row between two page fetches and asserts no skips or duplicates | `kairos/core/pagination.py`, `tests/bookings/test_read_endpoints.py` |
 | `idempotency_key`'s PK uses Django 6.1's `models.CompositePrimaryKey("user_id", "key")` — a genuine composite PK, not the surrogate-key-plus-`UniqueConstraint` workaround `resource_admin` needed in Phase 2 | Phase 5's DoD explicitly verifies the PK via `\d idempotency_key`; `CompositePrimaryKey` (new since Django 5.2) makes this a real composite PK now rather than requiring a workaround. Confirmed via `psql \d`: `idempotency_key_pkey PRIMARY KEY, btree (user_id, key)` | `kairos/core/models.py` |
 | Write-path session settings are applied ONCE at the top of `run_idempotent_write`'s outer transaction, before the key-claim INSERT — not left to `BookingService`'s own (redundant, too-late) internal call | The key-claim INSERT is now the FIRST statement in the transaction (Spec v1.0 §4.1's literal ordering) — if `lock_timeout` etc. were only applied inside the nested `create_booking()` call, a concurrent replay's key-claim insert would block using Postgres's default (no timeout) instead of the intended 3s budget, undermining IDEM-06's request_in_progress path entirely. Extracted the shared helper into `kairos/core/db.py` (RFC §4.1's "db helpers," reserved since Phase 2) so both `BookingService` and the idempotency wrapper call the identical function — the nested call inside `create_booking()` re-applies the same values harmlessly | `kairos/core/db.py`, `kairos/core/idempotency.py` |
 | A 409 `slot_unavailable` idempotency outcome is recorded in its OWN, separate transaction after the write's transaction rolls back — never inside the same transaction as the failed write | RFC v1.0 §11.2 states this explicitly ("in its own transaction after the rollback"). The failed write's rollback undoes the ENTIRE transaction, including the key claim — there is nothing left to `UPDATE`, so the 409 outcome must be a fresh `INSERT` in a new transaction. A 503 outcome is the opposite: nothing is recorded at all, since the write's outcome is genuinely unknown (Spec v1.0 §5.1) and a retry with the same key should start completely fresh, not receive a stale "unknown" result | `kairos/core/idempotency.py` (`run_idempotent_write`, `_record_conflict_outcome`) |
@@ -171,19 +187,23 @@ pytest                        # full suite: the above + smoke test + schema asse
 
 `tests/concurrency/` — CONC-01 (N=200 identical-slot, 10 runs), CONC-02 (partial + 5-way
 chained overlap, 10 runs each), CONC-05 (cancel-and-rebook race, 10 runs). Each round is
-retried up to 3 times only if it produced zero successes (a documented liveness
-characteristic — see Key Technical Decisions); more than one success on any single attempt
-fails immediately and is never retried. `tests/test_schema_assertion.py` (RECON-05 CI form)
-fails the moment `no_overlapping_bookings`'s predicate is narrowed — verified by hand during
-Phase 3 (narrowed it, watched the test fail, reverted). `tests/bookings/` covers
+retried up to 10 times only if it produced zero successes (a documented, load-correlated
+liveness characteristic — see Key Technical Decisions); more than one success on any single
+attempt fails immediately and is never retried. `tests/test_schema_assertion.py` (RECON-05
+CI form) fails the moment `no_overlapping_bookings`'s predicate is narrowed — verified by
+hand during Phase 3 (narrowed it, watched the test fail, reverted). `tests/bookings/` covers
 `BookingService` (session-settings assertion, all four SQLSTATE translations — 55P03 forced
 genuinely via a real held row, 40P01/57014 forced by simulation since natural reproduction
-isn't controllable on demand), the API (every Test Plan §10 policy-validation row, 409, 404,
-401, `X-Request-Id`), and idempotency (`test_idempotency.py`, Phase 5) — IDEM-01–04, 06 (100
-barrier-released repetitions), 09, 10, 11, plus the composite-PK schema check and the cleanup
-command. Also runnable:
+isn't controllable on demand), the write API (every Test Plan §10 policy-validation row,
+409, 404, 401, `X-Request-Id`), idempotency (`test_idempotency.py`) — IDEM-01–04, 06 (100
+barrier-released repetitions), 09, 10, 11, plus the composite-PK schema check and the
+cleanup command — and the read path (`test_read_endpoints.py`, Phase 6): detail/list
+authorization, held-row exclusion, and cursor-pagination stability under a concurrent
+insert. `tests/resources/` (Phase 6) covers resource list/detail and availability — the
+92/93-day boundary, SEC-05's key-absence assertion, held-slot opacity even to admins, and
+the bounded query-count guard. Also runnable:
 `cd backend && ruff check . && ruff format --check . && mypy kairos` (all pass with zero
-findings as of Phase 5). CI (`.github/workflows/ci.yml`) runs all of this as three jobs —
+findings as of Phase 6). CI (`.github/workflows/ci.yml`) runs all of this as three jobs —
 `lint`, `test`, `concurrency` — on every PR. The spike scripts under `scripts/spike/` are
 runnable but are diagnostic, not a test suite — see
 `docs/spikes/S1-postgres-verification.md` for what each one does and its recorded output.

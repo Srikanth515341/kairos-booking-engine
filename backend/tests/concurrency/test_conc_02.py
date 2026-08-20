@@ -35,7 +35,7 @@ RUNS = 10
 # as CONC-01, tuned there against an observed ~15-20% zero-success rate per
 # attempt at N=200 (this test's party counts are much smaller, so the real
 # risk here is lower — matching the value keeps the reasoning in one place).
-MAX_ROUND_ATTEMPTS = 6
+MAX_ROUND_ATTEMPTS = 10  # see test_conc_01.py Phase 6 tuning note
 
 
 def _insert_action(

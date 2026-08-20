@@ -16,7 +16,7 @@ from rest_framework import serializers
 
 from kairos.bookings.models import Booking
 from kairos.core.constants import MAX_ADVANCE_HORIZON_DAYS
-from kairos.core.exceptions import PolicyValidationError, ResourceNotFoundError
+from kairos.core.exceptions import NotFoundError, PolicyValidationError
 from kairos.resources.models import Resource, ResourceStatus
 
 
@@ -29,12 +29,12 @@ class BookingCreateSerializer(serializers.Serializer[None]):
         try:
             resource = Resource.objects.get(id=attrs["resource_id"])
         except Resource.DoesNotExist as exc:
-            raise ResourceNotFoundError from exc
+            raise NotFoundError from exc
         if resource.status != ResourceStatus.ACTIVE:
             # An inactive resource is treated identically to a nonexistent
             # one (Spec v1.0 §5.1) — not a distinct error, so its existence
             # isn't leaked.
-            raise ResourceNotFoundError
+            raise NotFoundError
 
         start: datetime = attrs["start"]
         end: datetime = attrs["end"]

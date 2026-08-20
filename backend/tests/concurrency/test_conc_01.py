@@ -49,9 +49,18 @@ RUNS = 10
 # Phase 4 tuning note: the observed zero-success rate per attempt at this
 # scale is roughly 15-20%. At MAX_ROUND_ATTEMPTS=3, three-in-a-row exhausts
 # the budget often enough to flake a 10-run suite a few percent of the time
-# (observed directly). 6 pushes that below ~0.1% per suite while adding
-# negligible time to the common case (most rounds resolve on attempt 1).
-MAX_ROUND_ATTEMPTS = 6
+# (observed directly).
+#
+# Phase 6 tuning note: raised 6 -> 10. Running the full suite back-to-back
+# (this test immediately after ~55 others, including Phase 5's IDEM-06 with
+# its own 100 threaded requests) produced a genuine 6-in-a-row exhaustion —
+# proof the per-attempt failures are somewhat CORRELATED under sustained
+# system load, not the cleanly independent trials the original probability
+# estimate assumed. Re-running in isolation immediately after showed the
+# ordinary ~15% rate. 10 adds headroom against that correlated-load case;
+# see CLAUDE.md for the full note and the reminder to revisit this before
+# Phase 28's full 100-run exercise multiplies whichever risk remains.
+MAX_ROUND_ATTEMPTS = 10
 
 
 def _insert_action(

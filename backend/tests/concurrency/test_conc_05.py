@@ -45,7 +45,7 @@ RUNS = 10
 # comment for the full reasoning and the Phase 4 tuning note behind the
 # value (matched here for consistency; this test's party count is much
 # smaller, so the real risk is lower).
-MAX_ROUND_ATTEMPTS = 6
+MAX_ROUND_ATTEMPTS = 10  # see test_conc_01.py Phase 6 tuning note
 
 
 def _insert_action(

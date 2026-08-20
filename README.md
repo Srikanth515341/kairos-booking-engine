@@ -53,9 +53,11 @@ database level. `POST /api/v1/bookings` is live (Phase 4) with policy validation
 SQLSTATE-to-HTTP translation on every write-path outcome, and structured logging — and
 retry-safe (Phase 5): every write carries an idempotency key, claimed in the same
 transaction as the booking itself, so a network retry can never tell a user their own
-successful booking is unavailable. No read/edit/cancel endpoints yet (Phase 6–7), and auth
-is a dev-only stub (Phase 9 does the real thing). See [`CLAUDE.md`](CLAUDE.md) for exactly
-what is and isn't built, and
+successful booking is unavailable. The read path is live too (Phase 6): booking detail/list
+with cursor pagination, and resource availability with field-level authorization —
+`booking_id`/`owner` are omitted entirely, not nulled, unless you own the booking or
+administer the resource. No edit/cancel yet (Phase 7), and auth is a dev-only stub (Phase 9
+does the real thing). See [`CLAUDE.md`](CLAUDE.md) for exactly what is and isn't built, and
 [`docs/06-implementation-plan.md`](docs/06-implementation-plan.md) for the full 31-phase
 build plan.
 
@@ -148,6 +150,15 @@ and reuse it across retries of that SAME action, never a new one per HTTP attemp
 the exact same request (same key, same body) and you'll get the original booking back with
 an `Idempotent-Replay: true` header, not a 409.
 
+Read it back, list your bookings, and check availability:
+
+```bash
+curl -s http://127.0.0.1:8000/api/v1/bookings -H "X-Dev-User-Id: <user-id-from-above>" | python -m json.tool
+
+curl -s "http://127.0.0.1:8000/api/v1/resources/<resource-id-from-above>/availability?from=2026-09-01&to=2026-09-08" \
+  -H "X-Dev-User-Id: <user-id-from-above>" | python -m json.tool
+```
+
 No frontend yet — see Status above and [`CLAUDE.md`](CLAUDE.md).
 
 ## Running the test suite
@@ -185,6 +196,7 @@ pytest
 | Booking creation | **Live** — `POST /api/v1/bookings` (Phase 4) |
 | Booking edit / cancel | Not started (Phase 7) |
 | Idempotent writes | **Live** — required `Idempotency-Key` on booking creation (Phase 5) |
+| Booking detail / list, resource list / detail / availability | **Live** — cursor pagination, field-level authorization (Phase 6) |
 | Audit trail | Not started (Phase 8) |
 | Auth & scoped authorization | Not started (Phase 9) |
 | DST-correct recurring bookings | Not started (Phase 10–13) |
