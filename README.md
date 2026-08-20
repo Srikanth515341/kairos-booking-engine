@@ -40,7 +40,9 @@ Implementation Plan — all committed under [`docs/`](docs/).
 
 ## Status
 
-🏁 **Milestone 1 reached.** The core guarantee is proven under genuine concurrency: 200
+🏁 **Milestone 2 reached** (`v0.2.0-milestone-2-recurrence-dst-correct`) — recurring bookings
+now work end to end, DST-correct, through a real two-step HTTP flow. 🏁 **Milestone 1** — the
+core guarantee proven under genuine concurrency: 200
 independently-connected clients, released simultaneously against one identical slot,
 exactly one succeeds — verified 10 consecutive times and running in CI on every commit
 (Phase 3). Repository scaffolding and the six planning documents are in place (Phase 0);
@@ -85,8 +87,17 @@ approach that silently drifts by an hour after every DST transition. A nonexiste
 ambiguous one (a fall-back overlap) resolves to the first, pre-transition instant. Verified
 against Europe/Paris, America/New_York, and Australia/Sydney (whose DST runs in the opposite
 calendar direction, catching sign errors the northern-hemisphere zones can't) and a zone with
-no DST at all. No API surface yet — this is the engine only; Phase 12 wires it up to real
-endpoints. See
+no DST at all. That engine is wired up to real endpoints now (Phase 12):
+`POST /bookings/recurring/preview` computes a full series and reports conflicts and DST
+adjustments without writing anything, and `POST /bookings/recurring` requires the caller to
+explicitly acknowledge every one of them before creating a single row — a series quietly
+missing an occurrence the booker never noticed is exactly the failure class this project
+exists to eliminate. Each occurrence commits in its own independent transaction, so one
+contested week never blocks the other seven or holds a lock across the whole resource; a
+conflict that arises between preview and confirm is reported distinctly from one the booker
+already knew about. The confirm response is idempotent byte-for-byte, not just once-per-key —
+a replay returns the identical outcome rather than re-evaluating anything. A recurring series
+can be cancelled going forward without touching its history. See
 [`CLAUDE.md`](CLAUDE.md) for exactly what is and isn't built, and
 [`docs/06-implementation-plan.md`](docs/06-implementation-plan.md) for the full 31-phase
 build plan.
@@ -277,8 +288,9 @@ pytest
 | Audit trail | **Live** — trigger-based, append-only by database grant, `GET /bookings/{id}/history` (Phase 8) |
 | Auth & scoped authorization | **Live** — real OIDC session tokens, four roles, scoped resource admin, restricted resources (Phase 9) |
 | Timezone foundation | **Live** — UTC-only API, IANA validation, DST-safe conversion + detection utilities (Phase 10) |
-| Recurrence expansion engine | **Live** — DST-safe, per-occurrence, no API surface yet (Phase 11) |
-| Recurring bookings (API, re-materialization) | Not started (Phase 12–13) |
+| Recurrence expansion engine | **Live** — DST-safe, per-occurrence (Phase 11) |
+| Recurring bookings API | **Live** — preview/confirm/cancel, 207 Multi-Status, per-occurrence transactions (Phase 12) 🏁 Milestone 2 |
+| Rolling / tzdata re-materialization | Not started (Phase 13) |
 | Enforceable waitlist | Not started (Phase 14–17) |
 | Notifications | Not started (Phase 18) |
 | Admin & offboarding | Not started (Phase 19) |

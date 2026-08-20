@@ -17,9 +17,11 @@ from kairos.core.exceptions import (
     IdempotencyKeyConflictError,
     NotFoundError,
     PolicyValidationError,
+    PreviewExpiredError,
     RequestInProgressError,
     ServiceUnavailableError,
     SlotUnavailableError,
+    UnacknowledgedConflictsError,
 )
 
 
@@ -119,6 +121,29 @@ def kairos_exception_handler(exc: Exception, context: dict[str, Any]) -> Respons
                 request_id,
             ),
             status=422,
+        )
+
+    if isinstance(exc, PreviewExpiredError):
+        return Response(
+            build_error_envelope(
+                "preview_expired",
+                "This preview has expired or is invalid. Request a new preview.",
+                None,
+                request_id,
+            ),
+            status=409,
+        )
+
+    if isinstance(exc, UnacknowledgedConflictsError):
+        return Response(
+            build_error_envelope(
+                "unacknowledged_conflicts",
+                "The preview reported conflicts or time adjustments this request did not "
+                "acknowledge.",
+                None,
+                request_id,
+            ),
+            status=409,
         )
 
     if isinstance(exc, NotFoundError):

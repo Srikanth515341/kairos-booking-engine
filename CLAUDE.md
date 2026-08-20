@@ -44,7 +44,10 @@ kairos-booking-engine/
 │   │   ├── core/           # constants.py, exceptions.py, drf.py, logging.py, middleware.py,
 │   │   │                   # db.py (write-path session settings + audit actor propagation,
 │   │   │                   # ONE shared apply_write_path_session_settings — Phase 8),
-│   │   │                   # idempotency.py (Phase 5), models.py (IdempotencyKey since Phase 5,
+│   │   │                   # idempotency.py (run_idempotent_write — Phase 5;
+│   │   │                   # run_idempotent_recurring_confirm — Phase 12, a genuinely
+│   │   │                   # different transaction shape, not a variant), models.py
+│   │   │                   # (IdempotencyKey since Phase 5,
 │   │   │                   # AuditLog since Phase 8), migrations/0002-0003 (audit_log table,
 │   │   │                   # kairos_app role + grants, write_audit_log() trigger — Phase 8),
 │   │   │                   # timezones.py (validate_iana_zone, local_to_instant,
@@ -67,12 +70,15 @@ kairos-booking-engine/
 │   │   │                   # IANA in Resource.save() — Phase 10), serializers.py,
 │   │   │                   # views.py, urls.py (list/detail/availability — Phase 6; writes
 │   │   │                   # are Phase 19)
-│   │   ├── bookings/       # booking (+ series FK, Phase 11), recurring_series (Phase 11 —
-│   │   │                   # Spec §3 field-for-field, no write path yet),
-│   │   │                   # recurrence.py (expand_occurrences — pure, DST-safe, no API
-│   │   │                   # surface yet — Phase 11), services.py (create/edit/cancel —
-│   │   │                   # Phase 7), serializers.py,
-│   │   │                   # views.py (BookingHistoryView — Phase 8), urls.py
+│   │   ├── bookings/       # booking (+ series FK, populated since Phase 12), recurring_series
+│   │   │                   # (Phase 11 schema, real write path since Phase 12),
+│   │   │                   # recurrence.py (expand_occurrences — pure, DST-safe, still no
+│   │   │                   # API surface of its own — Phase 11), recurring_series.py
+│   │   │                   # (preview/confirm orchestration + preview_token issue/verify —
+│   │   │                   # Phase 12), services.py (create/edit/cancel — Phase 7;
+│   │   │                   # cancel_recurring_series — Phase 12), serializers.py,
+│   │   │                   # views.py (BookingHistoryView — Phase 8; recurring preview/
+│   │   │                   # confirm/cancel views — Phase 12), urls.py
 │   │   ├── urls.py, wsgi.py
 │   ├── tests/
 │   │   ├── test_booking_exclusion_smoke.py
@@ -88,7 +94,9 @@ kairos-booking-engine/
 │   │   ├── bookings/                  # test_services.py, test_views.py, test_idempotency.py,
 │   │   │                              # test_read_endpoints.py (Phase 6), test_cancel_edit.py
 │   │   │                              # (Phase 7), test_history.py (AUD-03/04/05 — Phase 8),
-│   │   │                              # test_recurrence.py (TZ-01/05/06/09/10 — Phase 11)
+│   │   │                              # test_recurrence.py (TZ-01/05/06/09/10 — Phase 11),
+│   │   │                              # test_recurring_series.py (REC-01/07, IDEM-05,
+│   │   │                              # per-occurrence audit proof — Phase 12)
 │   │   ├── resources/                 # test_views.py (Phase 6 — list/detail/availability)
 │   │   └── concurrency/               # Milestone 1 — the project's central proof
 │   │       ├── harness.py             # barrier-released, independent-connection harness
@@ -108,15 +116,23 @@ kairos-booking-engine/
 ```
 
 Endpoints live (Phase 6 added the read path, Phase 7 the remaining single-booking mutations,
-Phase 8 the history endpoint, Phase 9 real auth, to Phase 4/5's write path): `POST`/
-`GET /api/v1/bookings`, `GET`/`PATCH /api/v1/bookings/{id}`, `POST /api/v1/bookings/{id}/cancel`,
-`GET /api/v1/bookings/{id}/history`, `GET /api/v1/resources`, `GET /api/v1/resources/{id}`,
-`GET /api/v1/resources/{id}/availability`, `POST /api/v1/auth/token`,
-`POST /api/v1/auth/dev-mock-login` (dev/test only). Every mutation (create, edit, cancel) is
-idempotent (Phase 5/7 — `Idempotency-Key` is required; missing it is 400). Edit is owner-only,
-no admin override; cancel is owner-or-scoped-admin, with a reason required for the
-admin-override case (400 otherwise). Cancelling an already-cancelled booking is a 200 no-op,
-independent of idempotency key.
+Phase 8 the history endpoint, Phase 9 real auth, Phase 12 recurring series, to Phase 4/5's
+write path): `POST`/`GET /api/v1/bookings`, `GET`/`PATCH /api/v1/bookings/{id}`,
+`POST /api/v1/bookings/{id}/cancel`, `GET /api/v1/bookings/{id}/history`,
+`POST /api/v1/bookings/recurring/preview` (commits nothing — no Idempotency-Key),
+`POST /api/v1/bookings/recurring` (207 Multi-Status, `Idempotency-Key` required),
+`POST /api/v1/recurring-series/{id}/cancel`, `GET /api/v1/resources`,
+`GET /api/v1/resources/{id}`, `GET /api/v1/resources/{id}/availability`,
+`POST /api/v1/auth/token`, `POST /api/v1/auth/dev-mock-login` (dev/test only). Every mutation
+(create, edit, cancel, recurring confirm, recurring-series cancel) is idempotent (Phase 5/7/12
+— `Idempotency-Key` is required; missing it is 400). Edit is owner-only, no admin override;
+cancel is owner-or-scoped-admin, with a reason required for the admin-override case (400
+otherwise). Cancelling an already-cancelled booking is a 200 no-op, independent of idempotency
+key. Recurring series confirm attempts each occurrence in its OWN independent transaction
+(RFC v1.0 §5d) — reusing `create_booking` (Phase 4) unchanged, which is what gives every
+occurrence a fresh, correctly-timed session-settings application for free; a recurring
+series's own cancel is owner(`created_by`)-or-scoped-admin, same shape as single-booking
+cancel, and only touches still-confirmed future occurrences.
 
 Real authentication (Phase 9, RFC v1.0 §4): `Authorization: Bearer <session-token>`, validated
 by `OIDCSessionAuthentication`. A client obtains that session token via `POST /auth/token`
@@ -161,10 +177,11 @@ DSN (`kairos_app` deliberately has no DDL rights) — see "Running Locally" belo
 | 9 | Authentication & Scoped Authorization | `OIDCSessionAuthentication` validates `Authorization: Bearer <session-token>`, issued by new `POST /api/v1/auth/token` after verifying a real (RS256, JWKS) or — dev/test only — mock OIDC ID token from `POST /api/v1/auth/dev-mock-login`, signed against a fixed local keypair instead of requiring Keycloak or any other external dependency; the backend's own session token is a SEPARATE, short-lived HS256 token (RFC v1.0 §4), not the raw ID token. `AuthorizationService` (`kairos/identity/authorization.py`) is now the ONE place every permission decision is resolved — every prior inline `is_resource_admin(...) or is_operations(...)` check in `bookings/views.py` and `resources/views.py` replaced with a call into it; PRD FR44's four roles (booker/resource_administrator/system_admin/operations) and PRD FR45's scoped-admin isolation (an admin for Resource A structurally cannot administer Resource B — `can_administer_resource` always re-checks against the specific resource, tested explicitly through the real cancel endpoint) are enforced through it uniformly. `X-Dev-User-Id` (Phase 4) is now inert outside `kairos.settings.test`, gated by `settings.KAIROS_DEV_AUTH_STUB_ENABLED` checked at request time — NOT verified by inspection alone, per explicit instruction: a dedicated test actually starts the app under `kairos.settings.dev` in a real subprocess and confirms a real HTTP request carrying that header gets a bare 401 (`WWW-Authenticate: Bearer`, not the stub's own challenge), independently reproduced live via `curl` against a real dev-mode server too. `app.actor_id` reaching the key-claim INSERT under a REAL authenticated principal (not a stub) is proven the same spy-on-cursor way Phase 7/8 proved the timeout/actor-type settings — reusing the identical `apply_write_path_session_settings` call site, per explicit instruction not to introduce a second mechanism for it. PRD FR46's "restricted resources" required inventing schema Spec v1.0 §3 never defined (`user_group`/`user_group_membership`, `resource.restricted_group`) — see Key Technical Decisions for the scoping call. SEC-01 (IDOR + response-body leakage across GET/PATCH/cancel/history) and SEC-06 (restricted resource 404 + absent from list, including the booking-creation and availability paths, not just resource detail) both pass. Post-review revision (caught by re-reading the DoD literally, not by a new test failing): 8 representative existing tests — create (full mock-login→token-exchange round trip), create-conflict-409, edit, self-cancel, admin-override-cancel, IDEM-01/02, and history's AUD-03(a) — converted to real minted session tokens, proving the write path (session settings, audit attribution, idempotency scoping) actually works end-to-end under real identity, not just that the auth layer and the existing suite each work in isolation; the remaining ~85 tests keep the stub deliberately (gated to `kairos.settings.test` only), and CONC-01–05 aren't candidates at all — no HTTP/auth layer exists in them to convert (raw psycopg SQL by design). Three real bugs found and fixed via hands-on verification: (1) `KAIROS_SESSION_SIGNING_KEY`'s fallback chain (env var → `SECRET_KEY`) produced an empty HMAC key, since `SECRET_KEY` is itself commonly empty in dev/test — PyJWT refused to sign, caught by the first real login attempt; (2) both new unauthenticated auth views' `authentication_classes = []` triggered the SAME 401→403 DRF downgrade this codebase already documents for `StubUserIdAuthentication` (no authenticator means no `WWW-Authenticate` challenge); (3) `can_administer_resource` was a strictly broader check than the pre-Phase-9 inline permission logic it replaced (now also recognizes `system_admin`, which those checks never consulted) — a genuine pre-existing gap the consolidation surfaced, not a deliberate feature. Full suite (121 tests — the 8 conversions modified existing tests rather than adding new ones) green | Pending (on branch `phase-09-auth-scoped-authz`) |
 | 10 | Timezone Foundation | `USE_TZ=True`/`TIME_ZONE='UTC'` confirmed already correct since Phase 2 — no change needed. New `kairos/core/timezones.py` is now the ONE place every IANA-zone check and local→UTC conversion goes through: `validate_iana_zone` (membership in `zoneinfo.available_timezones()`, so a fixed offset like `+01:00` is rejected — PRD FR8), `local_to_instant(local_dt, zone, on_date)` (combines `on_date` with `local_dt`'s wall-clock time and localizes using the rules in effect on `on_date` SPECIFICALLY — `on_date` is authoritative, never whatever date `local_dt` itself carries, which is what makes the RFC §9.1 creation-vs-occurrence bug structurally impossible to reintroduce here), `is_nonexistent_local_time`/`is_ambiguous_local_time` (round-trip and `fold`-based detection per RFC §9.3, unit-tested against the exact Europe/Paris 2027-03-28/2027-10-31 dates Test Plan TZ-05/TZ-06 use — built now, consumed by Phase 11), and `tzdata_version()`. `tzdata` is pinned EXACTLY (`==2026.3`, not a range) in `pyproject.toml` — required cross-platform since Windows and many minimal Linux images ship no system IANA database at all for `zoneinfo` to fall back on; its version is logged via the existing structured JSON logger on every app startup (`CoreConfig.ready()`, verified live via `manage.py check`) and a CI-form test (`tests/test_timezones.py`) asserts the pin is exact and the installed version matches it (Test Plan TZ-03 Test A). `Resource.save()` now calls `validate_iana_zone` unconditionally, so the only live write path today (direct ORM — Phase 19 adds a real endpoint) already cannot bypass it; raises the existing framework-agnostic `PolicyValidationError`, not Django's own `ValidationError`, so Phase 19's future serializer needs zero adaptation to turn it into 400 `validation_error`. TZ-02 passes as a direct unit test of `local_to_instant` (Oct-20-creation/Nov-10-occurrence resolves to `2026-11-10T15:00:00Z`, EST — not the `14:00:00Z` EDT bug); TZ-04 passes as a real HTTP test hitting `GET /resources/{id}/availability` as two different authenticated users and asserting byte-identical UTC `busy_blocks` — there is no per-viewer localization concept anywhere in the backend to produce a difference. A genuine spec gap surfaced, not fixed: PRD FR7's second sentence ("store the IANA timezone identifier under which [a one-off booking] was created, for display and audit") has no corresponding `booking` column in Spec v1.0 §3 at all, and this phase's own Scope IN / DoD (unlike its "Documents satisfied" line) never actually calls for adding one — flagged rather than silently built or silently dropped, see Key Technical Decisions and Open Questions. Full suite (134 tests — 121 prior + 13 new) green, including all five CONC tests | Pending (on branch `phase-10-timezone-foundation`) |
 | 11 | Recurrence Materialization & DST ⚠️ Subtle | `kairos/bookings/recurrence.py`'s `expand_occurrences` — a PURE function, no DB writes, no conflict checking — computes each occurrence's date via plain date arithmetic (`series_start_date + 7*i days`, never touching a UTC instant), THEN localizes that specific date's wall-clock time using `kairos/core/timezones.py`'s Phase 10 utilities, with a load-bearing comment citing RFC v1.0 §9.2 on the function itself. A nonexistent local time (PRD FR11) is shifted forward by a DYNAMICALLY COMPUTED transition gap (`fold=0` instant minus `fold=1` instant at that wall-clock value — not a hardcoded 1 hour) applied to BOTH start and end, preserving the occurrence's local duration; an ambiguous local time (PRD FR12) needs no shift at all, since `local_to_instant`'s default `fold=0` already IS the first/pre-transition instance — only disclosure is added. `RecurringSeries` (`kairos/bookings/models.py`) reproduces Spec v1.0 §3's DDL field-for-field, including the two columns v0.1 omitted (`series_start_date`, `tzdata_version`) plus `materialized_through`/`occurrence_count CHECK BETWEEN 1 AND 100`; `Resource.save()`'s Phase 10 IANA-validation pattern is reused verbatim in `RecurringSeries.save()`. `Booking.series` (nullable FK) exists now — `BookingResponseSerializer.get_series_id`'s Phase-9-era stub (hardcoded `None`, explicitly commented "doesn't exist until Phase 11") is wired up to the real column. `occurrence_count` is validated in TWO layers: `expand_occurrences` raises `PolicyValidationError` before any DB touch (satisfies "101 → validation error" without needing a `RecurringSeries` row at all, which matters because Phase 12's preview endpoint commits nothing), backed by the DB `CHECK` constraint from Spec's own DDL as a bulk/raw-SQL backstop. `idx_series_materialized_through` (32 characters) exceeds Django's 30-character portability limit for `models.Index` (E034) — added via a dedicated raw-SQL migration instead of shortening the name, matching Spec v1.0 §3 verbatim (Postgres itself allows up to 63). A new `core` migration grants `kairos_app` access to `recurring_series`, following the exact Phase 8/9 "GRANT statements aren't retroactive" pattern — verified live by connecting AS `kairos_app` and both SELECTing and INSERTing (rolled back) against the table. TZ-01 (America/New_York, the Nov-1 transition date itself as an occurrence, resolving EST not EDT), TZ-05 (Paris nonexistent, shifted 02:30→03:30), TZ-06 (Paris ambiguous, first/pre-transition instance chosen), TZ-09 (Sydney, both October/April transitions — opposite hemisphere, catches a sign error every northern test would miss), and TZ-10 (Kolkata, zero DST, identical offset throughout) all pass with the exact dates from Test Plan §5. No API surface yet, by design (Implementation Plan's own "why this is its own phase" — isolating DST correctness from conflict-handling concerns); materializing a confirmed series into real `booking` rows and surfacing per-occurrence conflicts (PRD FR10) are Phase 12's job. Full suite: 146 tests (140 + 6 concurrency), 12 new, no regressions | Pending (on branch `phase-11-recurrence-dst`) |
+| 12 | Recurring API — Preview & Confirm 🏁 Milestone 2 | `POST /bookings/recurring/preview` (Spec §5.8) commits NOTHING — not even a preview-tracking row — because the entire series definition plus the computed conflict-date and adjustment-date sets travels inside a signed, short-lived `preview_token` (HS256, `KAIROS_SESSION_SIGNING_KEY` — the same signing key the Phase 9 session token already uses, not a third key). `POST /bookings/recurring` (Spec §5.9) decodes that token and re-runs the IDENTICAL `expand_occurrences` call with the IDENTICAL inputs — REC-07's "preview and confirm use the same expansion code path" is true by construction, not by two implementations happening to agree, and is proven live (not just in tests): a real `curl` preview→confirm round trip produced byte-identical instants both times. PRD FR33's explicit-acknowledgment gate (`unacknowledged_conflicts`, 409) is checked BEFORE the idempotency key is ever claimed and before any occurrence is attempted (REC-02: zero bookings created), mirroring Phase 4's "policy validation before key-claim" precedent exactly. RFC §5d's per-occurrence transaction requirement is satisfied by REUSING `create_booking` (Phase 4) unchanged inside confirm's loop — not a new write function — so each occurrence gets its own transaction and its own fresh `apply_write_path_session_settings` call for free, the exact property Phase 12's own instructions demanded be confirmed explicitly; proven two ways: REC-05 (a real pre-existing booking on occurrence 7 doesn't roll back occurrence 6) and a dedicated audit test showing 4-5 real, DISTINCT `occurred_at` timestamps on the created bookings' audit rows — impossible if the whole loop shared one transaction, since Postgres's `now()` is stable per-transaction, not per-statement (verified live via `psql`, not just pytest: 4 audit rows at 21:47:52.106333 / .166871 / .207928 / .252695, ~40-60ms apart). Idempotency (IDEM-05) needed a GENUINELY NEW mechanism, `run_idempotent_recurring_confirm` — not a variant of `run_idempotent_write` — because the key claim can no longer live in the same transaction as "the write" when there are N independent writes; the key is claimed and committed in its own transaction FIRST, occurrences are attempted, and the outcome is recorded in a THIRD transaction after, which means (documented, not silently assumed away) a crash mid-series leaves the key permanently `in_progress` with no automatic recovery beyond the existing 24h cleanup command. Occurrences the preview already knew conflicted are reported as `acknowledged: true` conflicts with NO retry attempt at confirm time (the user's acknowledgment IS the agreement they won't be created); only occurrences the preview reported clean are actually attempted, so a NEW conflict arising between preview and confirm (REC-03) is structurally distinguishable (`acknowledged: false`) from an already-known one. `POST /recurring-series/{id}/cancel` (Spec §5.10) reuses the EXISTING single-transaction `run_idempotent_write` (not the new confirm mechanism) because cancellation can never lose to the exclusion constraint — moving rows OUT of `status IN ('confirmed','held')` never conflicts — so there is no "one contested item" isolation problem to solve, unlike creation; a single bulk `UPDATE ... WHERE id IN (...)` still produces one audit row per cancelled booking, since Postgres's row-level trigger fires per row regardless of statement count. REC-01 through REC-07 and IDEM-05 all pass, plus REC-06's full bound matrix (0/100/101, within/beyond 365-day horizon) — the 100-occurrence case required starting the test series far in the past, since 100 WEEKLY occurrences always span 693 days end to end, structurally exceeding the 365-day horizon from "now" forward for ANY future start date; this surfaced, not invented, a real tension between REC-06's two independent bounds. Post-review revision: initially left series-cancel-by-admin without a required `reason`, matching Spec v1.0 §5.10's example body (which shows none) — re-examined on the question "is that genuinely out of scope, or a gap," and found it's actually DIRECTLY governed by PRD FR47 ("administrative override of another user's booking requires a recorded reason," unconditional, no series/single-booking carve-out) — closed by mirroring `BookingCancelSerializer`'s exact pattern (`RecurringSeriesCancelSerializer`). Bookable-hours/max-duration/past-dating validation was examined under the SAME question and found to be genuinely different in character, not merely unlisted in Spec's failure table: doing it correctly requires converting each occurrence into the RESOURCE's own timezone (which can differ from the series' `timezone` field) and checking per-occurrence, plus resolving an unanswered "reject the batch or report per-occurrence" design question — deferred explicitly to Phase 13, not invented under time pressure; see Key Technical Decisions/Open Questions. Full suite: 165 tests (159 + 6 concurrency), 19 new, no regressions; entire flow (preview, confirm, cancel, admin-override-with-reason) verified live over real HTTP against `manage.py runserver` connected as `kairos_app`, with ground truth read back via `psql`, not just through the test client | Pending (on branch `phase-12-recurring-preview-confirm`) |
 
 ## Current Phase In Progress
 
-None. Phase 11 is complete pending review and merge. Phase 12 (Recurring API — Preview & Confirm) is next.
+None. Phase 12 is complete pending review and merge. Phase 13 (Rolling Materialization & tzdata Re-materialization) is next.
 
 ## NOT Yet Built
 
@@ -172,10 +189,13 @@ No Celery/Redis, no frontend, no hold reclamation (booking creation does not yet
 cleanup-on-write DELETE from Spec §4.1 step 2, since `held` rows don't exist until Phase 15),
 no `waitlist_entry`/`waitlist_offer`/`system_check_run` tables (each arrives with the phase
 that needs it — see the Key Technical Decisions and Phase Index in
-`docs/06-implementation-plan.md`). `recurring_series` exists as of Phase 11, but no write path
-creates rows in it yet — every row in tests is ORM-created directly, same caveat as
-`resource_admin` before Phase 19; `POST /api/v1/bookings/recurring/preview`/`.../recurring`
-(Phase 12) are the first real callers. No replica routing (Phase 30 — `data_freshness` is
+`docs/06-implementation-plan.md`). `recurring_series` rows are now created for real, via
+`POST /api/v1/bookings/recurring` (Phase 12) — but ROLLING materialization (a series whose
+occurrences extend beyond the 365-day horizon is currently rejected outright at 400, not
+partially materialized now and extended later per PRD FR14c) and tzdata re-materialization
+(RFC §9.4) are both entirely Phase 13; `recurring_series.materialized_through` is set once, at
+confirm time, to the series' own last occurrence, and nothing currently revisits it. No
+replica routing (Phase 30 — `data_freshness` is
 hardcoded `"primary"`, always true today since no replica exists). The audit trail covers
 `booking`/`resource`/`resource_admin` only — `waitlist_entry`/`waitlist_offer` triggers arrive
 with those tables (Phases 14/16), and `actor_type='unknown'` alerting (as opposed to just
@@ -186,17 +206,33 @@ logs "would enqueue waitlist check" — the real worker dispatch is Phase 16, an
 underlying trigger mechanism is proven directly instead). Resource CRUD (create/update/admin
 grants) is Phase 19 — the Phase 6 resource endpoints are read-only, and no live code path
 writes `resource_admin` yet (`ResourceAdmin` rows in tests are created directly via the ORM,
-not through any endpoint). IDEM-05 (recurring replay) needs Phase 12's endpoint; IDEM-07/08
+not through any endpoint). IDEM-07/08
 (fault injection — process kill mid-transaction, proxy-level response drop) need tooling that
 arrives in Phase 28; idempotency coverage on waitlist join/offer confirm arrives with those
-endpoints (Phases 14, 16). `booking.series_id` exists as of Phase 11 (nullable FK to
-`recurring_series`) but is NULL on every booking that exists today — nothing writes it yet,
-since Phase 11 built the expansion engine and schema only, deliberately isolated from the
-write/conflict-checking path (see "Why this is its own phase" in the Implementation Plan).
-`kairos/bookings/recurrence.py`'s `expand_occurrences` is a PURE function — no DB writes, no
-conflict checking against `no_overlapping_bookings` — so materializing a confirmed series into
-real `booking` rows, surfacing per-occurrence conflicts (PRD FR10), and series cancellation
-are all still entirely Phase 12/13, not Phase 11. No `booking` column records the IANA zone a
+endpoints (Phases 14, 16); `run_idempotent_recurring_confirm`'s own crash-mid-series gap
+(Phase 12 — key stays `in_progress` forever if the process dies between claiming it and
+recording the outcome, with no automatic recovery beyond the existing 24h cleanup command) is
+the same class of documented-not-solved gap, specific to this endpoint. Editing a recurring
+series definition (PRD FR16) has no endpoint — Phase 12's Scope IN only ever included preview/
+confirm/cancel, never edit, despite FR16 appearing on the phase's "Documents satisfied" line;
+the CANCEL endpoint honors FR16's underlying "past occurrences are historical and immutable"
+principle for the one operation Phase 12 actually built, but series editing itself remains
+unbuilt — see Key Technical Decisions/Open Questions. Recurring-series preview/confirm also
+validates NEITHER the resource's `bookable_start_time`/`bookable_end_time`/
+`max_booking_duration_minutes` NOR series-start-date past-dating — Spec v1.0 §5.8's own
+failure table never lists either as a 400 cause (unlike Spec v1.0 §5.1's single-booking
+create, which explicitly does), and — unlike the reason-on-cancel gap below — doing either
+CORRECTLY is not actually small: bookable hours are defined in the RESOURCE's own timezone,
+which can differ from a series' own `timezone` field, so a bookable-hours check done right
+means converting each occurrence's UTC instant into `resource.timezone` and checking
+per-occurrence (the resource's own DST can shift which occurrences pass independently of the
+series' DST), not one series-level comparison of raw local times — a real design question
+(also: does a bookable-hours violation reject the whole preview, or surface per-occurrence
+like a conflict?) Spec doesn't answer. Flagged, not invented — see Open Questions for which
+phase should resolve it. A series can currently be previewed/confirmed entirely in the past.
+`booking.series_id` is populated for real
+now (Phase 12) for every occurrence `POST /api/v1/bookings/recurring` creates — still NULL
+for every one-off booking, by design. No `booking` column records the IANA zone a
 one-off booking was created under (PRD FR7's second sentence) — Spec v1.0 §3 never defined
 one, and Phase 10 flagged rather than invented one (see Key Technical Decisions/Open
 Questions); whichever future phase needs it for display/audit should add it deliberately
@@ -297,6 +333,15 @@ and `git log` first.
 | `RecurringSeries.save()` reuses Phase 10's `validate_iana_zone` unconditionally, exactly like `Resource.save()` | Same field, same requirement (PRD FR8), same "no write path yet, so validate at the one place all writes — including test fixtures and Phase 12's future service layer — actually go through" reasoning Phase 10 already established for `Resource`. Not a new decision, a consistent application of an existing one | `kairos/bookings/models.py` (`RecurringSeries.save`) |
 | `core/migrations/0005_kairos_app_recurring_series_grants.py` is a NEW migration, not an edit to Phase 8's `0003` or Phase 9's `0004` | GRANT statements aren't retroactive — a table created after an earlier grants migration ran isn't covered by it. This is the third time this exact pattern has been needed (Phase 8's original grants, Phase 9's `user_group`/`user_group_membership`, now Phase 11's `recurring_series`) — verified live by connecting AS `kairos_app` and both `SELECT`ing and `INSERT`ing (rolled back) against `recurring_series`, not just by reading the migration | `kairos/core/migrations/0005_kairos_app_recurring_series_grants.py` |
 | `BookingResponseSerializer.get_series_id`'s Phase-9-era stub (`return None`, commented "doesn't exist until Phase 11") is wired up to the real `booking.series_id` column now that it exists, rather than left as `None` for a later phase to remember | The stub's own comment named Phase 11 explicitly as when this should happen — leaving it unwired after adding the column it was waiting on would recreate exactly the kind of "described but not actually done" gap Phase 7's session-settings regression already taught this project to distrust (see that Key Technical Decisions row) | `kairos/bookings/serializers.py` (`BookingResponseSerializer.get_series_id`) |
+| The `preview_token` is a signed, self-contained HS256 JWT (the whole series definition plus computed conflict/adjustment date sets), not a server-side preview table | Spec v1.0 §5.8 is explicit: preview "commits nothing." A DB-backed preview table would still be a write, even if not to `booking` — REC-01's ground-truth assertion is specifically about `booking` rows, but the stated intent ("commits nothing") reads more broadly. A signed token needs zero server-side state, expires via its own `exp` claim (REC-04 is then just ordinary JWT verification, not custom expiry bookkeeping), and reuses the EXACT signing key (`KAIROS_SESSION_SIGNING_KEY`) the Phase 9 session token already established this pattern with — not a third signing key for a third short-lived internal token type | `kairos/bookings/recurring_series.py` (`_issue_preview_token`, `decode_preview_token`) |
+| `confirm_recurring_series` re-runs `expand_occurrences` with the exact inputs decoded from the token, rather than trusting any occurrence data the token itself might carry | This is what makes REC-07 ("preview and confirm use the same expansion code path") true BY CONSTRUCTION — one function, called twice with identical arguments — rather than by two independent implementations happening to agree. Verified live, not just in a test: a real preview→confirm `curl` round trip produced byte-identical UTC instants for TZ-01's exact DST-spanning series | `kairos/bookings/recurring_series.py` (`confirm_recurring_series`) |
+| Confirm attempts ONLY the occurrences the preview did NOT already know conflicted — an already-known conflict is reported as `acknowledged: true` directly, with no INSERT attempt at all | The user's acknowledgment of a known conflict IS their agreement that occurrence will not be created — retrying it anyway would be attempting a write the user was never asked to confirm, and would make `acknowledged: true` vs `false` (REC-03's whole point) ambiguous: a retried-and-still-failed known conflict would look identical to a newly-arisen one unless a separate flag were invented. Not retrying keeps the acknowledged/unacknowledged distinction exactly as simple as REC-03 needs it | `kairos/bookings/recurring_series.py` (`confirm_recurring_series`) |
+| Confirm's per-occurrence writes reuse `create_booking` (Phase 4) completely unchanged — no new "create one occurrence" function | This is what makes RFC v1.0 §5d's "each occurrence in its own transaction" and Phase 12's explicit "each one needs its OWN correctly-timed session-settings application" instruction true for free: `create_booking` already opens a fresh `transaction.atomic()` and calls `apply_write_path_session_settings` on every invocation. Calling it N times in a loop gives N independent transactions and N independent session-settings applications without Phase 12 reimplementing either. Proven two ways: REC-05 (occurrence 6 survives occurrence 7's failure) and a dedicated test asserting the created bookings' `audit_log` rows have DISTINCT `occurred_at` values — impossible if the loop shared one transaction, since Postgres's `now()` is stable per-transaction, not per-statement; also verified live via `psql` against a real confirm call (4 audit rows, timestamps ~40-60ms apart) | `kairos/bookings/services.py` (`create_booking`, extended with an optional `series` field), `kairos/bookings/recurring_series.py` (`confirm_recurring_series`) |
+| `run_idempotent_recurring_confirm` is a NEW function in `core/idempotency.py`, not a parameterized variant of `run_idempotent_write` | `run_idempotent_write`'s entire design rests on the key claim and "the write" sharing ONE transaction (see that function's own docstring) — structurally impossible here, since there are N writes, each needing its OWN transaction per RFC v1.0 §5d. The key is claimed and COMMITTED first, occurrences are attempted, and the outcome is recorded in a THIRD transaction after — which means, unlike `run_idempotent_write`, a concurrent replay CAN observe a genuinely COMMITTED `in_progress` row (not just lock contention), so a dedicated `_replay_or_conflict_allowing_in_progress` handles that case explicitly. Documented, deliberate, NOT covered by any Phase 12 test: a crash between the key-claim commit and the outcome-record leaves the key permanently `in_progress`, with recovery only via the existing 24h cleanup command — after which a retry could re-create already-created occurrences. Flagged the same way IDEM-07/08's fault-injection gaps are flagged elsewhere in this project, not silently assumed solved | `kairos/core/idempotency.py` (`run_idempotent_recurring_confirm`) |
+| `POST /recurring-series/{id}/cancel` reuses the EXISTING `run_idempotent_write` (single shared transaction), not the new `run_idempotent_recurring_confirm` | Cancellation can never lose to the exclusion constraint — moving rows OUT of `status IN ('confirmed','held')` never conflicts with anything — so there is no "one contested occurrence" isolation problem the way CREATE has, and RFC v1.0 §5d's per-occurrence-transaction requirement was written specifically for creation, not cancellation. A single bulk `Booking.objects.filter(id__in=...).update(...)` is correct and simpler; Postgres's row-level audit trigger still fires once per affected row regardless of statement count, so the audit trail is identical either way | `kairos/bookings/services.py` (`cancel_recurring_series`) |
+| REC-06's `occurrence_count=100` boundary test starts its series 350 days in the PAST, not from "now" | 100 WEEKLY occurrences always span 99×7 = 693 days end to end — no start date from "now" forward keeps all 100 within the SEPARATE 365-day horizon bound REC-06 also tests. This isn't a workaround for a bug; it's what isolating two genuinely independent bounds in one test requires, since this endpoint has no past-dating rejection to prevent it (see the gap noted in NOT Yet Built) | `tests/bookings/test_recurring_series.py` |
+| Recurring-series preview/confirm validates NEITHER the resource's bookable-hours/max-duration policy NOR series-start-date past-dating | Spec v1.0 §5.8's own 400-cause list ("invalid weekday/timezone; local_end_time <= local_start_time; occurrence_count outside 1-100; horizon exceeded") never mentions either, unlike Spec v1.0 §5.1's single-booking create, which explicitly checks both via `_validate_range_policy`. Explicitly NOT a "just add it, it's small" case: bookable hours are defined in the resource's OWN timezone, which can differ from the series' `timezone` field, so a correct check is per-occurrence (converting each occurrence's UTC instant into `resource.timezone`) and raises an unanswered behavioral question (reject the whole preview, or report per-occurrence like a conflict, per FR10?) Spec doesn't resolve — genuinely deferred, recommended to Phase 13, not silently invented under time pressure | Spec v1.0 §5.8 (no such checks listed); `kairos/bookings/serializers.py` (`RecurringSeriesPreviewSerializer`); see Open Questions |
+| `POST /recurring-series/{id}/cancel` DOES require a `reason` on a resource-admin override — added after initial Phase 12 review, not left as a gap | Unlike the bookable-hours/past-dating question above, this one has a DIRECT, unconditional PRD requirement governing it: FR47, "Administrative override of another user's booking requires a recorded reason" — no carve-out for series vs. single bookings. Spec v1.0 §5.10's own example body simply not showing a `reason` field reads as an incomplete example, not a deliberate exemption, given FR47's unconditional wording. Mirrors `BookingCancelSerializer`'s exact pattern (`RecurringSeriesCancelSerializer`, same validation, same error shape) rather than inventing a new one | `kairos/bookings/serializers.py` (`RecurringSeriesCancelSerializer`), `kairos/bookings/services.py` (`cancel_recurring_series`) |
 
 ## Running Locally
 
@@ -418,8 +463,28 @@ fixed-offset timezone via the same `validate_iana_zone` path as `Resource`, and 
 `CHECK` constraint backstop firing on a bulk write that bypasses `expand_occurrences`
 entirely) and a `Booking.series` FK round-trip through `BookingResponseSerializer`.
 
+`tests/bookings/test_recurring_series.py` (Phase 12) — REC-01 (preview's zero-booking-row
+ground truth), REC-02 (unacknowledged conflicts → 409, zero bookings), REC-03 (a conflict
+arising between preview and confirm reports `acknowledged: false`, distinguishable from a
+known one), REC-04 (expired token → 409 `preview_expired`, via `monkeypatch`ing
+`PREVIEW_TOKEN_TTL_SECONDS` to a negative value rather than sleeping 15 real minutes), REC-05
+(occurrence 6 survives occurrence 7's real, induced conflict — proving independent
+transactions), a dedicated test asserting the created occurrences' `audit_log` rows carry
+DISTINCT `occurred_at` values (Phase 12's own explicit instruction — impossible under a
+single shared transaction, since Postgres's `now()` is stable per-transaction), REC-06's full
+bound matrix (0/100/101 occurrences, within/beyond the 365-day horizon), REC-07 (a preview→
+confirm round trip through TZ-01's exact DST-spanning series produces byte-identical
+instants), and IDEM-05 (a replayed confirm returns the IDENTICAL `created`/`conflicts`
+arrays, proven by asserting no additional bookings exist after the replay). Also covers a
+token issued to a different user (rejected identically to expired — no information leak
+about which), a fixed-offset timezone rejected at preview, and recurring-series cancel
+(future-only, owner-or-admin, 404 for a stranger). The full preview→confirm→cancel flow was
+ALSO verified live over real HTTP against `manage.py runserver` connected as `kairos_app`
+(the least-privilege role, not the superuser) with ground truth read back via `psql`, not
+only through the Django test client.
+
 Also runnable: `cd backend && ruff check . && ruff format --check . && mypy kairos` (all pass
-with zero findings as of Phase 11). CI (`.github/workflows/ci.yml`) runs all of this as three
+with zero findings as of Phase 12). CI (`.github/workflows/ci.yml`) runs all of this as three
 jobs — `lint`, `test`, `concurrency` — on every PR. The spike scripts under `scripts/spike/`
 are runnable but are diagnostic, not a test suite — see
 `docs/spikes/S1-postgres-verification.md` for what each one does and its recorded output.
@@ -465,17 +530,50 @@ From Phase 10:
   "Documents satisfied" line names FR7 in full. Nothing was built for it this phase: no
   `booking.created_timezone` column, no `timezone` field on `POST /api/v1/bookings`'s request
   body (Spec v1.0 §5.1's example body is `resource_id`/`start`/`end` only, already UTC — the
-  client doesn't send a zone today). **No phase in the current 31-phase plan is explicitly
-  scoped to pick this up.** The nearest natural point is Phase 12 (Recurring API — Preview &
-  Confirm), which builds the analogous timezone-storage path for `recurring_series` and is
-  the next time `BookingResponseSerializer`/booking-creation is touched at all — Phase 12
-  should either add `booking.created_timezone` then (client sends the creating zone, or it's
-  inferred from `resource.timezone`) or explicitly re-defer it in its own session's CLAUDE.md
-  update, restating this entry rather than letting it silently drop. If Phase 12 passes
-  without addressing it, it should be carried forward to a dedicated polish/cleanup phase
-  instead of being assumed resolved. It must not be silently assumed to already exist, and
-  must not be added incidentally as a side effect of unrelated work without updating this
-  entry.
+  client doesn't send a zone today). **Re-defer, per this entry's own instruction: Phase 12
+  passed without addressing it.** Phase 12's `BookingResponseSerializer`/booking-creation
+  touch was `get_series_id` and the `series` field specifically — it built a
+  `recurring_series`-facing timezone-storage path (the whole series definition, including its
+  `timezone` field, travels through the `preview_token` and lands on `RecurringSeries`), but
+  that is a genuinely different column for a genuinely different purpose (a series' OWN
+  defining zone, not the zone a ONE-OFF booking happened to be created under) — building it
+  did not, and structurally could not, also close this gap. **Still no phase in the 31-phase
+  plan is explicitly scoped to add `booking.created_timezone`.** Per this entry's own
+  fallback: carried forward to a dedicated polish/cleanup phase rather than assumed resolved.
+  Must not be silently assumed to already exist, and must not be added incidentally as a side
+  effect of unrelated work without updating this entry.
+
+From Phase 12:
+
+- **PRD FR16 ("editing a series definition must re-materialize future occurrences only") has
+  no endpoint** — Phase 12's "Documents satisfied" line names it, but its own Scope IN never
+  lists a series-edit endpoint at all, only preview/confirm/cancel. The CANCEL endpoint
+  honors FR16's underlying "past occurrences are historical fact and immutable" principle for
+  the one write it actually performs, but that is not the same as building FR16 itself. No
+  phase in the current plan is explicitly scoped to add series editing — whichever phase
+  needs it (most likely alongside Phase 13's re-materialization, which touches the same
+  "recompute future occurrences from the definition" mechanism) should treat this as already
+  flagged, not discover it fresh.
+- **Recurring-series preview/confirm enforces neither the resource's bookable-hours/
+  max-duration policy nor series-start-date past-dating — deliberately deferred, not merely
+  overlooked.** Considered directly during Phase 12 and NOT added, for a reason stronger than
+  "Spec v1.0 §5.8's 400-cause list doesn't mention them" (true, but not sufficient on its
+  own — see the reason-on-cancel item below, which WAS a real gap and WAS closed on that
+  reasoning alone). Bookable-hours specifically raises a genuine, unanswered design question:
+  a resource's bookable window is defined in the RESOURCE's own timezone, which can differ
+  from a series' own `timezone` field, so a correct check means converting each occurrence's
+  UTC instant into `resource.timezone` and checking PER-OCCURRENCE (the resource's own DST
+  can shift which occurrences pass, independently of the series' DST) — not the one
+  series-level comparison of raw local times that would be "small." It also raises a
+  behavioral question Spec doesn't answer: does a bookable-hours violation reject the whole
+  preview (400, like single-booking creation), or surface per-occurrence like a conflict
+  (consistent with FR10's "report precisely which occurrences failed and why")? Past-dating
+  has the same shape of open question (reject the whole series, or only the past
+  occurrences?). **Recommended owner: Phase 13** (Rolling Materialization & tzdata
+  Re-materialization) — it already has to decide how a per-occurrence check interacts with
+  partial materialization and per-occurrence reporting, so resolving this alongside it avoids
+  a second, inconsistent answer to the same "reject the batch vs. report per-item" question
+  later. Whichever phase closes this should update this entry rather than leave it stale.
 
 Genuine open questions from the source documents (offer window duration, nonexistent-time
 policy default, series bounds, etc.) are tracked in PRD v1.0 §11 and RFC v1.0 §18; they get

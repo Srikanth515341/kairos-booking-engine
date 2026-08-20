@@ -12,7 +12,7 @@ import uuid
 
 from django.db.models import Q, QuerySet
 
-from kairos.bookings.models import Booking
+from kairos.bookings.models import Booking, RecurringSeries
 from kairos.identity.models import AppUser, AppUserPlatformRole, ResourceAdmin, UserGroupMembership
 from kairos.resources.models import Resource
 
@@ -62,6 +62,18 @@ class AuthorizationService:
         if booking.user_id == user.id:
             return True, False
         if AuthorizationService.can_administer_resource(user, booking.resource_id):
+            return True, True
+        return False, False
+
+    @staticmethod
+    def can_cancel_series(user: AppUser, series: RecurringSeries) -> tuple[bool, bool]:
+        """Returns (allowed, is_override) — the same shape as
+        can_cancel_booking, for the same reason: Spec v1.0 §5.10 grants
+        this to the series' own creator OR a resource admin, mirroring
+        single-booking cancel's owner-or-admin-override model exactly."""
+        if series.created_by_id == user.id:
+            return True, False
+        if AuthorizationService.can_administer_resource(user, series.resource_id):
             return True, True
         return False, False
 

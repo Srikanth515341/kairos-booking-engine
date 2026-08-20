@@ -7,6 +7,7 @@ free, rather than reimplementing them per code path.
 from __future__ import annotations
 
 import logging
+import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from typing import NoReturn
@@ -14,7 +15,7 @@ from typing import NoReturn
 from django.db import DatabaseError, connection, transaction
 from django.utils import timezone
 
-from kairos.bookings.models import Booking, BookingStatus
+from kairos.bookings.models import Booking, BookingStatus, RecurringSeries
 from kairos.core.db import apply_write_path_session_settings
 from kairos.core.exceptions import ServiceUnavailableError, SlotUnavailableError
 from kairos.core.models import AuditActorType
@@ -70,6 +71,12 @@ class BookingCreateRequest:
     start: datetime
     end: datetime
     request_id: str
+    # NULL for a one-off booking (every caller before Phase 12). Set by
+    # confirm_recurring_series (Phase 12) when this INSERT is one
+    # occurrence of a series — the FK that makes series-level cancellation
+    # (Spec v1.0 §5.10) a filtered update rather than tracking membership
+    # some other way.
+    series: RecurringSeries | None = None
 
 
 def create_booking(req: BookingCreateRequest) -> Booking:
@@ -78,6 +85,15 @@ def create_booking(req: BookingCreateRequest) -> Booking:
     exists between "looks free" and "is free" for a second writer to land
     in. Idempotency (Phase 5) and hold reclamation (Phase 17) are not yet
     part of this transaction — both are documented, temporary gaps.
+
+    Called once per occurrence by confirm_recurring_series (Phase 12,
+    RFC v1.0 §5d) exactly as it's called for a one-off booking — same
+    function, same per-call transaction, same fresh
+    apply_write_path_session_settings on every invocation. That reuse is
+    deliberate and load-bearing: it's what gives each occurrence its own
+    independently-committed transaction (never one shared transaction
+    across a series) and its own correctly-timed session settings, without
+    Phase 12 needing to reimplement either.
     """
     log_context = {
         "request_id": req.request_id,
@@ -98,6 +114,7 @@ def create_booking(req: BookingCreateRequest) -> Booking:
             booking = Booking.objects.create(
                 resource=req.resource,
                 user=req.user,
+                series=req.series,
                 time_range=(req.start, req.end),
                 status=BookingStatus.CONFIRMED,
             )
@@ -231,3 +248,85 @@ def cancel_booking(req: BookingCancelRequest) -> BookingCancelResult:
         extra={**log_context, "outcome": "success"},
     )
     return BookingCancelResult(booking=booking, already_cancelled=not updated)
+
+
+@dataclass(frozen=True)
+class RecurringSeriesCancelRequest:
+    series: RecurringSeries
+    actor: AppUser
+    actor_type: str
+    reason: str | None
+    request_id: str
+
+
+@dataclass(frozen=True)
+class RecurringSeriesCancelResult:
+    cancelled_booking_ids: list[uuid.UUID]
+    occurrences_already_past: int
+
+
+def cancel_recurring_series(req: RecurringSeriesCancelRequest) -> RecurringSeriesCancelResult:
+    """Spec v1.0 §5.10; PRD FR15. Only still-CONFIRMED, still-FUTURE
+    occurrences are touched (`starts_at >= now()`) — past occurrences stay
+    exactly as they are, historical fact, matching PRD FR16's "past
+    occurrences are historical fact and immutable" even though this isn't
+    the edit path FR16 was written for.
+
+    `req.reason` is required by the view whenever this is a resource-admin
+    override, not a self-cancel by the series' own `created_by` (PRD FR47:
+    "administrative override of another user's booking requires a
+    recorded reason" — unconditional, and a series-cancel-by-admin is
+    exactly such an override on every occurrence it touches, the same as
+    single-booking cancel's existing rule).
+
+    Unlike `cancel_booking`, this doesn't need per-row transaction
+    isolation the way `confirm_recurring_series`'s CREATE does: cancelling
+    can never lose to the exclusion constraint (moving a row OUT of
+    `status IN ('confirmed','held')` never conflicts with anything), so
+    there is no "one contested occurrence" failure mode to isolate. A
+    single bulk UPDATE is correct and is what Postgres's row-level audit
+    trigger already handles correctly — it fires once per affected row
+    regardless of whether the UPDATE is issued as one statement or many.
+    """
+    log_context = {
+        "request_id": req.request_id,
+        "user_id": str(req.actor.id),
+        "series_id": str(req.series.id),
+    }
+    now = timezone.now()
+    with transaction.atomic():
+        with connection.cursor() as cursor:
+            apply_write_path_session_settings(
+                cursor,
+                actor_id=str(req.actor.id),
+                actor_type=req.actor_type,
+                request_id=req.request_id,
+                reason=req.reason,
+            )
+        cancelled_ids = list(
+            Booking.objects.filter(
+                series=req.series, status=BookingStatus.CONFIRMED, starts_at__gte=now
+            ).values_list("id", flat=True)
+        )
+        Booking.objects.filter(id__in=cancelled_ids).update(
+            status=BookingStatus.CANCELLED,
+            cancelled_at=now,
+            cancelled_by=req.actor,
+            cancellation_reason=req.reason,
+        )
+        occurrences_already_past = Booking.objects.filter(
+            series=req.series, starts_at__lt=now
+        ).count()
+
+    logger.info(
+        "recurring_series_cancelled",
+        extra={
+            **log_context,
+            "outcome": "success",
+            "cancelled_count": len(cancelled_ids),
+        },
+    )
+    return RecurringSeriesCancelResult(
+        cancelled_booking_ids=cancelled_ids,
+        occurrences_already_past=occurrences_already_past,
+    )

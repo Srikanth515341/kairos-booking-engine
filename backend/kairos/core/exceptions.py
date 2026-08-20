@@ -66,3 +66,21 @@ class IdempotencyKeyConflictError(Exception):
     (Spec v1.0 §7). Maps to 422 `idempotency_key_conflict` — a client bug
     signal, never a silent replay of a different request under an old key.
     """
+
+
+class PreviewExpiredError(Exception):
+    """A recurring-series `preview_token` failed verification — expired
+    (older than 15 minutes), tampered, malformed, or presented by a
+    different user than the one who generated it (Spec v1.0 §5.9). All
+    four collapse to the same outcome deliberately: Spec defines only
+    `preview_expired`, and distinguishing "wrong user" from "expired"
+    would leak whether a given token exists at all.
+    """
+
+
+class UnacknowledgedConflictsError(Exception):
+    """The preview reported a conflict or a time adjustment the confirm
+    body did not acknowledge (PRD FR33; Spec v1.0 §5.9). Maps to 409
+    `unacknowledged_conflicts`. Raised before any occurrence is attempted —
+    a series with unacknowledged items commits nothing at all.
+    """

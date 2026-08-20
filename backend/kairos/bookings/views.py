@@ -12,26 +12,40 @@ from rest_framework import status
 from rest_framework.request import Request
 from rest_framework.response import Response
 
-from kairos.core.exceptions import NotFoundError, PolicyValidationError
-from kairos.core.idempotency import run_idempotent_write
+from kairos.core.exceptions import (
+    NotFoundError,
+    PolicyValidationError,
+    UnacknowledgedConflictsError,
+)
+from kairos.core.idempotency import run_idempotent_recurring_confirm, run_idempotent_write
 from kairos.core.models import AuditActorType, AuditLog
 from kairos.core.pagination import decode_cursor, encode_cursor, parse_limit
 from kairos.core.views import KairosAPIView
 from kairos.identity.authorization import AuthorizationService
 from kairos.identity.models import AppUser
 
-from .models import Booking, BookingStatus
+from .models import Booking, BookingStatus, RecurringSeries
+from .recurring_series import (
+    confirm_recurring_series,
+    decode_preview_token,
+    preview_recurring_series,
+)
 from .serializers import (
     BookingCancelSerializer,
     BookingCreateSerializer,
     BookingEditSerializer,
     BookingResponseSerializer,
+    RecurringSeriesCancelSerializer,
+    RecurringSeriesConfirmSerializer,
+    RecurringSeriesPreviewSerializer,
 )
 from .services import (
     BookingCancelRequest,
     BookingCreateRequest,
     BookingEditRequest,
+    RecurringSeriesCancelRequest,
     cancel_booking,
+    cancel_recurring_series,
     create_booking,
     edit_booking,
 )
@@ -408,3 +422,150 @@ class BookingHistoryView(KairosAPIView):
                 ],
             }
         )
+
+
+class RecurringSeriesPreviewView(KairosAPIView):
+    """POST /api/v1/bookings/recurring/preview (Spec v1.0 §5.8). No
+    Idempotency-Key — this endpoint commits nothing, so there is no write
+    outcome to protect against a retry duplicating."""
+
+    def post(self, request: Request) -> Response:
+        user = cast(AppUser, request.user)
+        serializer = RecurringSeriesPreviewSerializer(data=request.data, context={"user": user})
+        serializer.is_valid(raise_exception=True)
+        attrs = serializer.validated_data
+
+        result = preview_recurring_series(
+            user=user,
+            resource=attrs["resource"],
+            timezone=attrs["timezone"],
+            local_start_time=attrs["local_start_time"],
+            local_end_time=attrs["local_end_time"],
+            weekday=attrs["weekday"],
+            series_start_date=attrs["series_start_date"],
+            occurrence_count=attrs["occurrence_count"],
+        )
+
+        return Response(
+            {
+                "preview_token": result.token,
+                "resource_id": str(result.resource_id),
+                "tzdata_version": result.tzdata_version,
+                "would_create": result.would_create,
+                "conflicts": result.conflicts,
+                "time_adjustments": result.time_adjustments,
+            }
+        )
+
+
+class RecurringSeriesConfirmView(KairosAPIView):
+    """POST /api/v1/bookings/recurring (Spec v1.0 §5.9)."""
+
+    def post(self, request: Request) -> Response:
+        idempotency_key = _require_idempotency_key(request)
+        user = cast(AppUser, request.user)
+
+        serializer = RecurringSeriesConfirmSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        attrs = serializer.validated_data
+
+        # PreviewExpiredError (409) is deliberately not a validation_error
+        # (400) — see RecurringSeriesConfirmSerializer's docstring.
+        decoded = decode_preview_token(attrs["preview_token"], user)
+
+        acknowledged_conflicts = set(attrs["acknowledged_conflicts"])
+        acknowledged_adjustments = set(attrs["acknowledged_adjustments"])
+        # PRD FR33: EVERY conflict and adjustment the preview reported must
+        # be explicitly acknowledged, checked BEFORE the idempotency key is
+        # ever claimed and before any occurrence is attempted — REC-02's
+        # "zero bookings created" (the same "validate before claiming a
+        # key" ordering Phase 4 established for single-booking policy
+        # checks). A superset is fine; only a MISSING acknowledgment blocks.
+        if (decoded.conflict_dates - acknowledged_conflicts) or (
+            decoded.adjustment_dates - acknowledged_adjustments
+        ):
+            raise UnacknowledgedConflictsError
+
+        request_id = _request_id(request)
+
+        def perform_confirm() -> tuple[int, dict[str, Any]]:
+            outcome = confirm_recurring_series(user=user, decoded=decoded, request_id=request_id)
+            body = {
+                "series_id": str(outcome.series_id),
+                "created": outcome.created,
+                "conflicts": outcome.conflicts,
+            }
+            return status.HTTP_207_MULTI_STATUS, body
+
+        result = run_idempotent_recurring_confirm(
+            user=user,
+            key=idempotency_key,
+            endpoint="POST /api/v1/bookings/recurring",
+            body=dict(request.data),
+            request_id=request_id,
+            actor_type=AuditActorType.USER,
+            perform_confirm=perform_confirm,
+        )
+
+        response = Response(result.response_body, status=result.response_status)
+        if result.is_replay:
+            response["Idempotent-Replay"] = "true"
+        return response
+
+
+class RecurringSeriesCancelView(KairosAPIView):
+    """POST /api/v1/recurring-series/{id}/cancel (Spec v1.0 §5.10)."""
+
+    def post(self, request: Request, pk: uuid.UUID) -> Response:
+        idempotency_key = _require_idempotency_key(request)
+
+        user = cast(AppUser, request.user)
+        try:
+            series = RecurringSeries.objects.select_related("resource").get(id=pk)
+        except RecurringSeries.DoesNotExist as exc:
+            raise NotFoundError from exc
+
+        allowed, is_override = AuthorizationService.can_cancel_series(user, series)
+        if not allowed:
+            # 404, not 403 — same object-level convention as booking cancel.
+            raise NotFoundError
+
+        serializer = RecurringSeriesCancelSerializer(
+            data=request.data, context={"is_owner": not is_override}
+        )
+        serializer.is_valid(raise_exception=True)
+        reason = serializer.validated_data["reason"]
+
+        actor_type = AuditActorType.ADMIN if is_override else AuditActorType.USER
+        request_id = _request_id(request)
+
+        def perform_write() -> tuple[int, dict[str, Any]]:
+            result = cancel_recurring_series(
+                RecurringSeriesCancelRequest(
+                    series=series,
+                    actor=user,
+                    actor_type=actor_type,
+                    reason=reason,
+                    request_id=request_id,
+                )
+            )
+            return status.HTTP_200_OK, {
+                "series_id": str(series.id),
+                "cancelled_booking_ids": [str(i) for i in result.cancelled_booking_ids],
+                "occurrences_already_past": result.occurrences_already_past,
+            }
+
+        result = run_idempotent_write(
+            user=user,
+            key=idempotency_key,
+            endpoint=f"POST /api/v1/recurring-series/{pk}/cancel",
+            body={"series_id": str(pk), **dict(request.data)},
+            request_id=request_id,
+            actor_type=actor_type,
+            perform_write=perform_write,
+        )
+
+        response = Response(result.response_body, status=result.response_status)
+        if result.is_replay:
+            response["Idempotent-Replay"] = "true"
+        return response
