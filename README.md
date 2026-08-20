@@ -71,7 +71,13 @@ exchanged for a short-lived session token, validated on every request — no mor
 header stub outside the test suite. Four roles (booker, scoped resource administrator, global
 system administrator, read-only operations) are enforced through one authorization service, an
 admin's authority never extends past the specific resource they're scoped to, and a resource
-can be restricted to a group whose non-members can't even tell it exists. See
+can be restricted to a group whose non-members can't even tell it exists. The timezone
+foundation is in place too (Phase 10): every timestamp is `timestamptz`/UTC end to end, a
+single `local_to_instant` conversion utility takes the occurrence's own date as authoritative
+so a booking created under one DST regime for an occurrence in another can never pick up the
+wrong offset, a fixed UTC offset submitted as a timezone is rejected outright, and the pinned
+`tzdata` version is logged on every startup and asserted in CI — the DST-correctness
+groundwork Phase 11's recurrence engine builds directly on. See
 [`CLAUDE.md`](CLAUDE.md) for exactly what is and isn't built, and
 [`docs/06-implementation-plan.md`](docs/06-implementation-plan.md) for the full 31-phase
 build plan.
@@ -261,7 +267,8 @@ pytest
 | Booking detail / list, resource list / detail / availability | **Live** — cursor pagination, field-level authorization (Phase 6) |
 | Audit trail | **Live** — trigger-based, append-only by database grant, `GET /bookings/{id}/history` (Phase 8) |
 | Auth & scoped authorization | **Live** — real OIDC session tokens, four roles, scoped resource admin, restricted resources (Phase 9) |
-| DST-correct recurring bookings | Not started (Phase 10–13) |
+| Timezone foundation | **Live** — UTC-only API, IANA validation, DST-safe conversion + detection utilities (Phase 10) |
+| DST-correct recurring bookings | Not started (Phase 11–13) |
 | Enforceable waitlist | Not started (Phase 14–17) |
 | Notifications | Not started (Phase 18) |
 | Admin & offboarding | Not started (Phase 19) |

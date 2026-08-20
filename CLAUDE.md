@@ -47,6 +47,11 @@ kairos-booking-engine/
 │   │   │                   # idempotency.py (Phase 5), models.py (IdempotencyKey since Phase 5,
 │   │   │                   # AuditLog since Phase 8), migrations/0002-0003 (audit_log table,
 │   │   │                   # kairos_app role + grants, write_audit_log() trigger — Phase 8),
+│   │   │                   # timezones.py (validate_iana_zone, local_to_instant,
+│   │   │                   # is_nonexistent_local_time/is_ambiguous_local_time,
+│   │   │                   # tzdata_version — Phase 10, consumed by Phase 11's recurrence
+│   │   │                   # engine), apps.py (CoreConfig.ready() logs tzdata_version at
+│   │   │                   # startup — Phase 10),
 │   │   │                   # management/commands/cleanup_idempotency_keys.py
 │   │   ├── identity/       # app_user, resource_admin (UUID surrogate PK since Phase 8),
 │   │   │                   # user_group/user_group_membership (Phase 9 — PRD FR46, not in
@@ -57,7 +62,8 @@ kairos-booking-engine/
 │   │   │                   # place every permission decision is resolved),
 │   │   │                   # oidc.py (JWT mint/verify + local mock issuer, Phase 9),
 │   │   │                   # views.py/urls.py (POST /auth/token, /auth/dev-mock-login)
-│   │   ├── resources/      # resource (+ restricted_group FK, Phase 9), serializers.py,
+│   │   ├── resources/      # resource (+ restricted_group FK, Phase 9; timezone validated as
+│   │   │                   # IANA in Resource.save() — Phase 10), serializers.py,
 │   │   │                   # views.py, urls.py (list/detail/availability — Phase 6; writes
 │   │   │                   # are Phase 19)
 │   │   ├── bookings/       # booking, services.py (create/edit/cancel — Phase 7), serializers.py,
@@ -68,6 +74,8 @@ kairos-booking-engine/
 │   │   ├── test_schema_assertion.py   # RECON-05 CI form — fails if the predicate is narrowed
 │   │   ├── test_audit_trail.py        # AUD-01, AUD-02, grant/trigger-existence checks (Phase 8)
 │   │   ├── test_security.py           # SEC-01, SEC-06 (Phase 9)
+│   │   ├── test_timezones.py          # TZ-02, TZ-04, TZ-03 Test A, IANA validation,
+│   │   │                              # nonexistent/ambiguous detection (Phase 10)
 │   │   ├── conftest.py                # app_user / active_resource fixtures, shared
 │   │   ├── identity/                  # test_authentication.py (real OIDC flow, actor_id spy,
 │   │   │                              # dev-settings-subprocess X-Dev-User-Id rejection),
@@ -85,7 +93,8 @@ kairos-booking-engine/
 │   │       ├── test_conc_04.py        # edit-vs-edit race (Phase 7)
 │   │       └── test_conc_05.py        # cancel-and-rebook race
 │   ├── manage.py
-│   └── pyproject.toml      # ruff, mypy strict, pytest config; pyjwt[crypto] added Phase 9
+│   └── pyproject.toml      # ruff, mypy strict, pytest config; pyjwt[crypto] added Phase 9;
+│                           # tzdata pinned exactly (==) added Phase 10
 ├── frontend/              # React + TypeScript — empty until Phase 23
 ├── infra/                 # docker-compose.yml, init-test-db.sql
 └── scripts/
@@ -144,10 +153,11 @@ DSN (`kairos_app` deliberately has no DDL rights) — see "Running Locally" belo
 | 7 | Cancellation & Editing | `PATCH /bookings/{id}` (owner only, evaluated against `no_overlapping_bookings` exactly as a create) and `POST /bookings/{id}/cancel` (owner or resource-admin override with a required reason, double-cancel idempotent at 200 regardless of idempotency key) — both share `_handle_write_database_error`'s SQLSTATE translation with create; the `transaction.on_commit()` waitlist-check stub registered inside cancel's nested atomic, correctly deferred to the outer (idempotency) transaction's commit; `BookingResponseSerializer` extended with `cancelled_at`/`cancelled_by`/`cancellation_reason`; idempotency fingerprints for both endpoints fold in `booking_id` (a real gap the body alone doesn't cover — see Key Technical Decisions); CONC-03 (edit-vs-create) and CONC-04 (edit-vs-edit), 10 runs each, loser verified unchanged at its original range. Also caught and fixed a real regression while doing this: Phase 5's session-settings fix had never actually been wired into `run_idempotent_write` — the key-claim INSERT was running with NO `lock_timeout` (proven via a spy test, then fixed, then proven fixed by reverting and watching the new test fail). Full suite (83 tests) green, including three concurrency runs back-to-back in one session | Merged (PR #7) |
 | 8 | Audit Trail — Triggers & Grants ⚠️ Subtle | `audit_log` table + `write_audit_log()` trigger on `booking`/`resource`/`resource_admin`, firing unconditionally on every INSERT/UPDATE/DELETE — proven by a raw SQL write that never touches the service layer (AUD-02); a dedicated `kairos_app` database role holds ordinary DML on every app table but only `INSERT`/`SELECT` (never `UPDATE`/`DELETE`) on `audit_log`, enforced at the grant level and proven by actually connecting AS that role (AUD-01) — the RUNNING APPLICATION now connects as `kairos_app`, not the superuser, verified live via `manage.py runserver` and a full create→edit→cancel→history round trip over real HTTP; `app.actor_type`/`app.reason` propagate through the SAME shared `apply_write_path_session_settings` call as the write-path timeouts (not a second context manager), per explicit instruction after Phase 7's regression — verified by extending that exact regression test, not adding a parallel one; `GET /bookings/{id}/history` reconstructs full lifecycles via a genuine before/after field-level diff (`_compute_changes`), not just status transitions, since Phase 7's edit changes `time_range` while leaving `status` untouched — AUD-03(a)(b), AUD-04, AUD-05 all pass; AUD-03(d)'s "system-initiated write" has no real worker yet (Phase 16), so the underlying mechanism is proven directly instead. Three real bugs found and fixed via hands-on verification, not just passing tests: (1) `occurred_at` used `auto_now_add` (Python-side only) instead of a genuine `db_default`, so the trigger's raw INSERT — which never goes through Django's ORM — hit a NOT NULL violation; (2) `resource_admin`'s implicit `BigAutoField` surrogate PK couldn't satisfy the trigger's `COALESCE(NEW.id, OLD.id)` into `audit_log.entity_id UUID`, so it's now an explicit UUID PK like every other entity table; (3) `kairos_app` had no grant on Django's own `django_migrations` table, so the app failed to even START under the new role until caught by actually running `manage.py runserver`, not only the test suite. Full suite (96 tests) green | Merged (PR #8) |
 | 9 | Authentication & Scoped Authorization | `OIDCSessionAuthentication` validates `Authorization: Bearer <session-token>`, issued by new `POST /api/v1/auth/token` after verifying a real (RS256, JWKS) or — dev/test only — mock OIDC ID token from `POST /api/v1/auth/dev-mock-login`, signed against a fixed local keypair instead of requiring Keycloak or any other external dependency; the backend's own session token is a SEPARATE, short-lived HS256 token (RFC v1.0 §4), not the raw ID token. `AuthorizationService` (`kairos/identity/authorization.py`) is now the ONE place every permission decision is resolved — every prior inline `is_resource_admin(...) or is_operations(...)` check in `bookings/views.py` and `resources/views.py` replaced with a call into it; PRD FR44's four roles (booker/resource_administrator/system_admin/operations) and PRD FR45's scoped-admin isolation (an admin for Resource A structurally cannot administer Resource B — `can_administer_resource` always re-checks against the specific resource, tested explicitly through the real cancel endpoint) are enforced through it uniformly. `X-Dev-User-Id` (Phase 4) is now inert outside `kairos.settings.test`, gated by `settings.KAIROS_DEV_AUTH_STUB_ENABLED` checked at request time — NOT verified by inspection alone, per explicit instruction: a dedicated test actually starts the app under `kairos.settings.dev` in a real subprocess and confirms a real HTTP request carrying that header gets a bare 401 (`WWW-Authenticate: Bearer`, not the stub's own challenge), independently reproduced live via `curl` against a real dev-mode server too. `app.actor_id` reaching the key-claim INSERT under a REAL authenticated principal (not a stub) is proven the same spy-on-cursor way Phase 7/8 proved the timeout/actor-type settings — reusing the identical `apply_write_path_session_settings` call site, per explicit instruction not to introduce a second mechanism for it. PRD FR46's "restricted resources" required inventing schema Spec v1.0 §3 never defined (`user_group`/`user_group_membership`, `resource.restricted_group`) — see Key Technical Decisions for the scoping call. SEC-01 (IDOR + response-body leakage across GET/PATCH/cancel/history) and SEC-06 (restricted resource 404 + absent from list, including the booking-creation and availability paths, not just resource detail) both pass. Post-review revision (caught by re-reading the DoD literally, not by a new test failing): 8 representative existing tests — create (full mock-login→token-exchange round trip), create-conflict-409, edit, self-cancel, admin-override-cancel, IDEM-01/02, and history's AUD-03(a) — converted to real minted session tokens, proving the write path (session settings, audit attribution, idempotency scoping) actually works end-to-end under real identity, not just that the auth layer and the existing suite each work in isolation; the remaining ~85 tests keep the stub deliberately (gated to `kairos.settings.test` only), and CONC-01–05 aren't candidates at all — no HTTP/auth layer exists in them to convert (raw psycopg SQL by design). Three real bugs found and fixed via hands-on verification: (1) `KAIROS_SESSION_SIGNING_KEY`'s fallback chain (env var → `SECRET_KEY`) produced an empty HMAC key, since `SECRET_KEY` is itself commonly empty in dev/test — PyJWT refused to sign, caught by the first real login attempt; (2) both new unauthenticated auth views' `authentication_classes = []` triggered the SAME 401→403 DRF downgrade this codebase already documents for `StubUserIdAuthentication` (no authenticator means no `WWW-Authenticate` challenge); (3) `can_administer_resource` was a strictly broader check than the pre-Phase-9 inline permission logic it replaced (now also recognizes `system_admin`, which those checks never consulted) — a genuine pre-existing gap the consolidation surfaced, not a deliberate feature. Full suite (121 tests — the 8 conversions modified existing tests rather than adding new ones) green | Pending (on branch `phase-09-auth-scoped-authz`) |
+| 10 | Timezone Foundation | `USE_TZ=True`/`TIME_ZONE='UTC'` confirmed already correct since Phase 2 — no change needed. New `kairos/core/timezones.py` is now the ONE place every IANA-zone check and local→UTC conversion goes through: `validate_iana_zone` (membership in `zoneinfo.available_timezones()`, so a fixed offset like `+01:00` is rejected — PRD FR8), `local_to_instant(local_dt, zone, on_date)` (combines `on_date` with `local_dt`'s wall-clock time and localizes using the rules in effect on `on_date` SPECIFICALLY — `on_date` is authoritative, never whatever date `local_dt` itself carries, which is what makes the RFC §9.1 creation-vs-occurrence bug structurally impossible to reintroduce here), `is_nonexistent_local_time`/`is_ambiguous_local_time` (round-trip and `fold`-based detection per RFC §9.3, unit-tested against the exact Europe/Paris 2027-03-28/2027-10-31 dates Test Plan TZ-05/TZ-06 use — built now, consumed by Phase 11), and `tzdata_version()`. `tzdata` is pinned EXACTLY (`==2026.3`, not a range) in `pyproject.toml` — required cross-platform since Windows and many minimal Linux images ship no system IANA database at all for `zoneinfo` to fall back on; its version is logged via the existing structured JSON logger on every app startup (`CoreConfig.ready()`, verified live via `manage.py check`) and a CI-form test (`tests/test_timezones.py`) asserts the pin is exact and the installed version matches it (Test Plan TZ-03 Test A). `Resource.save()` now calls `validate_iana_zone` unconditionally, so the only live write path today (direct ORM — Phase 19 adds a real endpoint) already cannot bypass it; raises the existing framework-agnostic `PolicyValidationError`, not Django's own `ValidationError`, so Phase 19's future serializer needs zero adaptation to turn it into 400 `validation_error`. TZ-02 passes as a direct unit test of `local_to_instant` (Oct-20-creation/Nov-10-occurrence resolves to `2026-11-10T15:00:00Z`, EST — not the `14:00:00Z` EDT bug); TZ-04 passes as a real HTTP test hitting `GET /resources/{id}/availability` as two different authenticated users and asserting byte-identical UTC `busy_blocks` — there is no per-viewer localization concept anywhere in the backend to produce a difference. A genuine spec gap surfaced, not fixed: PRD FR7's second sentence ("store the IANA timezone identifier under which [a one-off booking] was created, for display and audit") has no corresponding `booking` column in Spec v1.0 §3 at all, and this phase's own Scope IN / DoD (unlike its "Documents satisfied" line) never actually calls for adding one — flagged rather than silently built or silently dropped, see Key Technical Decisions and Open Questions. Full suite (134 tests — 121 prior + 13 new) green, including all five CONC tests | Pending (on branch `phase-10-timezone-foundation`) |
 
 ## Current Phase In Progress
 
-None. Phase 9 is complete pending review and merge. Phase 10 (Timezone Foundation) is next.
+None. Phase 10 is complete pending review and merge. Phase 11 (Recurrence Materialization & DST) is next.
 
 ## NOT Yet Built
 
@@ -171,6 +181,15 @@ not through any endpoint). IDEM-05 (recurring replay) needs Phase 12's endpoint;
 arrives in Phase 28; idempotency coverage on waitlist join/offer confirm arrives with those
 endpoints (Phases 14, 16). `booking.series_id` does not exist yet — it cannot, since
 `recurring_series` (Phase 11) doesn't exist; it is added in Phase 11, not retrofitted early.
+No `booking` column records the IANA zone a one-off booking was created under (PRD FR7's
+second sentence) — Spec v1.0 §3 never defined one, and Phase 10 flagged rather than invented
+one (see Key Technical Decisions/Open Questions); whichever future phase needs it for
+display/audit should add it deliberately rather than assume it already exists. Recurrence
+expansion (`kairos/bookings/recurrence.py`, `recurring_series` table, nonexistent/ambiguous
+POLICY APPLICATION as opposed to Phase 10's detection-only utilities) is entirely Phase 11 —
+`kairos/core/timezones.py`'s `local_to_instant`/`is_nonexistent_local_time`/
+`is_ambiguous_local_time` exist now specifically so Phase 11 doesn't have to build them under
+time pressure alongside the DST expansion logic itself.
 `kairos_app`'s password (Phase 8) and `KAIROS_SESSION_SIGNING_KEY`'s dev-only fallback (Phase
 9) are both hardcoded dev-only literals, matching `infra/docker-compose.yml`'s own
 precedent — Rollout (Phase 30) must replace both with real managed secrets before any
@@ -251,6 +270,13 @@ and `git log` first.
 | `AuthorizationService` gained `can_administer_resource` (system_admin OR scoped resource_admin) as a strictly BROADER check than Phase 6/7's original `is_resource_admin(...) or is_operations(...)` inline checks — system_admin can now also list-by-resource, cancel-override, and (implicitly) view/edit anywhere | PRD FR44 defines `system_admin` as global ("manages catalogue and scope assignment"); the pre-Phase-9 inline checks never actually consulted that role at all, an omission from before the role concept was fully wired up. Consolidating into one service surfaced and fixed this gap as a side effect, not a deliberately scoped-in feature — flagged here so it isn't mistaken for an intentional design decision made independently of the refactor | `kairos/identity/authorization.py` (`AuthorizationService.can_administer_resource`) |
 | PRD FR46's "restricted resources" needed a `user_group`/`user_group_membership` schema Spec v1.0 §3 never defined at all (confirmed: zero matches for "group" or "restrict" in that document) | RFC v1.0 §8.2 gestures at a `resource_group_id` in an aspirational grant table, but the ACTUAL implemented `resource_admin` grant (Phase 2) is keyed on `resource_id` directly, not a group. Rather than retrofit `resource_admin` to a group model Spec never specified either, Phase 9 adds the minimal schema PRD FR46/SEC-06 concretely need: a named `user_group`, a plain membership M2M, and a nullable `resource.restricted_group` FK (null = open, matching every resource before this phase). Group MANAGEMENT (create a group, add/remove members) has no endpoint yet — see NOT Yet Built | `kairos/identity/models.py` (`UserGroup`, `UserGroupMembership`), `kairos/resources/models.py` (`Resource.restricted_group`) |
 | `KAIROS_SESSION_SIGNING_KEY` falls back through THREE tiers — explicit env var, then `SECRET_KEY`, then a hardcoded dev-only literal — with `prod.py` refusing to start if the literal is ever what's actually in play | Caught empirically, not by inspection: the original two-tier fallback (env var, else `SECRET_KEY`) produced an EMPTY string in dev/test, because `SECRET_KEY` itself defaults to `""` when `DJANGO_SECRET_KEY` isn't set locally — and PyJWT refuses to sign with an empty HMAC key, so the very first login attempt in a fresh test run raised `InvalidKeyError`. The third tier fixes dev/test without weakening prod, which already required `SECRET_KEY` non-empty and now requires this key not be the literal fallback too | `kairos/settings/base.py`, `kairos/settings/prod.py` |
+| `local_to_instant(local_dt, zone, on_date)` takes `on_date` as a SEPARATE, authoritative argument rather than reading the date off `local_dt` | RFC v1.0 §9.1's exact bug is computing an occurrence's offset using the date the *request* (or series) was created on rather than the occurrence's own date. Making `on_date` a distinct parameter — always the one consulted for the offset, never `local_dt`'s own date component — makes that bug structurally unreachable through this function rather than merely avoided by caller discipline, the same "can't be bypassed" bar the exclusion constraint itself is held to. TZ-02 asserts this directly: `local_dt` deliberately carries Oct 20 (the creation date); only `on_date` (Nov 10) decides the offset | `kairos/core/timezones.py` (`local_to_instant`) |
+| `validate_iana_zone` checks membership in `zoneinfo.available_timezones()` rather than a regex rejecting offset-shaped strings | A regex could reject `+01:00` but would accept any other garbage that merely isn't offset-shaped; membership in the real IANA catalog is the actual PRD FR8 requirement ("an offset cannot express when rules change") and costs nothing extra since `zoneinfo`/`tzdata` are already required dependencies. A Postgres CHECK constraint was considered and rejected: Postgres forbids subqueries (e.g. against `pg_timezone_names`) in CHECK constraints because they aren't immutable, so DB-level enforcement of full IANA membership isn't achievable the way the exclusion constraint is — this is application-level validation on the one write path that exists, not a deliberately weaker tier of the same guarantee | `kairos/core/timezones.py` (`validate_iana_zone`) |
+| `validate_iana_zone` raises the existing `PolicyValidationError` (from `kairos/core/exceptions.py`) directly, not Django's `django.core.exceptions.ValidationError` | `PolicyValidationError` is already the framework-agnostic `{"field","issue"}` exception every write path raises, translated to 400 `validation_error` by `kairos_exception_handler`. Reusing it means Phase 19's future resource-write serializer needs zero adaptation — calling `validate_iana_zone` from `serializer.validate()` produces the correct 400 response on day one, the same pattern `PolicyValidationError`'s own docstring already describes | `kairos/core/timezones.py`, `kairos/core/exceptions.py` |
+| `Resource.save()` is overridden to call `validate_iana_zone(self.timezone)` unconditionally, before `super().save()` | Phase 19 (resource-write endpoint) doesn't exist yet — the only live write path today is direct ORM construction (test fixtures, and Phase 19's future service layer). Validating in `save()` rather than only in a not-yet-written serializer means the check is already active and already tested, and Phase 19 inherits it for free instead of needing to remember to add it | `kairos/resources/models.py` (`Resource.save`) |
+| `tzdata` is pinned with `==`, not a range, and a dedicated CI-form test (`tests/test_timezones.py`) asserts both the pin's exactness and that the installed version matches it | Test Plan TZ-03 Test A: "the deployed tzdata version is explicitly pinned and recorded... not 'whatever the base image shipped.'" A range (`>=`) would let CI silently resolve a newer release over time, reintroducing exactly the untracked-staleness failure mode TZ-03 exists to catch. The version is also logged at startup via `CoreConfig.ready()` (verified live via `manage.py check`, not just by inspection) so staleness is visible in production logs too, not only in CI | `backend/pyproject.toml`, `kairos/core/apps.py`, `tests/test_timezones.py` |
+| TZ-04 is tested against `GET /resources/{id}/availability` with two different authenticated users, not against a `booking` detail endpoint | Spec v1.0 §5.7: availability is viewable by "any authenticated user," unlike booking detail (owner/admin/operations only, 404 otherwise per SEC-01) — TZ-04's actual claim ("no per-viewer localization exists") needs two viewers who can BOTH legitimately see the same data, which only the availability endpoint (or resource detail) provides without also entangling authorization logic into the assertion | `tests/test_timezones.py` |
+| PRD FR7's second sentence ("store the IANA timezone identifier under which [a one-off booking] was created") is NOT implemented — flagged as a documented gap, not built | Symmetrical with Phase 9's `user_group` gap: Spec v1.0 §3's `booking` DDL has no column for it at all, and — unlike FR46/SEC-06 in Phase 9 — this phase's own Scope IN/DoD (as literally given) never calls for adding one, unlike its "Documents satisfied" line which names FR7 in full. Building unrequested schema/API surface beyond the given scope would be scope creep the same way silently dropping a named requirement would be a silent gap; flagging it here is the honest middle path. See Open Questions | Spec v1.0 §3 (no such column); PRD v1.0 FR7 |
 
 ## Running Locally
 
@@ -346,8 +372,20 @@ verb, and the response body's exact key set asserted, not just its status code) 
 including the booking-creation and availability paths; a group member and the resource's own
 admin can still see it).
 
+`tests/test_timezones.py` (Phase 10) — TZ-02 as a direct unit test of `local_to_instant`
+(the exact America/New_York Oct-20-creation/Nov-10-occurrence case resolves to
+`2026-11-10T15:00:00Z`); nonexistent/ambiguous detection against the exact Europe/Paris
+2027-03-28/2027-10-31 dates Test Plan TZ-05/TZ-06 use; `validate_iana_zone` accepting a real
+zone and rejecting a fixed offset, both directly and through `Resource.save()` (the DoD's
+"submitted → 400" case, proven at the model layer since no resource-write endpoint exists
+yet — see Key Technical Decisions); the tzdata-pin CI form (Test Plan TZ-03 Test A) —
+asserts the `pyproject.toml` pin is exact (`==`, not a range) AND that the installed
+`tzdata` version matches it; and TZ-04 as a real HTTP test against
+`GET /resources/{id}/availability`, asserting two different authenticated users receive
+byte-identical UTC `busy_blocks`.
+
 Also runnable: `cd backend && ruff check . && ruff format --check . && mypy kairos` (all pass
-with zero findings as of Phase 9). CI (`.github/workflows/ci.yml`) runs all of this as three
+with zero findings as of Phase 10). CI (`.github/workflows/ci.yml`) runs all of this as three
 jobs — `lint`, `test`, `concurrency` — on every PR. The spike scripts under `scripts/spike/`
 are runnable but are diagnostic, not a test suite — see
 `docs/spikes/S1-postgres-verification.md` for what each one does and its recorded output.
@@ -381,6 +419,29 @@ From Phase 9:
   "Resource Administration & Offboarding") should treat this schema as already decided** —
   extend it, don't redesign it, and don't let a differently-shaped group model creep in
   without updating this entry and the Key Technical Decisions row that explains the choice.
+
+From Phase 10:
+
+- **PRD FR7's second sentence has no corresponding column in Spec v1.0 §3's `booking` DDL.**
+  FR7 reads: "A one-off booking is an instant range. Store as UTC. Additionally store the
+  IANA timezone identifier under which it was created, for display and audit." The first two
+  sentences are satisfied (`time_range TSTZRANGE`, since Phase 2). The third has no
+  `booking` column for it at all, and — unlike the FR46/`user_group` gap above — Phase 10's
+  own Scope IN and Definition of Done (as given) never call for adding one, even though its
+  "Documents satisfied" line names FR7 in full. Nothing was built for it this phase: no
+  `booking.created_timezone` column, no `timezone` field on `POST /api/v1/bookings`'s request
+  body (Spec v1.0 §5.1's example body is `resource_id`/`start`/`end` only, already UTC — the
+  client doesn't send a zone today). **No phase in the current 31-phase plan is explicitly
+  scoped to pick this up.** The nearest natural point is Phase 12 (Recurring API — Preview &
+  Confirm), which builds the analogous timezone-storage path for `recurring_series` and is
+  the next time `BookingResponseSerializer`/booking-creation is touched at all — Phase 12
+  should either add `booking.created_timezone` then (client sends the creating zone, or it's
+  inferred from `resource.timezone`) or explicitly re-defer it in its own session's CLAUDE.md
+  update, restating this entry rather than letting it silently drop. If Phase 12 passes
+  without addressing it, it should be carried forward to a dedicated polish/cleanup phase
+  instead of being assumed resolved. It must not be silently assumed to already exist, and
+  must not be added incidentally as a side effect of unrelated work without updating this
+  entry.
 
 Genuine open questions from the source documents (offer window duration, nonexistent-time
 policy default, series bounds, etc.) are tracked in PRD v1.0 §11 and RFC v1.0 §18; they get
