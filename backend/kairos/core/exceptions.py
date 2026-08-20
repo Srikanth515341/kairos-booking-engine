@@ -28,10 +28,13 @@ class ServiceUnavailableError(Exception):
         self.retry_after_seconds = retry_after_seconds
 
 
-class ResourceNotFoundError(Exception):
-    """The referenced resource doesn't exist, or `status='inactive'`. Maps
-    to 404 `not_found` (Spec v1.0 §5.1) — an inactive resource is treated
-    identically to a nonexistent one, not surfaced as a distinct error.
+class NotFoundError(Exception):
+    """The referenced entity doesn't exist — or does, but the requester has
+    no right to know that (Spec v1.0 §1 convention: object-level protection
+    is 404, not 403, so existence isn't confirmed to someone without
+    access). Maps to 404 `not_found`. Used for a missing/inactive resource,
+    a missing booking, and a booking the requester may not view — the same
+    status and code regardless of which, by design.
     """
 
 

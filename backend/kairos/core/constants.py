@@ -23,3 +23,8 @@ MAX_ADVANCE_HORIZON_DAYS = int(os.environ.get("MAX_ADVANCE_HORIZON_DAYS", "365")
 # a dropped connection happens within seconds to minutes, not days — 24h is
 # the concrete default the contract needs.
 IDEMPOTENCY_RETENTION_HOURS = int(os.environ.get("IDEMPOTENCY_RETENTION_HOURS", "24"))
+
+# Availability query bound (PRD FR30). Unbounded ranges combined with
+# recurrence expansion are the most likely source of the first production
+# latency incident (RFC v1.0 §6.3).
+MAX_AVAILABILITY_QUERY_DAYS = int(os.environ.get("MAX_AVAILABILITY_QUERY_DAYS", "92"))

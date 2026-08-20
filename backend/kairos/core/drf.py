@@ -15,9 +15,9 @@ from rest_framework.views import exception_handler as drf_default_exception_hand
 
 from kairos.core.exceptions import (
     IdempotencyKeyConflictError,
+    NotFoundError,
     PolicyValidationError,
     RequestInProgressError,
-    ResourceNotFoundError,
     ServiceUnavailableError,
     SlotUnavailableError,
 )
@@ -121,7 +121,7 @@ def kairos_exception_handler(exc: Exception, context: dict[str, Any]) -> Respons
             status=422,
         )
 
-    if isinstance(exc, ResourceNotFoundError):
+    if isinstance(exc, NotFoundError):
         return Response(
             build_error_envelope(
                 "not_found", "The requested resource was not found.", None, request_id
