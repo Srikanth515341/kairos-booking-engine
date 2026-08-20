@@ -40,11 +40,13 @@ Implementation Plan — all committed under [`docs/`](docs/).
 
 ## Status
 
-🚧 **Early construction.** This repository currently contains only the Phase 0 scaffolding:
-project structure, the six planning documents, and process configuration. No application
-code exists yet. See [`CLAUDE.md`](CLAUDE.md) for exactly what is and isn't built, and
-[`docs/06-implementation-plan.md`](docs/06-implementation-plan.md) for the full 31-phase
-build plan.
+🚧 **Early construction.** Repository scaffolding and the six planning documents are in
+place (Phase 0), and the core architectural bet — a PostgreSQL exclusion constraint as the
+correctness mechanism — has been verified against a real PostgreSQL 16 instance (Phase 1
+spike; see [`docs/spikes/S1-postgres-verification.md`](docs/spikes/S1-postgres-verification.md)).
+No application code exists yet. See [`CLAUDE.md`](CLAUDE.md) for exactly what is and isn't
+built, and [`docs/06-implementation-plan.md`](docs/06-implementation-plan.md) for the full
+31-phase build plan.
 
 ## Tech stack
 

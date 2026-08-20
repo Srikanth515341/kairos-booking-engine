@@ -1,0 +1,28 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: kairos_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: kairos
+      POSTGRES_PASSWORD: kairos
+      POSTGRES_DB: kairos_dev
+    ports:
+      - "5432:5432"
+    # max_connections raised from the default 100: the S1.2/S1.6/S1.7 spike
+    # scripts (RFC v1.0 §16) open up to 500 concurrent connections to test
+    # real contention, not connection-pool exhaustion. Production sits behind
+    # PgBouncer in transaction-pooling mode (RFC §6.3) so this is a
+    # spike/dev-only setting, not a production sizing decision.
+    command: ["postgres", "-c", "max_connections=600"]
+    volumes:
+      - kairos_pgdata:/var/lib/postgresql/data
+      - ./init-test-db.sql:/docker-entrypoint-initdb.d/init-test-db.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kairos -d kairos_dev"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  kairos_pgdata:
