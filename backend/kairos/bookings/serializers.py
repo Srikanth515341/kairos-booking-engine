@@ -17,6 +17,7 @@ from rest_framework import serializers
 from kairos.bookings.models import Booking
 from kairos.core.constants import MAX_ADVANCE_HORIZON_DAYS
 from kairos.core.exceptions import NotFoundError, PolicyValidationError
+from kairos.core.timezones import validate_iana_zone
 from kairos.identity.authorization import AuthorizationService
 from kairos.resources.models import Resource, ResourceStatus
 
@@ -159,3 +160,78 @@ class BookingResponseSerializer(serializers.Serializer[Booking]):
 
     def get_cancelled_by(self, obj: Booking) -> str | None:
         return str(obj.cancelled_by_id) if obj.cancelled_by_id else None
+
+
+class RecurringSeriesPreviewSerializer(serializers.Serializer[None]):
+    """POST /bookings/recurring/preview body (Spec v1.0 §5.8). Request-shape
+    and stateless policy validation only — occurrence_count bounds are
+    `expand_occurrences`'s own job (Phase 11), and the 365-day horizon
+    needs `resource`/expanded occurrences that don't exist until
+    `kairos.bookings.recurring_series.preview_recurring_series` runs.
+    """
+
+    resource_id = serializers.UUIDField()
+    timezone = serializers.CharField()
+    local_start_time = serializers.TimeField()
+    local_end_time = serializers.TimeField()
+    weekday = serializers.IntegerField(min_value=0, max_value=6)
+    series_start_date = serializers.DateField()
+    occurrence_count = serializers.IntegerField()
+
+    def validate(self, attrs: dict[str, Any]) -> dict[str, Any]:
+        try:
+            resource = Resource.objects.get(id=attrs["resource_id"])
+        except Resource.DoesNotExist as exc:
+            raise NotFoundError from exc
+        if resource.status != ResourceStatus.ACTIVE:
+            raise NotFoundError
+        if not AuthorizationService.can_view_resource(self.context["user"], resource):
+            raise NotFoundError
+
+        # PRD FR8: a fixed offset is rejected at the API boundary, the
+        # same check Resource.save()/RecurringSeries.save() enforce at
+        # write time (Phase 10/11) — here it must run explicitly, since no
+        # RecurringSeries row exists yet for a model-level save() to
+        # intercept.
+        validate_iana_zone(attrs["timezone"])
+        if attrs["local_end_time"] <= attrs["local_start_time"]:
+            raise PolicyValidationError("local_end_time", "must be after local_start_time")
+
+        attrs["resource"] = resource
+        return attrs
+
+
+class RecurringSeriesCancelSerializer(serializers.Serializer[None]):
+    """POST /recurring-series/{id}/cancel body (Spec v1.0 §5.10). Spec's
+    own example body is empty, but PRD FR47 ("administrative override of
+    another user's booking requires a recorded reason") is unconditional
+    and a series-cancel-by-admin is exactly such an override — the
+    identical rule `BookingCancelSerializer` already enforces for a single
+    booking, applied here rather than left as a gap Spec's example simply
+    didn't happen to show.
+    """
+
+    reason = serializers.CharField(required=False, allow_null=True, allow_blank=True, default=None)
+
+    def validate(self, attrs: dict[str, Any]) -> dict[str, Any]:
+        if not self.context["is_owner"] and not attrs.get("reason"):
+            raise PolicyValidationError("reason", "required for an administrative override")
+        return attrs
+
+
+class RecurringSeriesConfirmSerializer(serializers.Serializer[None]):
+    """POST /bookings/recurring body (Spec v1.0 §5.9). `preview_token`
+    verification (expiry, signature, ownership) is deliberately NOT done
+    here — PreviewExpiredError is a 409, not a 400 `validation_error`,
+    so it belongs to the view/service layer, exactly like NotFoundError
+    is raised from BookingCreateSerializer.validate() but still isn't a
+    'validation_error' response.
+    """
+
+    preview_token = serializers.CharField()
+    acknowledged_conflicts = serializers.ListField(
+        child=serializers.DateField(), required=False, default=list
+    )
+    acknowledged_adjustments = serializers.ListField(
+        child=serializers.DateField(), required=False, default=list
+    )

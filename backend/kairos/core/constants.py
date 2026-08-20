@@ -34,3 +34,9 @@ MAX_AVAILABILITY_QUERY_DAYS = int(os.environ.get("MAX_AVAILABILITY_QUERY_DAYS", 
 # (RFC v1.0 §15b's cost of the materialized-rows design) — this is the
 # structural ceiling on that, checked before expansion ever runs.
 MAX_SERIES_OCCURRENCES = int(os.environ.get("MAX_SERIES_OCCURRENCES", "100"))
+
+# Recurring-series preview token lifetime (Spec v1.0 §5.8/§5.9; Test Plan
+# REC-04). A preview is advisory — availability can change while the user
+# is deciding — so the token that lets confirm reuse the preview's exact
+# computation without re-evaluating it is deliberately short-lived.
+PREVIEW_TOKEN_TTL_SECONDS = int(os.environ.get("PREVIEW_TOKEN_TTL_SECONDS", str(15 * 60)))

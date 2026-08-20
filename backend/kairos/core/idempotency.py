@@ -182,6 +182,118 @@ def _replay_or_conflict(user: AppUser, key: UUID, fingerprint: str) -> Idempoten
     raise IdempotencyKeyConflictError
 
 
+def run_idempotent_recurring_confirm(
+    *,
+    user: AppUser,
+    key: UUID,
+    endpoint: str,
+    body: dict[str, Any],
+    request_id: str | None,
+    actor_type: str,
+    perform_confirm: Callable[[], tuple[int, dict[str, Any]]],
+) -> IdempotentWriteResult:
+    """Recurring-series confirm (Implementation Plan Phase 12; Spec v1.0
+    §5.9; Test Plan IDEM-05) needs a DIFFERENT transaction shape than
+    `run_idempotent_write` above, not a variation of it — RFC v1.0 §5d
+    requires each occurrence to commit in its OWN independent transaction
+    (never one all-or-nothing transaction across the series), so the key
+    claim CANNOT live in the same transaction as "the write" the way
+    `run_idempotent_write`'s docstring requires, because there is no
+    single write here — there are N of them.
+
+    The key is claimed and COMMITTED in its own transaction first;
+    `perform_confirm` then runs each occurrence's own transaction via the
+    ordinary `create_booking` path (fresh `apply_write_path_session_
+    settings` every call — Phase 12's explicit requirement); the outcome
+    is recorded in a THIRD, final transaction afterward. This means a
+    replay arriving while confirm is still running sees a COMMITTED
+    'in_progress' row (unlike run_idempotent_write, where a concurrent
+    replay only ever blocks on lock contention — see _replay_or_conflict's
+    docstring) and must be told 409 request_in_progress explicitly, not
+    inferred from a database error.
+
+    Documented, deliberate cost of this design (not covered by any test in
+    Phase 12's Test Plan scope): a crash between the key-claim commit and
+    the final outcome-record leaves the key permanently 'in_progress' even
+    though some occurrences may have already committed successfully. A
+    naive retry after such a crash would see 'in_progress' and get 409
+    request_in_progress indefinitely, never a silent double-create — but
+    also never automatically resolves without the existing 24h
+    idempotency-key cleanup (kairos.core.management.commands.
+    cleanup_idempotency_keys) eventually deleting the stale row, after
+    which a fresh confirm could re-create already-created occurrences.
+    Recovering from a crash mid-series is unsolved here, exactly as
+    IDEM-07/08's fault-injection gaps are unsolved elsewhere in this
+    project — flagged, not silently assumed away.
+    """
+    fingerprint = compute_request_fingerprint(body)
+
+    try:
+        with transaction.atomic():
+            with connection.cursor() as cursor:
+                apply_write_path_session_settings(
+                    cursor,
+                    actor_id=str(user.id),
+                    actor_type=actor_type,
+                    request_id=request_id or "",
+                )
+            IdempotencyKey.objects.create(
+                user=user,
+                key=key,
+                endpoint=endpoint,
+                request_body_hash=fingerprint,
+                status=IdempotencyKeyStatus.IN_PROGRESS,
+            )
+    except DatabaseError as exc:
+        sqlstate = getattr(exc.__cause__, "sqlstate", None)
+        if sqlstate == KEY_CLAIM_UNIQUE_VIOLATION:
+            return _replay_or_conflict_allowing_in_progress(user, key, fingerprint)
+        if sqlstate in KEY_CLAIM_CONTENDED_SQLSTATES:
+            logger.info(
+                "idempotency_key_contended",
+                extra={"request_id": request_id, "user_id": str(user.id), "sqlstate": sqlstate},
+            )
+            raise RequestInProgressError from exc
+        raise
+
+    response_status, response_body = perform_confirm()
+
+    with transaction.atomic():
+        with connection.cursor() as cursor:
+            apply_write_path_session_settings(
+                cursor,
+                actor_id=str(user.id),
+                actor_type=actor_type,
+                request_id=request_id or "",
+            )
+        IdempotencyKey.objects.filter(user=user, key=key).update(
+            status=IdempotencyKeyStatus.COMPLETED,
+            response_status=response_status,
+            response_body=response_body,
+            completed_at=timezone.now(),
+        )
+
+    return IdempotentWriteResult(response_status, response_body, is_replay=False)
+
+
+def _replay_or_conflict_allowing_in_progress(
+    user: AppUser, key: UUID, fingerprint: str
+) -> IdempotentWriteResult:
+    # Unlike _replay_or_conflict (run_idempotent_write's version), a
+    # committed row here CAN legitimately still be 'in_progress' — the key
+    # claim and the outcome record are two separate committed
+    # transactions, with perform_confirm's real work happening between
+    # them, so a concurrent replay can genuinely observe the row mid-flight.
+    existing = IdempotencyKey.objects.get(user=user, key=key)
+    if existing.status == IdempotencyKeyStatus.IN_PROGRESS:
+        raise RequestInProgressError
+    if existing.request_body_hash == fingerprint:
+        assert existing.response_status is not None
+        assert existing.response_body is not None
+        return IdempotentWriteResult(existing.response_status, existing.response_body, True)
+    raise IdempotencyKeyConflictError
+
+
 def _record_conflict_outcome(
     user: AppUser, key: UUID, endpoint: str, fingerprint: str, request_id: str | None
 ) -> None:
