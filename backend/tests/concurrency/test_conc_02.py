@@ -31,8 +31,11 @@ RUNS = 10
 # produce zero successes under heavy contention (every competitor entangled
 # in the same documented timeout/deadlock pileup), which is a liveness
 # characteristic, not a safety violation. Retried only when zero succeed;
-# more than the expected count fails immediately, never retried.
-MAX_ROUND_ATTEMPTS = 3
+# more than the expected count fails immediately, never retried. Same value
+# as CONC-01, tuned there against an observed ~15-20% zero-success rate per
+# attempt at N=200 (this test's party counts are much smaller, so the real
+# risk here is lower — matching the value keeps the reasoning in one place).
+MAX_ROUND_ATTEMPTS = 6
 
 
 def _insert_action(

@@ -29,6 +29,14 @@ class AppUser(models.Model):
     PlatformRole = AppUserPlatformRole
     Status = AppUserStatus
 
+    # DRF's IsAuthenticated permission checks `request.user.is_authenticated`
+    # — a convention from Django's auth.User/AnonymousUser that AppUser
+    # doesn't inherit (Phase 2 deliberately excludes django.contrib.auth).
+    # Any resolved AppUser is, by definition, authenticated; DRF's fallback
+    # AnonymousUser (used when no authenticator matches) already supplies
+    # `is_authenticated = False` on its own, so only this side needs it.
+    is_authenticated = True
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     email = models.TextField(unique=True)
     display_name = models.TextField()

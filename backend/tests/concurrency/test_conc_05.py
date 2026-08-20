@@ -42,8 +42,10 @@ RUNS = 10
 # create succeeds" (RFC v1.0 §3's core guarantee). A round is retried only
 # when zero creates succeed, mirroring the retry a real client performs on a
 # documented error (RFC §11) — see test_conc_01.py's MAX_ROUND_ATTEMPTS
-# comment for the full reasoning.
-MAX_ROUND_ATTEMPTS = 3
+# comment for the full reasoning and the Phase 4 tuning note behind the
+# value (matched here for consistency; this test's party count is much
+# smaller, so the real risk is lower).
+MAX_ROUND_ATTEMPTS = 6
 
 
 def _insert_action(

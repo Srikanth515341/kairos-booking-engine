@@ -49,7 +49,10 @@ was verified against a real PostgreSQL 16 instance (Phase 1 spike; see
 [`docs/spikes/S1-postgres-verification.md`](docs/spikes/S1-postgres-verification.md)); the
 Django project and core schema exist (Phase 2): `app_user`, `resource`, `resource_admin`,
 and `booking`, with the `no_overlapping_bookings` `EXCLUDE` constraint enforced at the
-database level. No API, no service layer, no auth yet — those are Phase 4 onward. See
+database level. `POST /api/v1/bookings` is live (Phase 4) — the first user-reachable
+surface, with policy validation, correct SQLSTATE-to-HTTP translation on every write-path
+outcome, and structured logging. No idempotency yet (Phase 5), no read/edit/cancel
+endpoints (Phase 6–7), and auth is a dev-only stub (Phase 9 does the real thing). See
 [`CLAUDE.md`](CLAUDE.md) for exactly what is and isn't built, and
 [`docs/06-implementation-plan.md`](docs/06-implementation-plan.md) for the full 31-phase
 build plan.
@@ -114,9 +117,30 @@ python -m venv .venv
 .venv/Scripts/activate      # Windows; `source .venv/bin/activate` on macOS/Linux
 pip install -e ".[dev]"
 python manage.py migrate    # DATABASE_URL defaults to the docker-compose credentials above
+python manage.py runserver
 ```
 
-No API and no frontend exist yet — see Status above and [`CLAUDE.md`](CLAUDE.md).
+**Try it** — auth is a dev-only stub (`X-Dev-User-Id`, Phase 9 replaces it with real
+OIDC/SSO), so create a user and resource first:
+
+```bash
+python manage.py shell -c "
+from datetime import time
+from kairos.identity.models import AppUser
+from kairos.resources.models import Resource
+user = AppUser.objects.create(email='you@example.com', display_name='You')
+resource = Resource.objects.create(name='Room 1', timezone='UTC',
+    bookable_start_time=time(0,0), bookable_end_time=time(23,59), created_by=user)
+print(user.id, resource.id)
+"
+
+curl -i -X POST http://127.0.0.1:8000/api/v1/bookings \
+  -H "Content-Type: application/json" \
+  -H "X-Dev-User-Id: <user-id-from-above>" \
+  -d '{"resource_id": "<resource-id-from-above>", "start": "2026-09-01T13:00:00Z", "end": "2026-09-01T14:00:00Z"}'
+```
+
+No frontend yet — see Status above and [`CLAUDE.md`](CLAUDE.md).
 
 ## Running the test suite
 
@@ -150,7 +174,8 @@ pytest
 | Feature | Status |
 |---|---|
 | Core exclusion-constraint guarantee | **Proven under concurrency — Milestone 1** (Phase 1–3) |
-| Booking creation / edit / cancel | Not started (Phase 4–7) |
+| Booking creation | **Live** — `POST /api/v1/bookings` (Phase 4) |
+| Booking edit / cancel | Not started (Phase 7) |
 | Idempotent writes | Not started (Phase 5) |
 | Audit trail | Not started (Phase 8) |
 | Auth & scoped authorization | Not started (Phase 9) |
