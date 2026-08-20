@@ -36,7 +36,7 @@ A Django project now exists under `backend/kairos/`, structured per RFC §4.1:
 
 ```
 kairos-booking-engine/
-├── .github/workflows/    # CI (skeleton now, real jobs from Phase 3)
+├── .github/workflows/    # ci.yml — lint, test, concurrency (all real, Phase 3)
 ├── docs/                 # the six source documents + spike reports, checklists
 ├── backend/
 │   ├── kairos/
@@ -47,7 +47,15 @@ kairos-booking-engine/
 │   │   ├── resources/      # resource
 │   │   ├── bookings/       # booking — the table the correctness guarantee lives on
 │   │   ├── urls.py, wsgi.py
-│   ├── tests/              # test_booking_exclusion_smoke.py
+│   ├── tests/
+│   │   ├── test_booking_exclusion_smoke.py
+│   │   ├── test_schema_assertion.py   # RECON-05 CI form — fails if the predicate is narrowed
+│   │   └── concurrency/               # Milestone 1 — the project's central proof
+│   │       ├── harness.py             # barrier-released, independent-connection harness
+│   │       ├── conftest.py
+│   │       ├── test_conc_01.py        # identical-slot contention, N=200 x 10 runs
+│   │       ├── test_conc_02.py        # partial + chained overlap
+│   │       └── test_conc_05.py        # cancel-and-rebook race
 │   ├── manage.py
 │   └── pyproject.toml      # ruff, mypy strict, pytest config
 ├── frontend/              # React + TypeScript — empty until Phase 23
@@ -67,21 +75,25 @@ Phase 9). `backend/.venv/` is local and gitignored; recreate with
 | 0 | Repository & Process Foundation | Scaffolding, six docs committed, CLAUDE.md/README.md initialized, CI skeleton | Pending (direct-to-main commit) |
 | 1 | Spike S1 — Postgres Verification | All of RFC §16 S1.1–S1.7 verified against real PostgreSQL 16; gate PASSED; Candidate A confirmed. One liveness finding carried forward (see below) | Pending (on branch `phase-01-spike-postgres-verification`) |
 | 2 | Core Schema & The Exclusion Constraint | Django project scaffolded (Django 6.1); `app_user`, `resource`, `resource_admin`, `booking` created via migrations; `no_overlapping_bookings` EXCLUDE constraint added via raw SQL with the Spec §3 comment block reproduced verbatim; smoke test confirms SQLSTATE 23P01 on sequential overlap; ruff + mypy strict pass with zero findings | Pending (on branch `phase-02-core-schema-exclusion-constraint`) |
+| 3 | Concurrency Proof & CI Pipeline 🏁 Milestone 1 | Barrier-released concurrency harness (`tests/concurrency/harness.py`); CONC-01 (N=200, 10 runs), CONC-02 (partial + 5-way chained overlap), CONC-05 (cancel-and-rebook race) all pass reliably; RECON-05 CI-form schema assertion added and verified to fail on a manually narrowed predicate; full CI pipeline (`lint`, `test`, `concurrency` — three separate jobs) wired up; two new empirical findings beyond the carried-forward 40P01 one (see Key Technical Decisions) | Pending (on branch `phase-03-concurrency-proof-ci`) |
 
 ## Current Phase In Progress
 
-None. Phase 2 is complete pending review and merge. Phase 3 (Concurrency Proof & CI
-Pipeline — Milestone 1) is next.
+None. Phase 3 is complete pending review and merge. Phase 4 (Service Layer & Booking
+Creation API) is next.
 
 ## NOT Yet Built
 
 No API, no service layer, no views/serializers, no real authentication (Phase 9), no
-Celery/Redis, no frontend, no CI jobs beyond a placeholder, no concurrency proof (Phase 3),
-no `recurring_series`/`waitlist_entry`/`waitlist_offer`/`idempotency_key`/`audit_log`/
+Celery/Redis, no frontend, no
+`recurring_series`/`waitlist_entry`/`waitlist_offer`/`idempotency_key`/`audit_log`/
 `system_check_run` tables (each arrives with the phase that needs it — see the Key Technical
 Decisions and Phase Index in `docs/06-implementation-plan.md`). `booking.series_id` does not
 exist yet — it cannot, since `recurring_series` (Phase 11) doesn't exist; it is added in
-Phase 11, not retrofitted early. The throwaway spike table `spike_booking` may still exist in
+Phase 11, not retrofitted early. CONC-03/CONC-04 (edit-vs-create, edit-vs-edit races) don't
+exist yet — Phase 7, when editing exists. CONC-01's full 100-run + N=500 escalation and
+CONC-06 (throughput characterization) are deferred to Phase 28/29 respectively; CI only runs
+the 10-run CI-tier reduction. The throwaway spike table `spike_booking` may still exist in
 `kairos_dev`, created/dropped repeatedly by `scripts/spike/common.py` — unrelated to the real
 schema. Do not assume any of the above exist in a fresh session — verify against this file
 and `git log` first.
@@ -104,6 +116,9 @@ and `git log` first.
 | The EXCLUDE constraint is added via a raw-SQL migration (`RunSQL`), not Django's `ExclusionConstraint` ORM class | The Spec §3 comment block — the primary mitigation against RUNBOOK-01 cause #1 (someone narrowing the predicate during an unrelated migration) — needs to be reproduced verbatim at the point of definition; a raw SQL migration is where that text actually lives, byte for byte | Implementation Plan Phase 2 scope; RFC v1.0 §3.4 |
 | `resource_admin`'s composite PK `(resource_id, user_id)` from Spec §3 is modeled as a surrogate `id` + `UniqueConstraint` in Django | Django's ORM ergonomics around composite primary keys are still immature; the surrogate key still enforces the identical one-grant-per-pair guarantee at the DB level — a Django-ergonomics deviation, not a correctness one | `kairos/identity/models.py` (`ResourceAdmin`) |
 | Django's built-in `auth`/`contenttypes` apps are deliberately excluded from `INSTALLED_APPS` | Authentication is delegated to SSO/OIDC (RFC v1.0 §4, Phase 9) — Django's `User`/`Permission` machinery has no role here and would add unused tables that don't correspond to anything in Spec §3 | `kairos/settings/base.py` |
+| `BookingService` (Phase 4) must also treat SQLSTATE `57014` (`query_canceled`, i.e. `statement_timeout` fired) the same as `55P03`/`40P01` — 503 + retry | Phase 3 CONC-01 empirical finding, reproducible at N=200: under the heaviest pileups, most losers don't block cleanly on one uncommitted competitor for a single >3s stretch (which `lock_timeout` would catch) — they accumulate many shorter waits under GiST index contention that together exceed `statement_timeout` (10s) before any one wait exceeds `lock_timeout`. Safety was unaffected in every observed run | `tests/concurrency/harness.py` (`EXPECTED_NONSUCCESS_SQLSTATES`) |
+| At N=200 identical-slot contention, a single barrier-released round can — rarely — produce **zero** successes, not just "not exactly one": every competitor, including whichever would have won, can end up entangled in the same 57014/40P01 pileup | This is a liveness characteristic of the current, provisional timeout budget (RFC v1.0 §18 already flags `lock_timeout` as "tune from CONC-01's observed rate" — this is exactly that signal), not a safety violation. The concurrency tests retry a round only when it produced zero successes (bounded, `MAX_ROUND_ATTEMPTS = 3`); more than one success on any single attempt fails immediately and is never retried, so a real safety violation can never be masked | `tests/concurrency/test_conc_01.py`, `test_conc_02.py`, `test_conc_05.py` |
+| CI's `concurrency` job starts Postgres via a plain `docker run` (`-c max_connections=600`), not the `services:` block used by the `test` job | GitHub Actions' `services:` block can't override a container's startup command, and CONC-01 alone opens 200 simultaneous connections — well past Postgres's default `max_connections=100`. Same setting as `infra/docker-compose.yml`, same reason (spike/test-scale concurrency, not production sizing) | `.github/workflows/ci.yml` |
 
 ## Running Locally
 
@@ -125,14 +140,20 @@ The frontend starts Phase 23.
 
 ```bash
 cd backend
-pytest
+pytest tests/concurrency -v   # Milestone 1 — the project's central proof, run this first
+pytest                        # full suite: the above + smoke test + schema assertion
 ```
 
-Currently one smoke test (`tests/test_booking_exclusion_smoke.py`): a sequential overlapping
-insert against `booking` must raise SQLSTATE `23P01`. This is **not** the concurrency proof —
-that's Phase 3's 200-way barrier-released stress test, the project's central proof, not yet
-built. Also runnable: `cd backend && ruff check . && ruff format --check . && mypy kairos`
-(all pass with zero findings as of Phase 2). The spike scripts under `scripts/spike/` are
+`tests/concurrency/` — CONC-01 (N=200 identical-slot, 10 runs), CONC-02 (partial + 5-way
+chained overlap, 10 runs each), CONC-05 (cancel-and-rebook race, 10 runs). Each round is
+retried up to 3 times only if it produced zero successes (a documented liveness
+characteristic — see Key Technical Decisions); more than one success on any single attempt
+fails immediately and is never retried. `tests/test_schema_assertion.py` (RECON-05 CI form)
+fails the moment `no_overlapping_bookings`'s predicate is narrowed — verified by hand during
+Phase 3 (narrowed it, watched the test fail, reverted). Also runnable:
+`cd backend && ruff check . && ruff format --check . && mypy kairos` (all pass with zero
+findings as of Phase 3). CI (`.github/workflows/ci.yml`) runs all of this as three jobs —
+`lint`, `test`, `concurrency` — on every PR. The spike scripts under `scripts/spike/` are
 runnable but are diagnostic, not a test suite — see
 `docs/spikes/S1-postgres-verification.md` for what each one does and its recorded output.
 
