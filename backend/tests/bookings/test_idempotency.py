@@ -18,6 +18,7 @@ from django.utils import timezone
 from rest_framework.test import APIClient
 
 from kairos.bookings.models import Booking
+from kairos.core.idempotency import run_idempotent_write
 from kairos.core.models import IdempotencyKey, IdempotencyKeyStatus
 from kairos.identity.models import AppUser
 from kairos.resources.models import Resource
@@ -83,6 +84,59 @@ def test_in_progress_row_is_writable_with_null_response_columns(
     )
     assert row.response_status is None
     assert row.response_body is None
+
+
+# --------------------------------------------------------------------
+# Regression: session settings on the key-claim INSERT itself (RFC v1.0
+# §11.2/§7.1) — Phase 5's report claimed this was "moved into a shared
+# core/db.py helper applied once at the top of the outer transaction," but
+# run_idempotent_write never actually called it; only each write function's
+# own NESTED transaction did, which runs strictly after the key-claim
+# INSERT has already executed. A concurrent replay's key-claim insert would
+# then block under Postgres's untimed defaults instead of failing fast at
+# the intended 3s lock_timeout. Fixed in Phase 7 alongside the two new
+# write paths that go through this exact function.
+# --------------------------------------------------------------------
+
+
+@pytest.mark.django_db
+def test_session_settings_are_active_at_the_key_claim_insert_itself(
+    monkeypatch: pytest.MonkeyPatch, app_user: AppUser
+) -> None:
+    """Spies on the exact call `run_idempotent_write` uses for the
+    key-claim INSERT (`IdempotencyKey.objects.create`) and reads
+    `SHOW lock_timeout`/`SHOW statement_timeout` on the SAME connection
+    immediately before letting the real INSERT proceed — proving the
+    settings are active at that precise statement, not merely "somewhere"
+    later in the transaction (which a naive assertion after the fact
+    couldn't distinguish, since `set_config(..., true)` is scoped to the
+    transaction and unreadable once it commits).
+    """
+    observed: dict[str, str] = {}
+    original_create = IdempotencyKey.objects.create
+
+    def _spy_create(*args: object, **kwargs: object) -> IdempotencyKey:
+        with connection.cursor() as cur:
+            cur.execute("SHOW lock_timeout")
+            observed["lock_timeout"] = cur.fetchone()[0]  # type: ignore[index]
+            cur.execute("SHOW statement_timeout")
+            observed["statement_timeout"] = cur.fetchone()[0]  # type: ignore[index]
+        return original_create(*args, **kwargs)  # type: ignore[no-any-return]
+
+    monkeypatch.setattr(IdempotencyKey.objects, "create", _spy_create)
+
+    result = run_idempotent_write(
+        user=app_user,
+        key=uuid.uuid4(),
+        endpoint="TEST /session-settings-probe",
+        body={},
+        request_id="req-session-settings-probe",
+        perform_write=lambda: (200, {"ok": True}),
+    )
+
+    assert result.response_status == 200
+    assert observed["lock_timeout"] == "3s"
+    assert observed["statement_timeout"] == "10s"
 
 
 # --------------------------------------------------------------------

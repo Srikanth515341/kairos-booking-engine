@@ -66,11 +66,17 @@ def test_create_booking_returns_201_with_exact_body_shape(
         "status",
         "series_id",
         "created_at",
+        "cancelled_at",
+        "cancelled_by",
+        "cancellation_reason",
     }
     assert body["resource_id"] == str(active_resource.id)
     assert body["user_id"] == str(app_user.id)
     assert body["status"] == "confirmed"
     assert body["series_id"] is None
+    assert body["cancelled_at"] is None
+    assert body["cancelled_by"] is None
+    assert body["cancellation_reason"] is None
     assert Booking.objects.filter(id=body["id"]).exists()
 
 

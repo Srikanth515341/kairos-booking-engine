@@ -20,6 +20,38 @@ from kairos.core.exceptions import NotFoundError, PolicyValidationError
 from kairos.resources.models import Resource, ResourceStatus
 
 
+def _validate_range_policy(resource: Resource, start: datetime, end: datetime) -> None:
+    """Bookable hours, max duration, past-dating, and the advance horizon —
+    shared by create and edit (PRD FR5: "editing... must be evaluated
+    against the overlap constraint exactly as a new booking is. Edit
+    cannot be a bypass"). A range that would be rejected at creation must
+    be rejected identically when it arrives via an edit.
+    """
+    if end <= start:
+        raise PolicyValidationError("end", "must be after start")
+
+    local_tz = ZoneInfo(resource.timezone)
+    local_start_time = start.astimezone(local_tz).time()
+    local_end_time = end.astimezone(local_tz).time()
+    if not (
+        resource.bookable_start_time <= local_start_time
+        and local_end_time <= resource.bookable_end_time
+    ):
+        raise PolicyValidationError("start", "outside the resource's bookable hours")
+
+    if resource.max_booking_duration_minutes is not None and end - start > timedelta(
+        minutes=resource.max_booking_duration_minutes
+    ):
+        raise PolicyValidationError("end", "exceeds the resource's maximum booking duration")
+
+    now = django_timezone.now()
+    if start < now:
+        raise PolicyValidationError("start", "must not be in the past")
+
+    if start > now + timedelta(days=MAX_ADVANCE_HORIZON_DAYS):
+        raise PolicyValidationError("start", f"must be within {MAX_ADVANCE_HORIZON_DAYS} days")
+
+
 class BookingCreateSerializer(serializers.Serializer[None]):
     resource_id = serializers.UUIDField()
     start = serializers.DateTimeField()
@@ -36,39 +68,53 @@ class BookingCreateSerializer(serializers.Serializer[None]):
             # isn't leaked.
             raise NotFoundError
 
-        start: datetime = attrs["start"]
-        end: datetime = attrs["end"]
-
-        if end <= start:
-            raise PolicyValidationError("end", "must be after start")
-
-        local_tz = ZoneInfo(resource.timezone)
-        local_start_time = start.astimezone(local_tz).time()
-        local_end_time = end.astimezone(local_tz).time()
-        if not (
-            resource.bookable_start_time <= local_start_time
-            and local_end_time <= resource.bookable_end_time
-        ):
-            raise PolicyValidationError("start", "outside the resource's bookable hours")
-
-        if resource.max_booking_duration_minutes is not None and end - start > timedelta(
-            minutes=resource.max_booking_duration_minutes
-        ):
-            raise PolicyValidationError("end", "exceeds the resource's maximum booking duration")
-
-        now = django_timezone.now()
-        if start < now:
-            raise PolicyValidationError("start", "must not be in the past")
-
-        if start > now + timedelta(days=MAX_ADVANCE_HORIZON_DAYS):
-            raise PolicyValidationError("start", f"must be within {MAX_ADVANCE_HORIZON_DAYS} days")
+        _validate_range_policy(resource, attrs["start"], attrs["end"])
 
         attrs["resource"] = resource
         return attrs
 
 
+class BookingEditSerializer(serializers.Serializer[None]):
+    """PATCH body (Spec v1.0 §5.5). Only start/end are editable —
+    `resource_id` isn't a field here at all, not merely ignored if sent:
+    booking a different resource means cancelling and creating instead, so
+    the range is validated against the booking's EXISTING resource, passed
+    in via context rather than re-looked-up from the body.
+    """
+
+    start = serializers.DateTimeField()
+    end = serializers.DateTimeField()
+
+    def validate(self, attrs: dict[str, Any]) -> dict[str, Any]:
+        booking: Booking = self.context["booking"]
+        _validate_range_policy(booking.resource, attrs["start"], attrs["end"])
+        return attrs
+
+
+class BookingCancelSerializer(serializers.Serializer[None]):
+    """POST .../cancel body (Spec v1.0 §5.6). `reason` is required only
+    when the requester isn't the booking's owner (PRD FR40/FR47/FR53 — the
+    notified owner must be able to learn why an admin cancelled their
+    booking); optional for self-cancellation. A blank string is treated
+    the same as absent, not as "a reason was given."
+    """
+
+    reason = serializers.CharField(required=False, allow_null=True, allow_blank=True, default=None)
+
+    def validate(self, attrs: dict[str, Any]) -> dict[str, Any]:
+        if not self.context["is_owner"] and not attrs.get("reason"):
+            raise PolicyValidationError("reason", "required for an administrative override")
+        return attrs
+
+
 class BookingResponseSerializer(serializers.Serializer[Booking]):
-    """Spec v1.0 §5.1's 201 response body, exactly."""
+    """Spec v1.0 §5.1's 201 response body, plus the cancellation fields
+    Spec v1.0 §5.6 requires the cancel response to populate. Phase 6's
+    GET already promises "shape as §5.1" for every booking regardless of
+    status, so extending the ONE shared serializer (rather than a
+    cancel-only variant) keeps GET on a cancelled booking able to show why
+    and when it was cancelled too, instead of silently omitting that state.
+    """
 
     id = serializers.UUIDField()
     resource_id = serializers.SerializerMethodField()
@@ -87,6 +133,9 @@ class BookingResponseSerializer(serializers.Serializer[Booking]):
     status = serializers.CharField()
     series_id = serializers.SerializerMethodField()
     created_at = serializers.DateTimeField()
+    cancelled_at = serializers.DateTimeField(allow_null=True)
+    cancelled_by = serializers.SerializerMethodField()
+    cancellation_reason = serializers.CharField(allow_null=True)
 
     def get_resource_id(self, obj: Booking) -> str:
         return str(obj.resource_id)
@@ -97,3 +146,6 @@ class BookingResponseSerializer(serializers.Serializer[Booking]):
     def get_series_id(self, obj: Booking) -> None:
         # `booking.series_id` doesn't exist until Phase 11 (recurring_series).
         return None
+
+    def get_cancelled_by(self, obj: Booking) -> str | None:
+        return str(obj.cancelled_by_id) if obj.cancelled_by_id else None

@@ -49,20 +49,23 @@ kairos-booking-engine/
 │   │   │                   # authorization.py (is_resource_admin/is_operations, Phase 6)
 │   │   ├── resources/      # resource, serializers.py, views.py, urls.py (list/detail/
 │   │   │                   # availability — Phase 6; writes are Phase 19)
-│   │   ├── bookings/       # booking, services.py, serializers.py, views.py, urls.py
+│   │   ├── bookings/       # booking, services.py (create/edit/cancel — Phase 7), serializers.py,
+│   │   │                   # views.py, urls.py
 │   │   ├── urls.py, wsgi.py
 │   ├── tests/
 │   │   ├── test_booking_exclusion_smoke.py
 │   │   ├── test_schema_assertion.py   # RECON-05 CI form — fails if the predicate is narrowed
 │   │   ├── conftest.py                # app_user / active_resource fixtures, shared
 │   │   ├── bookings/                  # test_services.py, test_views.py, test_idempotency.py,
-│   │   │                              # test_read_endpoints.py (Phase 6)
+│   │   │                              # test_read_endpoints.py (Phase 6), test_cancel_edit.py (Phase 7)
 │   │   ├── resources/                 # test_views.py (Phase 6 — list/detail/availability)
 │   │   └── concurrency/               # Milestone 1 — the project's central proof
 │   │       ├── harness.py             # barrier-released, independent-connection harness
 │   │       ├── conftest.py
 │   │       ├── test_conc_01.py        # identical-slot contention, N=200 x 10 runs
 │   │       ├── test_conc_02.py        # partial + chained overlap
+│   │       ├── test_conc_03.py        # edit-vs-create race (Phase 7)
+│   │       ├── test_conc_04.py        # edit-vs-edit race (Phase 7)
 │   │       └── test_conc_05.py        # cancel-and-rebook race
 │   ├── manage.py
 │   └── pyproject.toml      # ruff, mypy strict, pytest config
@@ -72,12 +75,15 @@ kairos-booking-engine/
     └── spike/             # throwaway S1 spike scripts — will NOT be extended after Phase 1
 ```
 
-Endpoints live (Phase 6 adds the read path to Phase 4/5's write path):
-`POST`/`GET /api/v1/bookings`, `GET /api/v1/bookings/{id}`, `GET /api/v1/resources`,
-`GET /api/v1/resources/{id}`, `GET /api/v1/resources/{id}/availability`. Booking creation is
-idempotent (Phase 5 — `Idempotency-Key` is required; missing it is 400). No edit/cancel
-(Phase 7), no real auth (Phase 9 — currently a dev-only `X-Dev-User-Id` header stub, clearly
-marked `# STUB` in `kairos/identity/authentication.py`). `backend/.venv/` is local and
+Endpoints live (Phase 6 added the read path, Phase 7 the remaining single-booking mutations,
+to Phase 4/5's write path): `POST`/`GET /api/v1/bookings`, `GET`/`PATCH /api/v1/bookings/{id}`,
+`POST /api/v1/bookings/{id}/cancel`, `GET /api/v1/resources`, `GET /api/v1/resources/{id}`,
+`GET /api/v1/resources/{id}/availability`. Every mutation (create, edit, cancel) is idempotent
+(Phase 5/7 — `Idempotency-Key` is required; missing it is 400). Edit is owner-only, no admin
+override; cancel is owner-or-resource-admin, with a reason required for the admin-override
+case (400 otherwise). Cancelling an already-cancelled booking is a 200 no-op, independent of
+idempotency key. No real auth (Phase 9 — currently a dev-only `X-Dev-User-Id` header stub,
+clearly marked `# STUB` in `kairos/identity/authentication.py`). `backend/.venv/` is local and
 gitignored; recreate with `python -m venv .venv && pip install -e ".[dev]"` from `backend/`.
 
 ## Completed Phases
@@ -91,32 +97,34 @@ gitignored; recreate with `python -m venv .venv && pip install -e ".[dev]"` from
 | 4 | Service Layer & Booking Creation API | DRF wired up (`/api/v1`, JSON only); `POST /api/v1/bookings` live with policy validation (bookable hours, max duration, past-dating, 365-day horizon), stub `X-Dev-User-Id` auth, `X-Request-Id` on every response, structured JSON logging, and the Spec §6 error envelope on every error path; `BookingService.create_booking` catches all four write-path SQLSTATEs specifically (23P01→409, 55P03/40P01/57014→503+Retry-After); verified live against the real dev server (not just the test client); all Phase 2/3 tests still pass | Pending (on branch `phase-04-booking-creation-api`) |
 | 5 | Idempotency — The Transaction Boundary ⚠️ Subtle | `idempotency_key` table with a genuine composite `(user_id, key)` PRIMARY KEY (Django 6.1's `CompositePrimaryKey` — no surrogate-key workaround needed here, unlike Phase 2's `resource_admin`); `run_idempotent_write` (generic, in `core`, reused by every future write path) claims the key and runs the protected write in one transaction per RFC §11.2, recording a 409 outcome in its own follow-up transaction after rollback, and recording nothing at all for a 503 (outcome genuinely unknown); IDEM-01–04, 06 (100 reps), 09, 10, 11 all pass; verified live (replay returns the original booking, not a 409) | Pending (on branch `phase-05-idempotency`) |
 | 6 | Read Path & Availability View | `GET /bookings/{id}` (owner/admin/operations, else 404 per Spec §1) and `GET /bookings` (cursor pagination, `idx_booking_user_starts`-shaped, held rows always excluded); `GET /resources`, `GET /resources/{id}` (read-only; writes are Phase 19); `GET /resources/{id}/availability` bounded to 92 days, `booking_id`/`owner` omitted entirely (not nulled) unless the requester owns the booking or administers the resource, held slots never reveal them to anyone (SEC-05); keyset (not offset) pagination proven stable under a concurrent insert between page fetches; N+1 guard verified via `django_assert_max_num_queries`; all prior tests still green (see the `MAX_ROUND_ATTEMPTS` finding below) | Pending (on branch `phase-06-read-path-availability`) |
+| 7 | Cancellation & Editing | `PATCH /bookings/{id}` (owner only, evaluated against `no_overlapping_bookings` exactly as a create) and `POST /bookings/{id}/cancel` (owner or resource-admin override with a required reason, double-cancel idempotent at 200 regardless of idempotency key) — both share `_handle_write_database_error`'s SQLSTATE translation with create; the `transaction.on_commit()` waitlist-check stub registered inside cancel's nested atomic, correctly deferred to the outer (idempotency) transaction's commit; `BookingResponseSerializer` extended with `cancelled_at`/`cancelled_by`/`cancellation_reason`; idempotency fingerprints for both endpoints fold in `booking_id` (a real gap the body alone doesn't cover — see Key Technical Decisions); CONC-03 (edit-vs-create) and CONC-04 (edit-vs-edit), 10 runs each, loser verified unchanged at its original range. Also caught and fixed a real regression while doing this: Phase 5's session-settings fix had never actually been wired into `run_idempotent_write` — the key-claim INSERT was running with NO `lock_timeout` (proven via a spy test, then fixed, then proven fixed by reverting and watching the new test fail). Full suite (83 tests) green, including three concurrency runs back-to-back in one session | Pending (on branch `phase-07-cancel-edit`) |
 
 ## Current Phase In Progress
 
-None. Phase 6 is complete pending review and merge. Phase 7 (Cancellation & Editing) is
-next.
+None. Phase 7 is complete pending review and merge. Phase 8 (Audit Trail — Triggers &
+Grants) is next.
 
 ## NOT Yet Built
 
-No edit/cancel (Phase 7), no real authentication (Phase 9 —
-`X-Dev-User-Id` is an explicitly marked stub), no Celery/Redis, no frontend, no hold
-reclamation (booking creation does not yet run the cleanup-on-write DELETE from Spec §4.1
-step 2, since `held` rows don't exist until Phase 15), no
-`recurring_series`/`waitlist_entry`/`waitlist_offer`/`audit_log`/`system_check_run` tables
+No real authentication (Phase 9 — `X-Dev-User-Id` is an explicitly marked stub), no
+Celery/Redis, no frontend, no hold reclamation (booking creation does not yet run the
+cleanup-on-write DELETE from Spec §4.1 step 2, since `held` rows don't exist until Phase 15),
+no `recurring_series`/`waitlist_entry`/`waitlist_offer`/`audit_log`/`system_check_run` tables
 (each arrives with the phase that needs it — see the Key Technical Decisions and Phase Index
 in `docs/06-implementation-plan.md`). No replica routing (Phase 30 — `data_freshness` is
 hardcoded `"primary"`, always true today since no replica exists). `GET /bookings/{id}/history`
-is Phase 8. Resource CRUD (create/update/admin grants) is Phase 19 — the Phase 6 resource
-endpoints are read-only. IDEM-05 (recurring replay) needs Phase 12's endpoint;
-IDEM-07/08 (fault injection — process kill mid-transaction, proxy-level response drop) need
-tooling that arrives in Phase 28; idempotency coverage on cancel/edit/waitlist/confirm
-arrives with those endpoints (Phases 7, 14, 16). `booking.series_id` does not
-exist yet — it cannot, since `recurring_series` (Phase 11) doesn't exist; it is added in
-Phase 11, not retrofitted early. CONC-03/CONC-04 (edit-vs-create, edit-vs-edit races) don't
-exist yet — Phase 7, when editing exists. CONC-01's full 100-run + N=500 escalation and
-CONC-06 (throughput characterization) are deferred to Phase 28/29 respectively; CI only runs
-the 10-run CI-tier reduction. The throwaway spike table `spike_booking` may still exist in
+is Phase 8, along with the audit trail itself — Phase 7's cancel/edit produce no audit rows
+yet. The Phase 7 cancel endpoint's `on_commit()` hook only logs "would enqueue waitlist
+check" — the real worker dispatch is Phase 16, and there is no `waitlist_entry` table yet for
+anything to be eligible against. Resource CRUD (create/update/admin grants) is Phase 19 — the
+Phase 6 resource endpoints are read-only. IDEM-05 (recurring replay) needs Phase 12's
+endpoint; IDEM-07/08 (fault injection — process kill mid-transaction, proxy-level response
+drop) need tooling that arrives in Phase 28; idempotency coverage on waitlist join/offer
+confirm arrives with those endpoints (Phases 14, 16). `booking.series_id` does not exist
+yet — it cannot, since `recurring_series` (Phase 11) doesn't exist; it is added in Phase 11,
+not retrofitted early. CONC-01's full 100-run + N=500 escalation and CONC-06 (throughput
+characterization) are deferred to Phase 28/29 respectively; CI only runs the 10-run CI-tier
+reduction for every CONC test. The throwaway spike table `spike_booking` may still exist in
 `kairos_dev`, created/dropped repeatedly by `scripts/spike/common.py` — unrelated to the real
 schema. Do not assume any of the above exist in a fresh session — verify against this file
 and `git log` first.
@@ -159,6 +167,11 @@ and `git log` first.
 | A 409 `slot_unavailable` idempotency outcome is recorded in its OWN, separate transaction after the write's transaction rolls back — never inside the same transaction as the failed write | RFC v1.0 §11.2 states this explicitly ("in its own transaction after the rollback"). The failed write's rollback undoes the ENTIRE transaction, including the key claim — there is nothing left to `UPDATE`, so the 409 outcome must be a fresh `INSERT` in a new transaction. A 503 outcome is the opposite: nothing is recorded at all, since the write's outcome is genuinely unknown (Spec v1.0 §5.1) and a retry with the same key should start completely fresh, not receive a stale "unknown" result | `kairos/core/idempotency.py` (`run_idempotent_write`, `_record_conflict_outcome`) |
 | Policy validation (bookable hours, duration, past-dating, horizon) happens BEFORE the idempotency key is ever claimed, not inside the protected transaction | Spec v1.0 §7 point 7 ("conflict outcomes are recorded too") is scoped to 409 specifically, not general validation failures — and a malformed/policy-violating request has nothing worth protecting or replaying. Validating first also means a request that will never succeed doesn't consume a key slot | `kairos/bookings/views.py` (`BookingCreateView.post`) |
 | `BookingResponseSerializer.start`/`.end` changed from `SerializerMethodField` (returning a raw `datetime`) to `DateTimeField(source="time_range.lower"/".upper")` | A raw datetime returned by `SerializerMethodField` gets formatted differently by two different code paths: Django's `DjangoJSONEncoder` (used when storing the response into `IdempotencyKey.response_body`, a JSONField) truncates microseconds to milliseconds, while DRF's own response renderer preserves full microsecond precision — producing two different strings for the identical instant and breaking IDEM-02's "identical stored response returned verbatim." Formatting to a string once, through the same `DateTimeField` code path `created_at` already used, fixed it | `kairos/bookings/serializers.py` |
+| Cancel's conditional UPDATE is guarded on the booking's CURRENT status (`WHERE status='confirmed'`), not the target one, and the affected row-count decides whether the row was actually flipped this call | Spec v1.0 §5.6: cancelling an already-cancelled booking must return 200 with the existing state, not an error — the guard makes the UPDATE match zero rows in that case instead of raising or double-applying, and the row-count (not a re-read-then-compare) is what decides whether the `on_commit` waitlist-check hook fires, since a no-op cancel has nothing to notify anyone about | `kairos/bookings/services.py` (`cancel_booking`) |
+| Idempotency fingerprints for `PATCH /bookings/{id}` and `POST /bookings/{id}/cancel` fold the URL's `booking_id` into the body passed to `run_idempotent_write`, not just the `endpoint` label | `compute_request_fingerprint()` hashes only the body (Phase 5). An edit/cancel body — `{"start","end"}` or `{"reason"}` — never mentions which booking it's about; without folding the id in, reusing one idempotency key across two DIFFERENT bookings with a coincidentally identical body would be misread as a replay of the first, silently never touching the second. Phase 4/5's create doesn't have this problem because `resource_id` is already part of its body. Folding the id in surfaces the reuse as the same 422 `idempotency_key_conflict` any other same-key-different-body reuse gets (IDEM-03), rather than a silent wrong-booking replay | `kairos/bookings/views.py` (`BookingDetailView.patch`, `BookingCancelView.post`) |
+| `_handle_write_database_error` (shared by create/edit/cancel) is typed to return `NoReturn` and is used uniformly across all three, even though cancel's UPDATE can never actually trigger SQLSTATE 23P01 | A partial EXCLUDE constraint only fires on rows satisfying its predicate (`status IN ('confirmed','held')`); cancel's UPDATE moves a row OUT of that set, so Postgres never evaluates the constraint against it. The branch is unreachable for cancel specifically, but keeping one shared function — rather than a cancel-specific subset — is what RFC v1.0 §17 asks for ("every future write path... gets consistent SQLSTATE translation... for free"), and an unreachable branch costs nothing | `kairos/bookings/services.py` |
+| `BookingResponseSerializer` gained `cancelled_at`/`cancelled_by`/`cancellation_reason` as one shared extension, not a cancel-only response variant | Spec v1.0 §5.2 already promises GET's shape matches §5.1's exactly regardless of booking status, and a cancelled booking now genuinely exists post-Phase-7 — a GET that omitted why/when it was cancelled would be a real product gap, not just an unused field. One serializer keeps every endpoint (create, GET, edit, cancel) returning the identical shape rather than diverging per endpoint | `kairos/bookings/serializers.py` (`BookingResponseSerializer`) |
+| ⚠️ **Regression found and fixed in Phase 7**: `run_idempotent_write`'s key-claim INSERT was NOT calling `apply_write_path_session_settings` before it ran, despite this file's own Phase 5 entry claiming the fix was "moved into a shared `core/db.py` helper applied once at the top of the outer transaction" | Verified directly: `kairos/core/idempotency.py` had no cursor/session-settings call at all — the Phase 5 report described the intended fix, but it was never actually wired into `run_idempotent_write` (only each write function's own NESTED transaction called it, which runs strictly AFTER the key-claim INSERT has already executed under Postgres's untimed defaults). Confirmed empirically before fixing: a spy on the key-claim `.create()` call observed `SHOW lock_timeout` = `'0'` (no timeout) at that exact statement. Fixed by adding the same `apply_write_path_session_settings(cursor, ...)` call at the top of `run_idempotent_write`'s outer `transaction.atomic()`, before the key-claim INSERT — verified the same spy now observes `3s`/`10s`, and that reverting the fix makes the new test fail (confirming the test is a real regression guard, not incidental). IDEM-06 (100 concurrent-replay reps) and all five CONC tests still pass | `kairos/core/idempotency.py`, `tests/bookings/test_idempotency.py` (`test_session_settings_are_active_at_the_key_claim_insert_itself`) |
 
 ## Running Locally
 
@@ -186,26 +199,37 @@ pytest                        # full suite: the above + smoke test + schema asse
 ```
 
 `tests/concurrency/` — CONC-01 (N=200 identical-slot, 10 runs), CONC-02 (partial + 5-way
-chained overlap, 10 runs each), CONC-05 (cancel-and-rebook race, 10 runs). Each round is
-retried up to 10 times only if it produced zero successes (a documented, load-correlated
+chained overlap, 10 runs each), CONC-03 (edit-vs-create race, Phase 7, 10 runs), CONC-04
+(edit-vs-edit race, Phase 7, 10 runs), CONC-05 (cancel-and-rebook race, 10 runs). Each round
+is retried up to 10 times only if it produced zero successes (a documented, load-correlated
 liveness characteristic — see Key Technical Decisions); more than one success on any single
-attempt fails immediately and is never retried. `tests/test_schema_assertion.py` (RECON-05
-CI form) fails the moment `no_overlapping_bookings`'s predicate is narrowed — verified by
-hand during Phase 3 (narrowed it, watched the test fail, reverted). `tests/bookings/` covers
-`BookingService` (session-settings assertion, all four SQLSTATE translations — 55P03 forced
-genuinely via a real held row, 40P01/57014 forced by simulation since natural reproduction
-isn't controllable on demand), the write API (every Test Plan §10 policy-validation row,
-409, 404, 401, `X-Request-Id`), idempotency (`test_idempotency.py`) — IDEM-01–04, 06 (100
-barrier-released repetitions), 09, 10, 11, plus the composite-PK schema check and the
-cleanup command — and the read path (`test_read_endpoints.py`, Phase 6): detail/list
-authorization, held-row exclusion, and cursor-pagination stability under a concurrent
-insert. `tests/resources/` (Phase 6) covers resource list/detail and availability — the
-92/93-day boundary, SEC-05's key-absence assertion, held-slot opacity even to admins, and
-the bounded query-count guard. Also runnable:
-`cd backend && ruff check . && ruff format --check . && mypy kairos` (all pass with zero
-findings as of Phase 6). CI (`.github/workflows/ci.yml`) runs all of this as three jobs —
-`lint`, `test`, `concurrency` — on every PR. The spike scripts under `scripts/spike/` are
-runnable but are diagnostic, not a test suite — see
+attempt fails immediately and is never retried. CONC-03/04 exercise the raw UPDATE/INSERT
+SQL directly through the same barrier-released harness as the others, not through the
+service/view layer — proving the constraint itself, independent of Phase 7's application
+code. `tests/test_schema_assertion.py` (RECON-05 CI form) fails the moment
+`no_overlapping_bookings`'s predicate is narrowed — verified by hand during Phase 3 (narrowed
+it, watched the test fail, reverted). `tests/bookings/` covers `BookingService` (session-
+settings assertion, all four SQLSTATE translations — 55P03 forced genuinely via a real held
+row, 40P01/57014 forced by simulation since natural reproduction isn't controllable on
+demand), the write API (every Test Plan §10 policy-validation row, 409, 404, 401,
+`X-Request-Id`), idempotency (`test_idempotency.py`) — IDEM-01–04, 06 (100 barrier-released
+repetitions), 09, 10, 11, the composite-PK schema check, the cleanup command, and (Phase 7)
+`test_session_settings_are_active_at_the_key_claim_insert_itself` — a spy on the key-claim
+INSERT itself proving `lock_timeout`/`statement_timeout` are active at that exact statement,
+added after finding `run_idempotent_write` had silently regressed on the Phase 5 fix it
+claimed to have (see Key Technical Decisions) — the
+read path (`test_read_endpoints.py`, Phase 6): detail/list authorization, held-row exclusion,
+and cursor-pagination stability under a concurrent insert — and cancel/edit
+(`test_cancel_edit.py`, Phase 7): every Spec §5.5/§5.6 failure case from the Test Plan §10
+matrix, double-cancel idempotence, self-conflict-on-edit, and the two same-key-different-
+booking tests proving the idempotency-fingerprint gap described in Key Technical Decisions is
+actually closed (422 conflict, not a silent wrong-booking replay). `tests/resources/`
+(Phase 6) covers resource list/detail and availability — the 92/93-day boundary, SEC-05's
+key-absence assertion, held-slot opacity even to admins, and the bounded query-count guard.
+Also runnable: `cd backend && ruff check . && ruff format --check . && mypy kairos` (all pass
+with zero findings as of Phase 7). CI (`.github/workflows/ci.yml`) runs all of this as three
+jobs — `lint`, `test`, `concurrency` — on every PR. The spike scripts under `scripts/spike/`
+are runnable but are diagnostic, not a test suite — see
 `docs/spikes/S1-postgres-verification.md` for what each one does and its recorded output.
 
 ## Open Questions
