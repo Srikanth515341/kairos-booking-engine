@@ -45,7 +45,13 @@ RUNS = 10
 # up to MAX_ROUND_ATTEMPTS. More than one success on any attempt fails the
 # test immediately; it is never retried, because retrying could mask a real
 # safety violation.
-MAX_ROUND_ATTEMPTS = 3
+#
+# Phase 4 tuning note: the observed zero-success rate per attempt at this
+# scale is roughly 15-20%. At MAX_ROUND_ATTEMPTS=3, three-in-a-row exhausts
+# the budget often enough to flake a 10-run suite a few percent of the time
+# (observed directly). 6 pushes that below ~0.1% per suite while adding
+# negligible time to the common case (most rounds resolve on attempt 1).
+MAX_ROUND_ATTEMPTS = 6
 
 
 def _insert_action(

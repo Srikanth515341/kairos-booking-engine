@@ -40,16 +40,17 @@ kairos-booking-engine/
 ├── docs/                 # the six source documents + spike reports, checklists
 ├── backend/
 │   ├── kairos/
-│   │   ├── settings/      # base.py, dev.py, test.py, prod.py
-│   │   ├── core/           # reserved for shared constants/exceptions/db helpers — empty
-│   │   │                   # until a phase (Phase 4+) actually needs them
-│   │   ├── identity/       # app_user, resource_admin
+│   │   ├── settings/      # base.py, dev.py, test.py, prod.py — DRF + logging wired in (Phase 4)
+│   │   ├── core/           # constants.py, exceptions.py, drf.py, logging.py, middleware.py
+│   │   ├── identity/       # app_user, resource_admin, authentication.py (# STUB, Phase 4)
 │   │   ├── resources/      # resource
-│   │   ├── bookings/       # booking — the table the correctness guarantee lives on
+│   │   ├── bookings/       # booking, services.py, serializers.py, views.py, urls.py
 │   │   ├── urls.py, wsgi.py
 │   ├── tests/
 │   │   ├── test_booking_exclusion_smoke.py
 │   │   ├── test_schema_assertion.py   # RECON-05 CI form — fails if the predicate is narrowed
+│   │   ├── conftest.py                # app_user / active_resource fixtures, shared
+│   │   ├── bookings/                  # test_services.py, test_views.py (Phase 4)
 │   │   └── concurrency/               # Milestone 1 — the project's central proof
 │   │       ├── harness.py             # barrier-released, independent-connection harness
 │   │       ├── conftest.py
@@ -64,8 +65,10 @@ kairos-booking-engine/
     └── spike/             # throwaway S1 spike scripts — will NOT be extended after Phase 1
 ```
 
-No API, no service layer, no views, no serializers, no auth — those start Phase 4 (auth is
-Phase 9). `backend/.venv/` is local and gitignored; recreate with
+`POST /api/v1/bookings` is live (Phase 4) — the first user-reachable surface. No other
+endpoints, no idempotency (Phase 5), no real auth (Phase 9 — currently a dev-only
+`X-Dev-User-Id` header stub, clearly marked `# STUB` in
+`kairos/identity/authentication.py`). `backend/.venv/` is local and gitignored; recreate with
 `python -m venv .venv && pip install -e ".[dev]"` from `backend/`.
 
 ## Completed Phases
@@ -76,16 +79,20 @@ Phase 9). `backend/.venv/` is local and gitignored; recreate with
 | 1 | Spike S1 — Postgres Verification | All of RFC §16 S1.1–S1.7 verified against real PostgreSQL 16; gate PASSED; Candidate A confirmed. One liveness finding carried forward (see below) | Pending (on branch `phase-01-spike-postgres-verification`) |
 | 2 | Core Schema & The Exclusion Constraint | Django project scaffolded (Django 6.1); `app_user`, `resource`, `resource_admin`, `booking` created via migrations; `no_overlapping_bookings` EXCLUDE constraint added via raw SQL with the Spec §3 comment block reproduced verbatim; smoke test confirms SQLSTATE 23P01 on sequential overlap; ruff + mypy strict pass with zero findings | Pending (on branch `phase-02-core-schema-exclusion-constraint`) |
 | 3 | Concurrency Proof & CI Pipeline 🏁 Milestone 1 | Barrier-released concurrency harness (`tests/concurrency/harness.py`); CONC-01 (N=200, 10 runs), CONC-02 (partial + 5-way chained overlap), CONC-05 (cancel-and-rebook race) all pass reliably; RECON-05 CI-form schema assertion added and verified to fail on a manually narrowed predicate; full CI pipeline (`lint`, `test`, `concurrency` — three separate jobs) wired up; two new empirical findings beyond the carried-forward 40P01 one (see Key Technical Decisions) | Pending (on branch `phase-03-concurrency-proof-ci`) |
+| 4 | Service Layer & Booking Creation API | DRF wired up (`/api/v1`, JSON only); `POST /api/v1/bookings` live with policy validation (bookable hours, max duration, past-dating, 365-day horizon), stub `X-Dev-User-Id` auth, `X-Request-Id` on every response, structured JSON logging, and the Spec §6 error envelope on every error path; `BookingService.create_booking` catches all four write-path SQLSTATEs specifically (23P01→409, 55P03/40P01/57014→503+Retry-After); verified live against the real dev server (not just the test client); all Phase 2/3 tests still pass | Pending (on branch `phase-04-booking-creation-api`) |
 
 ## Current Phase In Progress
 
-None. Phase 3 is complete pending review and merge. Phase 4 (Service Layer & Booking
-Creation API) is next.
+None. Phase 4 is complete pending review and merge. Phase 5 (Idempotency — Transaction
+Boundary) is next.
 
 ## NOT Yet Built
 
-No API, no service layer, no views/serializers, no real authentication (Phase 9), no
-Celery/Redis, no frontend, no
+No idempotency (Phase 5 — `POST /bookings` currently accepts no `Idempotency-Key`, a
+documented, temporary gap), no read endpoints (Phase 6), no edit/cancel (Phase 7), no real
+authentication (Phase 9 — `X-Dev-User-Id` is an explicitly marked stub), no Celery/Redis, no
+frontend, no hold reclamation (booking creation does not yet run the cleanup-on-write DELETE
+from Spec §4.1 step 2, since `held` rows don't exist until Phase 15), no
 `recurring_series`/`waitlist_entry`/`waitlist_offer`/`idempotency_key`/`audit_log`/
 `system_check_run` tables (each arrives with the phase that needs it — see the Key Technical
 Decisions and Phase Index in `docs/06-implementation-plan.md`). `booking.series_id` does not
@@ -119,6 +126,12 @@ and `git log` first.
 | `BookingService` (Phase 4) must also treat SQLSTATE `57014` (`query_canceled`, i.e. `statement_timeout` fired) the same as `55P03`/`40P01` — 503 + retry | Phase 3 CONC-01 empirical finding, reproducible at N=200: under the heaviest pileups, most losers don't block cleanly on one uncommitted competitor for a single >3s stretch (which `lock_timeout` would catch) — they accumulate many shorter waits under GiST index contention that together exceed `statement_timeout` (10s) before any one wait exceeds `lock_timeout`. Safety was unaffected in every observed run | `tests/concurrency/harness.py` (`EXPECTED_NONSUCCESS_SQLSTATES`) |
 | At N=200 identical-slot contention, a single barrier-released round can — rarely — produce **zero** successes, not just "not exactly one": every competitor, including whichever would have won, can end up entangled in the same 57014/40P01 pileup | This is a liveness characteristic of the current, provisional timeout budget (RFC v1.0 §18 already flags `lock_timeout` as "tune from CONC-01's observed rate" — this is exactly that signal), not a safety violation. The concurrency tests retry a round only when it produced zero successes (bounded, `MAX_ROUND_ATTEMPTS = 3`); more than one success on any single attempt fails immediately and is never retried, so a real safety violation can never be masked | `tests/concurrency/test_conc_01.py`, `test_conc_02.py`, `test_conc_05.py` |
 | CI's `concurrency` job starts Postgres via a plain `docker run` (`-c max_connections=600`), not the `services:` block used by the `test` job | GitHub Actions' `services:` block can't override a container's startup command, and CONC-01 alone opens 200 simultaneous connections — well past Postgres's default `max_connections=100`. Same setting as `infra/docker-compose.yml`, same reason (spike/test-scale concurrency, not production sizing) | `.github/workflows/ci.yml` |
+| Write-path session settings and the audit actor variables are applied via `SELECT set_config(name, value, true)`, not literal `SET LOCAL ...` SQL text | `set_config`'s third argument (`is_local`) is the functional equivalent of `SET LOCAL`, but as a plain function call it safely accepts bind parameters — `actor_id`/`request_id` are request-influenced values, and interpolating them directly into `SET` statement text would be an injection risk `set_config` avoids entirely | `kairos/bookings/services.py` (`apply_write_path_session_settings`) |
+| `PolicyValidationError` (custom, not DRF's `ValidationError`) carries a single `{"field", "issue"}` pair and is raised directly from `serializer.validate()`, stopping at the first violation | Spec v1.0 §6's `validation_error` details example is one flat field/issue pair, not DRF's default per-field list-of-messages aggregation. Because it isn't `rest_framework.exceptions.ValidationError`, DRF's `is_valid()` doesn't intercept it — it propagates straight to `kairos_exception_handler`, which builds the exact shape | `kairos/core/exceptions.py`, `kairos/bookings/serializers.py` |
+| `REST_FRAMEWORK["UNAUTHENTICATED_USER"]` is explicitly `None` | DRF's default is the string path to `django.contrib.auth.models.AnonymousUser` — importing that module pulls in `ContentType`, which fails because `contenttypes` isn't installed (Phase 2's deliberate decision). `None` makes DRF leave `request.user` as `None` for anonymous requests instead, which `IsAuthenticated` already handles correctly without needing `contenttypes` at all | `kairos/settings/base.py` |
+| `StubUserIdAuthentication.authenticate_header()` returns `"X-Dev-User-Id"` instead of the `BaseAuthentication` default of `None` | Without a `WWW-Authenticate` challenge available, DRF's `APIView.handle_exception()` silently downgrades `NotAuthenticated` from 401 to 403 (HTTP requires a challenge header alongside a bare 401). Spec v1.0 §5.1 documents 401 specifically for `unauthorized` | `kairos/identity/authentication.py` |
+| `BookingService.create_booking` calls `booking.refresh_from_db()` immediately after `Booking.objects.create(...)` | `.create()` leaves fields exactly as assigned in Python — `time_range` stays the plain tuple passed in, not the `Range` object a fresh `SELECT` returns, which broke response serialization (`AttributeError: 'tuple' object has no attribute 'lower'`) until this was added. Also correctly picks up the generated `starts_at` column and the DB-stored `created_at` precision | `kairos/bookings/services.py` |
+| CONC-01/02/05's `MAX_ROUND_ATTEMPTS` raised from 3 to 6 | Phase 4's "confirm all CONC tests still pass" check caught real flakiness: at N=200 the per-attempt zero-success rate is ~15-20%, so 3 consecutive zero-success attempts (retry budget exhausted) happened in a live run during this phase — a ~5% chance of flaking any given 10-run suite at the old value. 6 pushes that below ~0.1%. **Relevant to Phase 28**: the full 100-run CONC-01 exercise multiplies this same per-run risk by 10×; revisit this budget (or the underlying timeout tuning RFC v1.0 §18 already flags) before that phase, not after it flakes | `tests/concurrency/test_conc_01.py`, `test_conc_02.py`, `test_conc_05.py` |
 
 ## Running Locally
 
@@ -132,6 +145,7 @@ python -m venv .venv
 .venv/Scripts/activate      # Windows; `source .venv/bin/activate` on macOS/Linux
 pip install -e ".[dev]"
 python manage.py migrate    # DATABASE_URL defaults to the docker-compose credentials above
+python manage.py runserver  # POST /api/v1/bookings is live — see README.md for a curl example
 ```
 
 The frontend starts Phase 23.
@@ -150,9 +164,13 @@ retried up to 3 times only if it produced zero successes (a documented liveness
 characteristic — see Key Technical Decisions); more than one success on any single attempt
 fails immediately and is never retried. `tests/test_schema_assertion.py` (RECON-05 CI form)
 fails the moment `no_overlapping_bookings`'s predicate is narrowed — verified by hand during
-Phase 3 (narrowed it, watched the test fail, reverted). Also runnable:
+Phase 3 (narrowed it, watched the test fail, reverted). `tests/bookings/` (Phase 4) covers
+`BookingService` (session-settings assertion, all four SQLSTATE translations — 55P03 forced
+genuinely via a real held row, 40P01/57014 forced by simulation since natural reproduction
+isn't controllable on demand) and the API (every Test Plan §10 policy-validation row, 409,
+404, 401, `X-Request-Id`). Also runnable:
 `cd backend && ruff check . && ruff format --check . && mypy kairos` (all pass with zero
-findings as of Phase 3). CI (`.github/workflows/ci.yml`) runs all of this as three jobs —
+findings as of Phase 4). CI (`.github/workflows/ci.yml`) runs all of this as three jobs —
 `lint`, `test`, `concurrency` — on every PR. The spike scripts under `scripts/spike/` are
 runnable but are diagnostic, not a test suite — see
 `docs/spikes/S1-postgres-verification.md` for what each one does and its recorded output.

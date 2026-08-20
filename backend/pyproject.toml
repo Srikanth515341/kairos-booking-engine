@@ -7,6 +7,7 @@ dependencies = [
     "django>=6.1,<6.2",
     "psycopg[binary]>=3.3,<4",
     "dj-database-url>=2.3,<3",
+    "djangorestframework>=3.18,<3.19",
 ]
 
 [project.optional-dependencies]
@@ -14,6 +15,7 @@ dev = [
     "ruff>=0.16,<0.17",
     "mypy>=2.3,<3",
     "django-stubs[compatible-mypy]>=6.1,<6.2",
+    "djangorestframework-stubs>=3.18,<3.19",
     "pytest>=9.1,<10",
     "pytest-django>=4.14,<5",
 ]
