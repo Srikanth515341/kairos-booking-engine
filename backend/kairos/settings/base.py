@@ -17,6 +17,7 @@ SECRET_KEY = os.environ.get("DJANGO_SECRET_KEY", "")
 INSTALLED_APPS = [
     "django.contrib.postgres",
     "rest_framework",
+    "kairos.core",
     "kairos.identity",
     "kairos.resources",
     "kairos.bookings",

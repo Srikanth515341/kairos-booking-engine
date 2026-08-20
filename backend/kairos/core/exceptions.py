@@ -46,3 +46,20 @@ class PolicyValidationError(Exception):
         super().__init__(f"{field}: {issue}")
         self.field = field
         self.issue = issue
+
+
+class RequestInProgressError(Exception):
+    """An earlier request with this exact idempotency key is still
+    executing (RFC v1.0 §11.3). Maps to 409 `request_in_progress` — never
+    confused with `slot_unavailable`, even though both are 409: this means
+    *your own* request is still in flight, not that someone else took the
+    slot. Returning `slot_unavailable` here would misinform the user that
+    their own in-flight booking made the slot unavailable (PRD FR38).
+    """
+
+
+class IdempotencyKeyConflictError(Exception):
+    """The same (user, key) was presented with a different request body
+    (Spec v1.0 §7). Maps to 422 `idempotency_key_conflict` — a client bug
+    signal, never a silent replay of a different request under an old key.
+    """

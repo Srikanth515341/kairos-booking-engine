@@ -1,12 +1,13 @@
 """POST /api/v1/bookings — Spec v1.0 §5.1, every documented failure case
 from Implementation Plan Phase 4's Definition of Done and the relevant rows
-of Test Plan v1.0 §10. Idempotency-Key is deliberately not required yet —
-that's Phase 5's documented, temporary gap (Implementation Plan Phase 4
-scope).
+of Test Plan v1.0 §10. Idempotency-Key coverage (missing header -> 400,
+replay, conflict, concurrent replay) is tests/bookings/test_idempotency.py
+(Phase 5) — this file covers the non-idempotency-specific request surface.
 """
 
 from __future__ import annotations
 
+import uuid
 from datetime import datetime, time, timedelta
 
 import pytest
@@ -24,8 +25,11 @@ def _iso(dt: datetime) -> str:
     return dt.isoformat().replace("+00:00", "Z")
 
 
-def _auth_headers(user: AppUser) -> dict[str, str]:
-    return {"HTTP_X_DEV_USER_ID": str(user.id)}
+def _headers(user: AppUser, idempotency_key: uuid.UUID | None = None) -> dict[str, str]:
+    return {
+        "HTTP_X_DEV_USER_ID": str(user.id),
+        "HTTP_IDEMPOTENCY_KEY": str(idempotency_key or uuid.uuid4()),
+    }
 
 
 @pytest.fixture
@@ -48,7 +52,7 @@ def test_create_booking_returns_201_with_exact_body_shape(
             "end": _iso(end),
         },
         format="json",
-        **_auth_headers(app_user),
+        **_headers(app_user),
     )
 
     assert response.status_code == 201
@@ -82,10 +86,12 @@ def test_conflicting_booking_returns_409_slot_unavailable(
         "end": _iso(end),
     }
 
-    first = client.post(BOOKINGS_URL, data=payload, format="json", **_auth_headers(app_user))
+    # Two DISTINCT idempotency keys (each _headers() call mints a fresh one)
+    # — this test proves a genuine slot conflict (23P01), not a replay.
+    first = client.post(BOOKINGS_URL, data=payload, format="json", **_headers(app_user))
     assert first.status_code == 201
 
-    second = client.post(BOOKINGS_URL, data=payload, format="json", **_auth_headers(app_user))
+    second = client.post(BOOKINGS_URL, data=payload, format="json", **_headers(app_user))
     assert second.status_code == 409
     assert second.json()["error"]["code"] == "slot_unavailable"
 
@@ -101,7 +107,7 @@ def test_nonexistent_resource_returns_404(client: APIClient, app_user: AppUser) 
             "end": _iso(start + timedelta(hours=1)),
         },
         format="json",
-        **_auth_headers(app_user),
+        **_headers(app_user),
     )
     assert response.status_code == 404
     assert response.json()["error"]["code"] == "not_found"
@@ -123,7 +129,7 @@ def test_inactive_resource_returns_404(
             "end": _iso(start + timedelta(hours=1)),
         },
         format="json",
-        **_auth_headers(app_user),
+        **_headers(app_user),
     )
     assert response.status_code == 404
     assert response.json()["error"]["code"] == "not_found"
@@ -152,7 +158,7 @@ def test_request_id_present_on_success_and_error(client: APIClient, app_user: Ap
         data={},
         format="json",
         HTTP_X_REQUEST_ID="req-fixed-123",
-        **_auth_headers(app_user),
+        **_headers(app_user),
     )
     assert response.status_code == 400
     assert response.headers["X-Request-Id"] == "req-fixed-123"
@@ -183,7 +189,7 @@ class TestPolicyValidation:
                 "end": _iso(start),
             },
             format="json",
-            **_auth_headers(app_user),
+            **_headers(app_user),
         )
         assert response.status_code == 400
         body = response.json()
@@ -203,7 +209,7 @@ class TestPolicyValidation:
                 "end": _iso(start + timedelta(hours=1)),
             },
             format="json",
-            **_auth_headers(app_user),
+            **_headers(app_user),
         )
         assert response.status_code == 400
         assert response.json()["error"]["details"]["field"] == "start"
@@ -221,7 +227,7 @@ class TestPolicyValidation:
                 "end": _iso(start + timedelta(hours=1)),
             },
             format="json",
-            **_auth_headers(app_user),
+            **_headers(app_user),
         )
         assert response.status_code == 400
         assert response.json()["error"]["details"]["field"] == "start"
@@ -239,7 +245,7 @@ class TestPolicyValidation:
                 "end": _iso(start + timedelta(hours=1)),
             },
             format="json",
-            **_auth_headers(app_user),
+            **_headers(app_user),
         )
         assert response.status_code == 201
 
@@ -264,7 +270,7 @@ class TestPolicyValidation:
                 "end": _iso(start + timedelta(hours=1)),
             },
             format="json",
-            **_auth_headers(app_user),
+            **_headers(app_user),
         )
         assert response.status_code == 400
         assert response.json()["error"]["details"]["field"] == "start"
@@ -288,7 +294,7 @@ class TestPolicyValidation:
             BOOKINGS_URL,
             data={"resource_id": str(resource.id), "start": _iso(start), "end": _iso(end)},
             format="json",
-            **_auth_headers(app_user),
+            **_headers(app_user),
         )
         assert response.status_code == 201
 
@@ -311,7 +317,7 @@ class TestPolicyValidation:
                 "end": _iso(start + timedelta(minutes=61)),
             },
             format="json",
-            **_auth_headers(app_user),
+            **_headers(app_user),
         )
         assert response.status_code == 400
         assert response.json()["error"]["details"]["field"] == "end"
@@ -335,6 +341,6 @@ class TestPolicyValidation:
                 "end": _iso(start + timedelta(minutes=60)),
             },
             format="json",
-            **_auth_headers(app_user),
+            **_headers(app_user),
         )
         assert response.status_code == 201

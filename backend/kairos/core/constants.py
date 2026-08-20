@@ -18,3 +18,8 @@ WRITE_PATH_IDLE_IN_TRANSACTION_TIMEOUT = os.environ.get("DB_IDLE_IN_TRANSACTION_
 
 # Booking policy bounds (PRD FR14b).
 MAX_ADVANCE_HORIZON_DAYS = int(os.environ.get("MAX_ADVANCE_HORIZON_DAYS", "365"))
+
+# Idempotency key retention (PRD FR37; Spec v1.0 §7). A browser retry after
+# a dropped connection happens within seconds to minutes, not days — 24h is
+# the concrete default the contract needs.
+IDEMPOTENCY_RETENTION_HOURS = int(os.environ.get("IDEMPOTENCY_RETENTION_HOURS", "24"))

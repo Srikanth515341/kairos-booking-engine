@@ -73,8 +73,17 @@ class BookingResponseSerializer(serializers.Serializer[Booking]):
     id = serializers.UUIDField()
     resource_id = serializers.SerializerMethodField()
     user_id = serializers.SerializerMethodField()
-    start = serializers.SerializerMethodField()
-    end = serializers.SerializerMethodField()
+    # DateTimeField (not a SerializerMethodField returning a raw datetime)
+    # so start/end are formatted through the exact same code path as
+    # created_at below. This matters for idempotency (Phase 5): a
+    # SerializerMethodField's raw datetime return value gets re-formatted
+    # differently by Django's JSONField storage encoder (which truncates to
+    # millisecond precision) than by DRF's own response renderer (which
+    # keeps microseconds) — two different strings for the same instant,
+    # breaking IDEM-02's "identical stored response returned verbatim."
+    # Formatting to a string once, here, means both paths see the same value.
+    start = serializers.DateTimeField(source="time_range.lower")
+    end = serializers.DateTimeField(source="time_range.upper")
     status = serializers.CharField()
     series_id = serializers.SerializerMethodField()
     created_at = serializers.DateTimeField()
@@ -84,12 +93,6 @@ class BookingResponseSerializer(serializers.Serializer[Booking]):
 
     def get_user_id(self, obj: Booking) -> str:
         return str(obj.user_id)
-
-    def get_start(self, obj: Booking) -> datetime:
-        return obj.time_range.lower  # type: ignore[no-any-return]
-
-    def get_end(self, obj: Booking) -> datetime:
-        return obj.time_range.upper  # type: ignore[no-any-return]
 
     def get_series_id(self, obj: Booking) -> None:
         # `booking.series_id` doesn't exist until Phase 11 (recurring_series).
