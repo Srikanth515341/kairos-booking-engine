@@ -14,14 +14,16 @@ from rest_framework.response import Response
 from rest_framework.views import exception_handler as drf_default_exception_handler
 
 from kairos.core.exceptions import (
+    IdempotencyKeyConflictError,
     PolicyValidationError,
+    RequestInProgressError,
     ResourceNotFoundError,
     ServiceUnavailableError,
     SlotUnavailableError,
 )
 
 
-def _request_id(context: dict[str, Any]) -> str | None:
+def request_id_from_context(context: dict[str, Any]) -> str | None:
     request = context.get("request")
     # DRF's Request proxies unknown attributes to the underlying Django
     # HttpRequest, so this reads the value RequestIdMiddleware attached —
@@ -32,12 +34,17 @@ def _request_id(context: dict[str, Any]) -> str | None:
     return str(request_id) if request_id is not None else None
 
 
-def _envelope(
+def build_error_envelope(
     code: str,
     message: str,
     details: dict[str, Any] | list[Any] | None,
     request_id: str | None,
 ) -> dict[str, Any]:
+    """The Spec v1.0 §6 shape, built in exactly one place. Also used by
+    kairos.core.idempotency to record a 409 slot_unavailable outcome with
+    the identical body a live request would have received (Spec v1.0 §7:
+    "conflict outcomes are recorded too").
+    """
     return {
         "error": {
             "code": code,
@@ -63,11 +70,11 @@ def _map_drf_exception(exc: Exception) -> tuple[str, str]:
 
 
 def kairos_exception_handler(exc: Exception, context: dict[str, Any]) -> Response | None:
-    request_id = _request_id(context)
+    request_id = request_id_from_context(context)
 
     if isinstance(exc, SlotUnavailableError):
         return Response(
-            _envelope(
+            build_error_envelope(
                 "slot_unavailable",
                 "This time slot is no longer available.",
                 None,
@@ -78,7 +85,7 @@ def kairos_exception_handler(exc: Exception, context: dict[str, Any]) -> Respons
 
     if isinstance(exc, ServiceUnavailableError):
         response = Response(
-            _envelope(
+            build_error_envelope(
                 "service_unavailable",
                 "The outcome of this request is unknown. Retry the same request.",
                 None,
@@ -89,15 +96,42 @@ def kairos_exception_handler(exc: Exception, context: dict[str, Any]) -> Respons
         response["Retry-After"] = str(exc.retry_after_seconds)
         return response
 
+    if isinstance(exc, RequestInProgressError):
+        # Same 409 status as slot_unavailable, opposite meaning — never the
+        # same code. Distinct branch so the two can never be conflated
+        # (Spec v1.0 §6.1, IDEM-09).
+        return Response(
+            build_error_envelope(
+                "request_in_progress",
+                "An earlier request with this idempotency key is still executing.",
+                None,
+                request_id,
+            ),
+            status=409,
+        )
+
+    if isinstance(exc, IdempotencyKeyConflictError):
+        return Response(
+            build_error_envelope(
+                "idempotency_key_conflict",
+                "This idempotency key was already used with a different request body.",
+                None,
+                request_id,
+            ),
+            status=422,
+        )
+
     if isinstance(exc, ResourceNotFoundError):
         return Response(
-            _envelope("not_found", "The requested resource was not found.", None, request_id),
+            build_error_envelope(
+                "not_found", "The requested resource was not found.", None, request_id
+            ),
             status=404,
         )
 
     if isinstance(exc, PolicyValidationError):
         return Response(
-            _envelope(
+            build_error_envelope(
                 "validation_error",
                 "The request failed validation.",
                 {"field": exc.field, "issue": exc.issue},
@@ -112,5 +146,5 @@ def kairos_exception_handler(exc: Exception, context: dict[str, Any]) -> Respons
 
     code, message = _map_drf_exception(exc)
     details = default_response.data if isinstance(exc, drf_exceptions.ValidationError) else None
-    default_response.data = _envelope(code, message, details, request_id)
+    default_response.data = build_error_envelope(code, message, details, request_id)
     return default_response

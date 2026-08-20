@@ -49,11 +49,13 @@ was verified against a real PostgreSQL 16 instance (Phase 1 spike; see
 [`docs/spikes/S1-postgres-verification.md`](docs/spikes/S1-postgres-verification.md)); the
 Django project and core schema exist (Phase 2): `app_user`, `resource`, `resource_admin`,
 and `booking`, with the `no_overlapping_bookings` `EXCLUDE` constraint enforced at the
-database level. `POST /api/v1/bookings` is live (Phase 4) — the first user-reachable
-surface, with policy validation, correct SQLSTATE-to-HTTP translation on every write-path
-outcome, and structured logging. No idempotency yet (Phase 5), no read/edit/cancel
-endpoints (Phase 6–7), and auth is a dev-only stub (Phase 9 does the real thing). See
-[`CLAUDE.md`](CLAUDE.md) for exactly what is and isn't built, and
+database level. `POST /api/v1/bookings` is live (Phase 4) with policy validation, correct
+SQLSTATE-to-HTTP translation on every write-path outcome, and structured logging — and
+retry-safe (Phase 5): every write carries an idempotency key, claimed in the same
+transaction as the booking itself, so a network retry can never tell a user their own
+successful booking is unavailable. No read/edit/cancel endpoints yet (Phase 6–7), and auth
+is a dev-only stub (Phase 9 does the real thing). See [`CLAUDE.md`](CLAUDE.md) for exactly
+what is and isn't built, and
 [`docs/06-implementation-plan.md`](docs/06-implementation-plan.md) for the full 31-phase
 build plan.
 
@@ -137,8 +139,14 @@ print(user.id, resource.id)
 curl -i -X POST http://127.0.0.1:8000/api/v1/bookings \
   -H "Content-Type: application/json" \
   -H "X-Dev-User-Id: <user-id-from-above>" \
+  -H "Idempotency-Key: $(python -c 'import uuid; print(uuid.uuid4())')" \
   -d '{"resource_id": "<resource-id-from-above>", "start": "2026-09-01T13:00:00Z", "end": "2026-09-01T14:00:00Z"}'
 ```
+
+`Idempotency-Key` is required (missing it is 400) — generate a fresh UUID per user action
+and reuse it across retries of that SAME action, never a new one per HTTP attempt. Replay
+the exact same request (same key, same body) and you'll get the original booking back with
+an `Idempotent-Replay: true` header, not a 409.
 
 No frontend yet — see Status above and [`CLAUDE.md`](CLAUDE.md).
 
@@ -176,7 +184,7 @@ pytest
 | Core exclusion-constraint guarantee | **Proven under concurrency — Milestone 1** (Phase 1–3) |
 | Booking creation | **Live** — `POST /api/v1/bookings` (Phase 4) |
 | Booking edit / cancel | Not started (Phase 7) |
-| Idempotent writes | Not started (Phase 5) |
+| Idempotent writes | **Live** — required `Idempotency-Key` on booking creation (Phase 5) |
 | Audit trail | Not started (Phase 8) |
 | Auth & scoped authorization | Not started (Phase 9) |
 | DST-correct recurring bookings | Not started (Phase 10–13) |

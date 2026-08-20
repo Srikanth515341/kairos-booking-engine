@@ -25,9 +25,9 @@ import pytest
 from django.db import OperationalError, connection, transaction
 from django.utils import timezone
 
-from kairos.bookings import services
 from kairos.bookings.models import Booking
 from kairos.bookings.services import BookingCreateRequest, create_booking
+from kairos.core import db as core_db
 from kairos.core.exceptions import ServiceUnavailableError, SlotUnavailableError
 from kairos.identity.models import AppUser
 from kairos.resources.models import Resource
@@ -40,7 +40,7 @@ def test_write_path_session_settings_applied() -> None:
     transaction.'"""
     with transaction.atomic():
         with connection.cursor() as cursor:
-            services.apply_write_path_session_settings(
+            core_db.apply_write_path_session_settings(
                 cursor, actor_id=str(uuid.uuid4()), request_id="req-session-settings"
             )
             cursor.execute("SHOW lock_timeout")
@@ -109,7 +109,7 @@ def test_lock_timeout_maps_to_service_unavailable(monkeypatch: pytest.MonkeyPatc
     on an independent connection — create_booking()'s own insert has to
     wait, and with lock_timeout forced very short, it times out for real.
     """
-    monkeypatch.setattr(services, "WRITE_PATH_LOCK_TIMEOUT", "200ms")
+    monkeypatch.setattr(core_db, "WRITE_PATH_LOCK_TIMEOUT", "200ms")
 
     owner = AppUser.objects.create(email="lock-timeout@example.com", display_name="Owner")
     resource = Resource.objects.create(
