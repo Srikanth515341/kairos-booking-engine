@@ -1,0 +1,20 @@
+name: CI
+
+# Placeholder pipeline. Real jobs (lint, test, concurrency) are added in
+# Phase 3 — see docs/06-implementation-plan.md. This file exists from
+# Phase 0 so that every PR from Phase 1 onward has a status check attached
+# to it from the very first one.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  placeholder:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Placeholder — real jobs land in Phase 3
+        run: echo "CI skeleton only. lint / test / concurrency jobs are added in Phase 3."
