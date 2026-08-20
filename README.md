@@ -76,8 +76,17 @@ foundation is in place too (Phase 10): every timestamp is `timestamptz`/UTC end 
 single `local_to_instant` conversion utility takes the occurrence's own date as authoritative
 so a booking created under one DST regime for an occurrence in another can never pick up the
 wrong offset, a fixed UTC offset submitted as a timezone is rejected outright, and the pinned
-`tzdata` version is logged on every startup and asserted in CI — the DST-correctness
-groundwork Phase 11's recurrence engine builds directly on. See
+`tzdata` version is logged on every startup and asserted in CI. Recurring series can now be
+expanded correctly across a DST boundary too (Phase 11): each occurrence is computed in local
+wall-clock time first and converted to UTC using the rules in effect on its *own* date, never
+by adding a fixed weekly duration to the previous occurrence's UTC instant — the naive
+approach that silently drifts by an hour after every DST transition. A nonexistent local time
+(a spring-forward gap) is detected and shifted forward with the adjustment disclosed; an
+ambiguous one (a fall-back overlap) resolves to the first, pre-transition instant. Verified
+against Europe/Paris, America/New_York, and Australia/Sydney (whose DST runs in the opposite
+calendar direction, catching sign errors the northern-hemisphere zones can't) and a zone with
+no DST at all. No API surface yet — this is the engine only; Phase 12 wires it up to real
+endpoints. See
 [`CLAUDE.md`](CLAUDE.md) for exactly what is and isn't built, and
 [`docs/06-implementation-plan.md`](docs/06-implementation-plan.md) for the full 31-phase
 build plan.
@@ -268,7 +277,8 @@ pytest
 | Audit trail | **Live** — trigger-based, append-only by database grant, `GET /bookings/{id}/history` (Phase 8) |
 | Auth & scoped authorization | **Live** — real OIDC session tokens, four roles, scoped resource admin, restricted resources (Phase 9) |
 | Timezone foundation | **Live** — UTC-only API, IANA validation, DST-safe conversion + detection utilities (Phase 10) |
-| DST-correct recurring bookings | Not started (Phase 11–13) |
+| Recurrence expansion engine | **Live** — DST-safe, per-occurrence, no API surface yet (Phase 11) |
+| Recurring bookings (API, re-materialization) | Not started (Phase 12–13) |
 | Enforceable waitlist | Not started (Phase 14–17) |
 | Notifications | Not started (Phase 18) |
 | Admin & offboarding | Not started (Phase 19) |

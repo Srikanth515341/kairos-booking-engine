@@ -28,3 +28,9 @@ IDEMPOTENCY_RETENTION_HOURS = int(os.environ.get("IDEMPOTENCY_RETENTION_HOURS", 
 # recurrence expansion are the most likely source of the first production
 # latency incident (RFC v1.0 §6.3).
 MAX_AVAILABILITY_QUERY_DAYS = int(os.environ.get("MAX_AVAILABILITY_QUERY_DAYS", "92"))
+
+# Recurring series bound (PRD FR14a). Unbounded expansion writes thousands
+# of rows in one transaction while holding locks across an entire resource
+# (RFC v1.0 §15b's cost of the materialized-rows design) — this is the
+# structural ceiling on that, checked before expansion ever runs.
+MAX_SERIES_OCCURRENCES = int(os.environ.get("MAX_SERIES_OCCURRENCES", "100"))
