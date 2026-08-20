@@ -91,5 +91,5 @@ jobs:
           python-version: "3.12"
       - name: Install dependencies
         run: pip install -e ".[dev]"
-      - name: Run the concurrency proof suite (CONC-01, CONC-02, CONC-05)
+      - name: Run the concurrency proof suite (CONC-01 through CONC-05)
         run: pytest tests/concurrency -v

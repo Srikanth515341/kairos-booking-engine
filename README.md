@@ -56,8 +56,12 @@ transaction as the booking itself, so a network retry can never tell a user thei
 successful booking is unavailable. The read path is live too (Phase 6): booking detail/list
 with cursor pagination, and resource availability with field-level authorization —
 `booking_id`/`owner` are omitted entirely, not nulled, unless you own the booking or
-administer the resource. No edit/cancel yet (Phase 7), and auth is a dev-only stub (Phase 9
-does the real thing). See [`CLAUDE.md`](CLAUDE.md) for exactly what is and isn't built, and
+administer the resource. Bookings can now be edited and cancelled (Phase 7):
+`PATCH /api/v1/bookings/{id}` is evaluated against the exclusion constraint exactly like a
+create, and `POST /api/v1/bookings/{id}/cancel` supports an owner self-cancel or a
+resource-admin override with a required reason — cancelling an already-cancelled booking is a
+200 no-op, not an error. Auth is still a dev-only stub (Phase 9 does the real thing). See
+[`CLAUDE.md`](CLAUDE.md) for exactly what is and isn't built, and
 [`docs/06-implementation-plan.md`](docs/06-implementation-plan.md) for the full 31-phase
 build plan.
 
@@ -159,6 +163,22 @@ curl -s "http://127.0.0.1:8000/api/v1/resources/<resource-id-from-above>/availab
   -H "X-Dev-User-Id: <user-id-from-above>" | python -m json.tool
 ```
 
+Edit or cancel it (`Idempotency-Key` is required on both, same as creation):
+
+```bash
+curl -i -X PATCH http://127.0.0.1:8000/api/v1/bookings/<booking-id-from-above> \
+  -H "Content-Type: application/json" \
+  -H "X-Dev-User-Id: <user-id-from-above>" \
+  -H "Idempotency-Key: $(python -c 'import uuid; print(uuid.uuid4())')" \
+  -d '{"start": "2026-09-01T15:00:00Z", "end": "2026-09-01T16:00:00Z"}'
+
+curl -i -X POST http://127.0.0.1:8000/api/v1/bookings/<booking-id-from-above>/cancel \
+  -H "Content-Type: application/json" \
+  -H "X-Dev-User-Id: <user-id-from-above>" \
+  -H "Idempotency-Key: $(python -c 'import uuid; print(uuid.uuid4())')" \
+  -d '{}'
+```
+
 No frontend yet — see Status above and [`CLAUDE.md`](CLAUDE.md).
 
 ## Running the test suite
@@ -194,8 +214,8 @@ pytest
 |---|---|
 | Core exclusion-constraint guarantee | **Proven under concurrency — Milestone 1** (Phase 1–3) |
 | Booking creation | **Live** — `POST /api/v1/bookings` (Phase 4) |
-| Booking edit / cancel | Not started (Phase 7) |
-| Idempotent writes | **Live** — required `Idempotency-Key` on booking creation (Phase 5) |
+| Booking edit / cancel | **Live** — `PATCH`/`POST .../cancel`, CONC-03/04 proven under concurrency (Phase 7) |
+| Idempotent writes | **Live** — required `Idempotency-Key` on every mutation (Phase 5, 7) |
 | Booking detail / list, resource list / detail / availability | **Live** — cursor pagination, field-level authorization (Phase 6) |
 | Audit trail | Not started (Phase 8) |
 | Auth & scoped authorization | Not started (Phase 9) |

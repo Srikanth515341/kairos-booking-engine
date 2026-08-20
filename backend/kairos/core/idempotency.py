@@ -24,9 +24,10 @@ from dataclasses import dataclass
 from typing import Any
 from uuid import UUID
 
-from django.db import DatabaseError, transaction
+from django.db import DatabaseError, connection, transaction
 from django.utils import timezone
 
+from kairos.core.db import apply_write_path_session_settings
 from kairos.core.drf import build_error_envelope
 from kairos.core.exceptions import (
     IdempotencyKeyConflictError,
@@ -99,6 +100,20 @@ def run_idempotent_write(
 
     try:
         with transaction.atomic():
+            # Applied HERE, before the key-claim INSERT below — that
+            # INSERT is the actual first statement of the outer
+            # transaction (Spec v1.0 §4.1's literal ordering). Each write
+            # function (create_booking/edit_booking/cancel_booking) also
+            # calls this inside its own NESTED atomic, which only runs
+            # after this key-claim insert has already committed to its
+            # savepoint — too late to matter for the claim itself. Without
+            # this call, a concurrent replay's key-claim insert blocks
+            # under Postgres's untimed defaults instead of failing fast at
+            # the intended 3s lock_timeout budget.
+            with connection.cursor() as cursor:
+                apply_write_path_session_settings(
+                    cursor, actor_id=str(user.id), request_id=request_id or ""
+                )
             IdempotencyKey.objects.create(
                 user=user,
                 key=key,
