@@ -26,26 +26,39 @@ any phase.
 
 ## Current Architecture State
 
-No application code yet. `infra/docker-compose.yml` runs PostgreSQL 16 with `btree_gist`
-enabled and `max_connections=600` (spike/test setting — see the file's comment). Everything
-else in `scripts/spike/` is throwaway spike code (RFC §16) that produced
-`docs/spikes/S1-postgres-verification.md` and does not become the application.
+`infra/docker-compose.yml` runs PostgreSQL 16 with `btree_gist` enabled and
+`max_connections=600` (spike/test setting — see the file's comment); it also provisions a
+`kairos_test` database via `infra/init-test-db.sql`. `scripts/spike/` is throwaway spike code
+(RFC §16) that produced `docs/spikes/S1-postgres-verification.md` and does not become the
+application.
 
-Planned structure (populated phase by phase, per RFC §4.1):
+A Django project now exists under `backend/kairos/`, structured per RFC §4.1:
 
 ```
 kairos-booking-engine/
 ├── .github/workflows/    # CI (skeleton now, real jobs from Phase 3)
 ├── docs/                 # the six source documents + spike reports, checklists
 ├── backend/
-│   ├── kairos/           # Django project — empty until Phase 2
-│   ├── tests/
-│   └── migrations/
+│   ├── kairos/
+│   │   ├── settings/      # base.py, dev.py, test.py, prod.py
+│   │   ├── core/           # reserved for shared constants/exceptions/db helpers — empty
+│   │   │                   # until a phase (Phase 4+) actually needs them
+│   │   ├── identity/       # app_user, resource_admin
+│   │   ├── resources/      # resource
+│   │   ├── bookings/       # booking — the table the correctness guarantee lives on
+│   │   ├── urls.py, wsgi.py
+│   ├── tests/              # test_booking_exclusion_smoke.py
+│   ├── manage.py
+│   └── pyproject.toml      # ruff, mypy strict, pytest config
 ├── frontend/              # React + TypeScript — empty until Phase 23
-├── infra/                 # docker-compose.yml — exists (Postgres only; Redis added Phase 13)
+├── infra/                 # docker-compose.yml, init-test-db.sql
 └── scripts/
     └── spike/             # throwaway S1 spike scripts — will NOT be extended after Phase 1
 ```
+
+No API, no service layer, no views, no serializers, no auth — those start Phase 4 (auth is
+Phase 9). `backend/.venv/` is local and gitignored; recreate with
+`python -m venv .venv && pip install -e ".[dev]"` from `backend/`.
 
 ## Completed Phases
 
@@ -53,19 +66,25 @@ kairos-booking-engine/
 |---|---|---|---|
 | 0 | Repository & Process Foundation | Scaffolding, six docs committed, CLAUDE.md/README.md initialized, CI skeleton | Pending (direct-to-main commit) |
 | 1 | Spike S1 — Postgres Verification | All of RFC §16 S1.1–S1.7 verified against real PostgreSQL 16; gate PASSED; Candidate A confirmed. One liveness finding carried forward (see below) | Pending (on branch `phase-01-spike-postgres-verification`) |
+| 2 | Core Schema & The Exclusion Constraint | Django project scaffolded (Django 6.1); `app_user`, `resource`, `resource_admin`, `booking` created via migrations; `no_overlapping_bookings` EXCLUDE constraint added via raw SQL with the Spec §3 comment block reproduced verbatim; smoke test confirms SQLSTATE 23P01 on sequential overlap; ruff + mypy strict pass with zero findings | Pending (on branch `phase-02-core-schema-exclusion-constraint`) |
 
 ## Current Phase In Progress
 
-None. Phase 1 is complete pending review and merge. Phase 2 (Core Schema & The Exclusion
-Constraint) is next.
+None. Phase 2 is complete pending review and merge. Phase 3 (Concurrency Proof & CI
+Pipeline — Milestone 1) is next.
 
 ## NOT Yet Built
 
-No Django project, no application-level database schema (only the throwaway spike table
-`spike_booking` exists, in the dev database, created/dropped repeatedly by
-`scripts/spike/common.py`), no API, no frontend, no CI jobs beyond a placeholder, no tests
-beyond the spike scripts. Do not assume any of these exist in a fresh session — verify
-against this file and `git log` first.
+No API, no service layer, no views/serializers, no real authentication (Phase 9), no
+Celery/Redis, no frontend, no CI jobs beyond a placeholder, no concurrency proof (Phase 3),
+no `recurring_series`/`waitlist_entry`/`waitlist_offer`/`idempotency_key`/`audit_log`/
+`system_check_run` tables (each arrives with the phase that needs it — see the Key Technical
+Decisions and Phase Index in `docs/06-implementation-plan.md`). `booking.series_id` does not
+exist yet — it cannot, since `recurring_series` (Phase 11) doesn't exist; it is added in
+Phase 11, not retrofitted early. The throwaway spike table `spike_booking` may still exist in
+`kairos_dev`, created/dropped repeatedly by `scripts/spike/common.py` — unrelated to the real
+schema. Do not assume any of the above exist in a fresh session — verify against this file
+and `git log` first.
 
 ## Key Technical Decisions (with source references)
 
@@ -82,25 +101,40 @@ against this file and `git log` first.
 | Waitlist eligibility is containment (`@>`), not overlap (`&&`) | The freed range must fully contain the entry's requested range — the strictest defensible rule, chosen because "next eligible user" admitted two readings in an earlier draft | PRD v1.0 FR21 |
 | Spike S1 gate: PASSED. Candidate A (exclusion constraint) confirmed on real PostgreSQL 16 | `btree_gist` available; predicate accepted; blocking-not-fail-fast confirmed; `now()` in a predicate correctly rejected (42P17), confirming Phase 17's dual-reclamation design is necessary; cleanup-on-write showed zero deadlocks across 10,000 attempts | `docs/spikes/S1-postgres-verification.md` |
 | `BookingService` (Phase 4) must treat SQLSTATE `40P01` (deadlock) the same as `55P03` (lock timeout) — 503 + retry, never a bare failure | Spike S1.2: at N=200 truly-simultaneous identical-slot contention (the extreme worst case), 2/10 runs produced deadlock cascades where the constraint's lack of fixed lock ordering (unlike a btree unique index) let a circular wait form. Safety held 10/10 (never more than one success) — only liveness was at risk, and it's retryable | `docs/spikes/S1-postgres-verification.md` §S1.2 Consequences |
+| The EXCLUDE constraint is added via a raw-SQL migration (`RunSQL`), not Django's `ExclusionConstraint` ORM class | The Spec §3 comment block — the primary mitigation against RUNBOOK-01 cause #1 (someone narrowing the predicate during an unrelated migration) — needs to be reproduced verbatim at the point of definition; a raw SQL migration is where that text actually lives, byte for byte | Implementation Plan Phase 2 scope; RFC v1.0 §3.4 |
+| `resource_admin`'s composite PK `(resource_id, user_id)` from Spec §3 is modeled as a surrogate `id` + `UniqueConstraint` in Django | Django's ORM ergonomics around composite primary keys are still immature; the surrogate key still enforces the identical one-grant-per-pair guarantee at the DB level — a Django-ergonomics deviation, not a correctness one | `kairos/identity/models.py` (`ResourceAdmin`) |
+| Django's built-in `auth`/`contenttypes` apps are deliberately excluded from `INSTALLED_APPS` | Authentication is delegated to SSO/OIDC (RFC v1.0 §4, Phase 9) — Django's `User`/`Permission` machinery has no role here and would add unused tables that don't correspond to anything in Spec §3 | `kairos/settings/base.py` |
 
 ## Running Locally
-
-Postgres only, for now:
 
 ```bash
 cd infra
 docker compose up -d
 docker exec kairos_postgres psql -U kairos -d kairos_dev -c "SELECT 1;"
+
+cd ../backend
+python -m venv .venv
+.venv/Scripts/activate      # Windows; `source .venv/bin/activate` on macOS/Linux
+pip install -e ".[dev]"
+python manage.py migrate    # DATABASE_URL defaults to the docker-compose credentials above
 ```
 
-Django app setup starts Phase 2; the frontend starts Phase 23.
+The frontend starts Phase 23.
 
 ## Running Tests
 
-Not yet applicable to the application (no app exists). The spike scripts under
-`scripts/spike/` are runnable but are diagnostic, not a test suite — see
+```bash
+cd backend
+pytest
+```
+
+Currently one smoke test (`tests/test_booking_exclusion_smoke.py`): a sequential overlapping
+insert against `booking` must raise SQLSTATE `23P01`. This is **not** the concurrency proof —
+that's Phase 3's 200-way barrier-released stress test, the project's central proof, not yet
+built. Also runnable: `cd backend && ruff check . && ruff format --check . && mypy kairos`
+(all pass with zero findings as of Phase 2). The spike scripts under `scripts/spike/` are
+runnable but are diagnostic, not a test suite — see
 `docs/spikes/S1-postgres-verification.md` for what each one does and its recorded output.
-The real concurrency test suite (the project's central proof) is introduced in Phase 3.
 
 ## Open Questions
 
