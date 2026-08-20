@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from django.core.serializers.json import DjangoJSONEncoder
 from django.db import models
+from django.db.models.functions import Now
 
 from kairos.identity.models import AppUser
 
@@ -73,3 +74,80 @@ class IdempotencyKey(models.Model):
 
     def __str__(self) -> str:
         return f"{self.user_id}:{self.key} ({self.status})"
+
+
+class AuditActorType(models.TextChoices):
+    # A write arriving with no actor set is a bug, not a valid state — the
+    # trigger records it as UNKNOWN rather than failing the write (RFC
+    # v1.0 §12), and the reconciliation job (Phase 21) alerts on any such
+    # row. It is a value this system defends AGAINST, not a normal choice
+    # application code ever passes deliberately.
+    USER = "user", "User"
+    ADMIN = "admin", "Admin"
+    SYSTEM = "system", "System"
+    UNKNOWN = "unknown", "Unknown"
+
+
+class AuditLog(models.Model):
+    """Written EXCLUSIVELY by the `write_audit_log()` trigger (Spec v1.0
+    §3; RFC v1.0 §12) — never by application code. That is the entire
+    argument for a trigger over an application-level audit call: a future
+    bulk-import script bypassing the service layer entirely still produces
+    a row here, because the trigger fires on the table write itself, not
+    on any particular code path calling it (AUD-02).
+
+    No foreign keys to `app_user`/`booking`/etc — deliberate, matching
+    Spec v1.0 §3's DDL exactly. `entity_id` is polymorphic (booking,
+    resource, resource_admin, and later waitlist_entry/waitlist_offer all
+    share this one table), so no single FK target exists; `actor_id` has
+    no FK either, since a `RESTRICT`-on-delete FK to `app_user` would let
+    a booking's own audit history block that user's eventual offboarding
+    (Phase 19) — the audit trail must survive independently of whether the
+    referenced principal still exists.
+    """
+
+    ActorType = AuditActorType
+
+    id = models.BigAutoField(primary_key=True)
+    entity_type = models.TextField()  # TG_TABLE_NAME — 'booking' | 'resource' | 'resource_admin'
+    entity_id = models.UUIDField()
+    action = models.TextField()  # 'insert' | 'update' | 'delete'
+    actor_id = models.UUIDField(null=True, blank=True)
+    actor_type = models.TextField(choices=AuditActorType.choices, default=AuditActorType.UNKNOWN)
+    # REQUIRED for administrative overrides (PRD FR40) — enforced at the API
+    # layer (BookingCancelSerializer), not by a DB-level NOT NULL here: a
+    # self-cancel or a create/edit legitimately has no reason at all.
+    reason = models.TextField(null=True, blank=True)  # noqa: DJ001
+    request_id = models.TextField(null=True, blank=True)  # noqa: DJ001
+    before_state = models.JSONField(null=True, blank=True)
+    after_state = models.JSONField(null=True, blank=True)
+    # `db_default`, NOT `auto_now_add` — `auto_now_add` is Python-side only
+    # (Django sets the value before INSERT), so it does nothing for a row
+    # the ORM never writes. Every audit_log row is written by the
+    # write_audit_log() trigger via raw SQL that never mentions
+    # `occurred_at` at all (matching Spec v1.0 §3's trigger body exactly),
+    # relying entirely on a genuine column-level `DEFAULT now()` — which is
+    # exactly what `db_default` creates and `auto_now_add` does not.
+    # Caught empirically: a raw SQL insert into `resource` failed with
+    # "null value in column occurred_at violates not-null constraint"
+    # until this was fixed.
+    occurred_at = models.DateTimeField(db_default=Now())
+
+    class Meta:
+        db_table = "audit_log"
+        constraints = [
+            models.CheckConstraint(
+                condition=models.Q(actor_type__in=list(AuditActorType.values)),
+                name="audit_log_actor_type_check",
+            ),
+        ]
+        indexes = [
+            models.Index(
+                fields=["entity_type", "entity_id", "-occurred_at"], name="idx_audit_entity"
+            ),
+            models.Index(fields=["actor_id", "-occurred_at"], name="idx_audit_actor"),
+            models.Index(fields=["request_id"], name="idx_audit_request"),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.entity_type}:{self.entity_id} {self.action} @ {self.occurred_at}"

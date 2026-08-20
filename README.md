@@ -60,7 +60,13 @@ administer the resource. Bookings can now be edited and cancelled (Phase 7):
 `PATCH /api/v1/bookings/{id}` is evaluated against the exclusion constraint exactly like a
 create, and `POST /api/v1/bookings/{id}/cancel` supports an owner self-cancel or a
 resource-admin override with a required reason — cancelling an already-cancelled booking is a
-200 no-op, not an error. Auth is still a dev-only stub (Phase 9 does the real thing). See
+200 no-op, not an error. Every state transition is now audited too (Phase 8): a database
+trigger — not application code — writes an immutable record on every insert/update/delete to
+`booking`/`resource`/`resource_admin`, so even a raw SQL write that bypasses the API entirely
+still gets recorded, and the running application connects as a least-privilege database role
+that can `INSERT`/`SELECT` its own audit log but structurally cannot `UPDATE` or `DELETE` it —
+enforced by Postgres grants, not a promise in application code. `GET /bookings/{id}/history`
+surfaces the full trail. Auth is still a dev-only stub (Phase 9 does the real thing). See
 [`CLAUDE.md`](CLAUDE.md) for exactly what is and isn't built, and
 [`docs/06-implementation-plan.md`](docs/06-implementation-plan.md) for the full 31-phase
 build plan.
@@ -124,8 +130,13 @@ cd backend
 python -m venv .venv
 .venv/Scripts/activate      # Windows; `source .venv/bin/activate` on macOS/Linux
 pip install -e ".[dev]"
-python manage.py migrate    # DATABASE_URL defaults to the docker-compose credentials above
-python manage.py runserver
+
+# Migrations need DDL privileges the app's own least-privilege kairos_app
+# role deliberately doesn't have (Phase 8) — override DATABASE_URL to the
+# superuser DSN for this ONE command:
+DATABASE_URL=postgresql://kairos:kairos@localhost:5432/kairos_dev python manage.py migrate
+
+python manage.py runserver  # now connects as kairos_app by default
 ```
 
 **Try it** — auth is a dev-only stub (`X-Dev-User-Id`, Phase 9 replaces it with real
@@ -179,6 +190,15 @@ curl -i -X POST http://127.0.0.1:8000/api/v1/bookings/<booking-id-from-above>/ca
   -d '{}'
 ```
 
+See who did what and why — every insert/update/delete above was recorded by a database
+trigger, not application code, so this reflects the truth even for a write that skipped the
+API entirely:
+
+```bash
+curl -s http://127.0.0.1:8000/api/v1/bookings/<booking-id-from-above>/history \
+  -H "X-Dev-User-Id: <user-id-from-above>" | python -m json.tool
+```
+
 No frontend yet — see Status above and [`CLAUDE.md`](CLAUDE.md).
 
 ## Running the test suite
@@ -217,7 +237,7 @@ pytest
 | Booking edit / cancel | **Live** — `PATCH`/`POST .../cancel`, CONC-03/04 proven under concurrency (Phase 7) |
 | Idempotent writes | **Live** — required `Idempotency-Key` on every mutation (Phase 5, 7) |
 | Booking detail / list, resource list / detail / availability | **Live** — cursor pagination, field-level authorization (Phase 6) |
-| Audit trail | Not started (Phase 8) |
+| Audit trail | **Live** — trigger-based, append-only by database grant, `GET /bookings/{id}/history` (Phase 8) |
 | Auth & scoped authorization | Not started (Phase 9) |
 | DST-correct recurring bookings | Not started (Phase 10–13) |
 | Enforceable waitlist | Not started (Phase 14–17) |

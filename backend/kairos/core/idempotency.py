@@ -80,6 +80,8 @@ def run_idempotent_write(
     endpoint: str,
     body: dict[str, Any],
     request_id: str | None,
+    actor_type: str,
+    reason: str | None = None,
     perform_write: Callable[[], tuple[int, dict[str, Any]]],
 ) -> IdempotentWriteResult:
     """Claims `key`, runs `perform_write` in the same transaction, and
@@ -95,6 +97,16 @@ def run_idempotent_write(
     there is nothing left to update. A 503 is different: the outcome is
     unknown, not decided (Spec v1.0 §5.1), so nothing is recorded — the
     retry, finding no key at all, starts completely fresh.
+
+    `actor_type`/`reason` (Phase 8, RFC v1.0 §12) are the caller's to
+    supply, exactly like `user`/`request_id` already are: this function is
+    generic infrastructure with no idea whether the write behind it is a
+    self-service create/edit or an administrative override, so it cannot
+    derive them itself. The `idempotency_key` table has no audit trigger,
+    so what's applied here has no observable effect on ITS row — but
+    `perform_write`'s own nested call to the same helper overwrites these
+    values with the specific ones for the table it actually audits, before
+    that write's trigger ever fires.
     """
     fingerprint = compute_request_fingerprint(body)
 
@@ -112,7 +124,11 @@ def run_idempotent_write(
             # the intended 3s lock_timeout budget.
             with connection.cursor() as cursor:
                 apply_write_path_session_settings(
-                    cursor, actor_id=str(user.id), request_id=request_id or ""
+                    cursor,
+                    actor_id=str(user.id),
+                    actor_type=actor_type,
+                    request_id=request_id or "",
+                    reason=reason,
                 )
             IdempotencyKey.objects.create(
                 user=user,

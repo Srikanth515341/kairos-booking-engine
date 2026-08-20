@@ -88,14 +88,19 @@ def test_in_progress_row_is_writable_with_null_response_columns(
 
 # --------------------------------------------------------------------
 # Regression: session settings on the key-claim INSERT itself (RFC v1.0
-# §11.2/§7.1) — Phase 5's report claimed this was "moved into a shared
-# core/db.py helper applied once at the top of the outer transaction," but
-# run_idempotent_write never actually called it; only each write function's
-# own NESTED transaction did, which runs strictly after the key-claim
-# INSERT has already executed. A concurrent replay's key-claim insert would
-# then block under Postgres's untimed defaults instead of failing fast at
-# the intended 3s lock_timeout. Fixed in Phase 7 alongside the two new
-# write paths that go through this exact function.
+# §11.2/§7.1, §12) — Phase 5's report claimed the timeout settings were
+# "moved into a shared core/db.py helper applied once at the top of the
+# outer transaction," but run_idempotent_write never actually called it;
+# only each write function's own NESTED transaction did, which runs
+# strictly after the key-claim INSERT has already executed. A concurrent
+# replay's key-claim insert would then block under Postgres's untimed
+# defaults instead of failing fast at the intended 3s lock_timeout. Fixed
+# in Phase 7 alongside the two new write paths that go through this exact
+# function. Phase 8 adds a SECOND category of session variable through
+# the identical mechanism/call site — app.actor_type/app.reason, read by
+# write_audit_log() (Spec v1.0 §3) exactly the way Postgres itself reads
+# lock_timeout — and this same test is extended, not duplicated, to prove
+# both categories together rather than trusting the second one by analogy.
 # --------------------------------------------------------------------
 
 
@@ -105,12 +110,15 @@ def test_session_settings_are_active_at_the_key_claim_insert_itself(
 ) -> None:
     """Spies on the exact call `run_idempotent_write` uses for the
     key-claim INSERT (`IdempotencyKey.objects.create`) and reads
-    `SHOW lock_timeout`/`SHOW statement_timeout` on the SAME connection
-    immediately before letting the real INSERT proceed — proving the
-    settings are active at that precise statement, not merely "somewhere"
-    later in the transaction (which a naive assertion after the fact
-    couldn't distinguish, since `set_config(..., true)` is scoped to the
-    transaction and unreadable once it commits).
+    `SHOW lock_timeout`/`SHOW statement_timeout` PLUS
+    `current_setting('app.actor_type')`/`current_setting('app.reason')` on
+    the SAME connection immediately before letting the real INSERT
+    proceed — proving BOTH categories of session variable (write-path
+    timeouts and audit actor propagation) are active at that precise
+    statement, not merely "somewhere" later in the transaction (which a
+    naive assertion after the fact couldn't distinguish, since
+    `set_config(..., true)` is scoped to the transaction and unreadable
+    once it commits).
     """
     observed: dict[str, str] = {}
     original_create = IdempotencyKey.objects.create
@@ -121,6 +129,10 @@ def test_session_settings_are_active_at_the_key_claim_insert_itself(
             observed["lock_timeout"] = cur.fetchone()[0]  # type: ignore[index]
             cur.execute("SHOW statement_timeout")
             observed["statement_timeout"] = cur.fetchone()[0]  # type: ignore[index]
+            cur.execute("SELECT current_setting('app.actor_type', true)")
+            observed["actor_type"] = cur.fetchone()[0]  # type: ignore[index]
+            cur.execute("SELECT current_setting('app.reason', true)")
+            observed["reason"] = cur.fetchone()[0]  # type: ignore[index]
         return original_create(*args, **kwargs)  # type: ignore[no-any-return]
 
     monkeypatch.setattr(IdempotencyKey.objects, "create", _spy_create)
@@ -131,12 +143,16 @@ def test_session_settings_are_active_at_the_key_claim_insert_itself(
         endpoint="TEST /session-settings-probe",
         body={},
         request_id="req-session-settings-probe",
+        actor_type="admin",
+        reason="testing session-variable propagation",
         perform_write=lambda: (200, {"ok": True}),
     )
 
     assert result.response_status == 200
     assert observed["lock_timeout"] == "3s"
     assert observed["statement_timeout"] == "10s"
+    assert observed["actor_type"] == "admin"
+    assert observed["reason"] == "testing session-variable propagation"
 
 
 # --------------------------------------------------------------------

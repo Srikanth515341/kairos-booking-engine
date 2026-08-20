@@ -82,8 +82,19 @@ class ResourceAdmin(models.Model):
     as a surrogate key plus a uniqueness constraint, so this uses a surrogate
     `id` with `resource_admin_unique_grant` enforcing the same one-grant-per-
     pair guarantee — a Django-ergonomics deviation, not a correctness one.
+
+    `id` is an explicit UUIDField, not Django's implicit BigAutoField
+    default, matching every other entity table this schema's `audit_log`
+    trigger fires on (app_user/resource/booking all declare the identical
+    pattern). Phase 8's `write_audit_log()` trigger does
+    `COALESCE(NEW.id, OLD.id)` into `entity_id UUID` — an implicit bigint
+    surrogate key here would fail that INSERT with a type mismatch the
+    moment a `resource_admin` row was written, caught empirically via
+    `ResourceAdmin.objects.create()` in the test suite once the audit
+    trigger was attached to this table.
     """
 
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     resource = models.ForeignKey(
         "resources.Resource",
         on_delete=models.CASCADE,
