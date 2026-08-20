@@ -4,7 +4,7 @@ import uuid
 
 from django.db import models
 
-from kairos.identity.models import AppUser
+from kairos.identity.models import AppUser, UserGroup
 
 
 class ResourceOffboardingPolicy(models.TextChoices):
@@ -40,6 +40,20 @@ class Resource(models.Model):
     status = models.TextField(choices=ResourceStatus.choices, default=ResourceStatus.ACTIVE)
     created_by = models.ForeignKey(AppUser, on_delete=models.RESTRICT, db_column="created_by")
     created_at = models.DateTimeField(auto_now_add=True)
+    # PRD FR46 — null means open to everyone (every resource before Phase
+    # 9, and every resource that never opts in). Non-members must not be
+    # able to tell the difference between "doesn't exist" and "exists but
+    # restricted" (SEC-06) — enforced in the view layer via
+    # AuthorizationService.can_view_resource, not here; this column only
+    # records the fact of restriction.
+    restricted_group = models.ForeignKey(
+        UserGroup,
+        on_delete=models.RESTRICT,
+        db_column="restricted_group_id",
+        null=True,
+        blank=True,
+        related_name="restricted_resources",
+    )
 
     class Meta:
         db_table = "resource"

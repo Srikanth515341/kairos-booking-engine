@@ -17,6 +17,7 @@ from rest_framework.test import APIClient
 
 from kairos.bookings.models import Booking
 from kairos.identity.models import AppUser, ResourceAdmin
+from kairos.identity.oidc import issue_session_token
 from kairos.resources.models import Resource
 
 BOOKINGS_URL = "/api/v1/bookings"
@@ -31,6 +32,27 @@ def _headers(
 ) -> dict[str, str]:
     headers = {
         "HTTP_X_DEV_USER_ID": str(user.id),
+        "HTTP_IDEMPOTENCY_KEY": str(idempotency_key or uuid.uuid4()),
+    }
+    if request_id is not None:
+        headers["HTTP_X_REQUEST_ID"] = request_id
+    return headers
+
+
+def _bearer_headers(
+    user: AppUser, idempotency_key: uuid.UUID | None = None, request_id: str | None = None
+) -> dict[str, str]:
+    """A REAL minted session token (Phase 9) — see
+    tests/bookings/test_views.py's identical helper for the full
+    rationale. Used on AUD-03(a) specifically: proves the audit trigger
+    correctly attributes `actor_id`/`actor_type` from a REAL authenticated
+    principal end-to-end through the history endpoint, not just at the
+    session-variable level (that's tests/identity/test_authentication.py's
+    spy test) or via the stub.
+    """
+    token, _ = issue_session_token(user.id)
+    headers = {
+        "HTTP_AUTHORIZATION": f"Bearer {token}",
         "HTTP_IDEMPOTENCY_KEY": str(idempotency_key or uuid.uuid4()),
     }
     if request_id is not None:
@@ -73,6 +95,11 @@ def test_history_nonexistent_booking_returns_404(client: APIClient, app_user: Ap
 def test_aud_03a_create_records_actor_type_user_with_matching_request_id(
     client: APIClient, app_user: AppUser, active_resource: Resource
 ) -> None:
+    """Real minted session token (Phase 9) throughout — proves the audit
+    trail correctly attributes a REAL authenticated principal end to end,
+    not just that the session variable was set (that's the separate spy
+    test in tests/identity/test_authentication.py).
+    """
     start = timezone.now() + timedelta(hours=1)
     create_response = client.post(
         BOOKINGS_URL,
@@ -83,13 +110,15 @@ def test_aud_03a_create_records_actor_type_user_with_matching_request_id(
         },
         format="json",
         HTTP_X_REQUEST_ID="req-aud-03a",
-        **_headers(app_user),
+        **_bearer_headers(app_user),
     )
     assert create_response.status_code == 201
     booking_id = create_response.json()["id"]
     assert create_response.headers["X-Request-Id"] == "req-aud-03a"
 
-    history_response = client.get(f"{BOOKINGS_URL}/{booking_id}/history", **_headers(app_user))
+    history_response = client.get(
+        f"{BOOKINGS_URL}/{booking_id}/history", **_bearer_headers(app_user)
+    )
     assert history_response.status_code == 200
     body = history_response.json()
     assert body["booking_id"] == booking_id

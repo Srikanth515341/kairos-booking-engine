@@ -66,7 +66,12 @@ trigger — not application code — writes an immutable record on every insert/
 still gets recorded, and the running application connects as a least-privilege database role
 that can `INSERT`/`SELECT` its own audit log but structurally cannot `UPDATE` or `DELETE` it —
 enforced by Postgres grants, not a promise in application code. `GET /bookings/{id}/history`
-surfaces the full trail. Auth is still a dev-only stub (Phase 9 does the real thing). See
+surfaces the full trail. Authentication is real now too (Phase 9): OIDC-issued tokens
+exchanged for a short-lived session token, validated on every request — no more dev-only
+header stub outside the test suite. Four roles (booker, scoped resource administrator, global
+system administrator, read-only operations) are enforced through one authorization service, an
+admin's authority never extends past the specific resource they're scoped to, and a resource
+can be restricted to a group whose non-members can't even tell it exists. See
 [`CLAUDE.md`](CLAUDE.md) for exactly what is and isn't built, and
 [`docs/06-implementation-plan.md`](docs/06-implementation-plan.md) for the full 31-phase
 build plan.
@@ -139,23 +144,40 @@ DATABASE_URL=postgresql://kairos:kairos@localhost:5432/kairos_dev python manage.
 python manage.py runserver  # now connects as kairos_app by default
 ```
 
-**Try it** — auth is a dev-only stub (`X-Dev-User-Id`, Phase 9 replaces it with real
-OIDC/SSO), so create a user and resource first:
+**Try it** — auth is real now (Phase 9): a session token, obtained via an OIDC login, on
+every request. Locally there's no real identity provider to log in against, so
+`POST /auth/dev-mock-login` mints a token from a fixed local keypair standing in for one —
+exchange it for a session token the same way a real ID token would be:
+
+```bash
+# 1. Mock IdP issues an ID token (dev/test only — never available in prod)
+ID_TOKEN=$(curl -s -X POST http://127.0.0.1:8000/api/v1/auth/dev-mock-login \
+  -H "Content-Type: application/json" \
+  -d '{"email": "you@example.com", "display_name": "You"}' | python -c "import sys,json;print(json.load(sys.stdin)['id_token'])")
+
+# 2. Exchange it for this backend's own short-lived session token — this
+#    step is the SAME one a real OIDC login goes through.
+ACCESS_TOKEN=$(curl -s -X POST http://127.0.0.1:8000/api/v1/auth/token \
+  -H "Content-Type: application/json" \
+  -d "{\"id_token\": \"$ID_TOKEN\"}" | python -c "import sys,json;print(json.load(sys.stdin)['access_token'])")
+```
+
+Logging in auto-provisions your `AppUser` — grab its id for the resource fixture below:
 
 ```bash
 python manage.py shell -c "
 from datetime import time
 from kairos.identity.models import AppUser
 from kairos.resources.models import Resource
-user = AppUser.objects.create(email='you@example.com', display_name='You')
+user = AppUser.objects.get(email='you@example.com')
 resource = Resource.objects.create(name='Room 1', timezone='UTC',
     bookable_start_time=time(0,0), bookable_end_time=time(23,59), created_by=user)
-print(user.id, resource.id)
+print(resource.id)
 "
 
 curl -i -X POST http://127.0.0.1:8000/api/v1/bookings \
   -H "Content-Type: application/json" \
-  -H "X-Dev-User-Id: <user-id-from-above>" \
+  -H "Authorization: Bearer $ACCESS_TOKEN" \
   -H "Idempotency-Key: $(python -c 'import uuid; print(uuid.uuid4())')" \
   -d '{"resource_id": "<resource-id-from-above>", "start": "2026-09-01T13:00:00Z", "end": "2026-09-01T14:00:00Z"}'
 ```
@@ -168,10 +190,10 @@ an `Idempotent-Replay: true` header, not a 409.
 Read it back, list your bookings, and check availability:
 
 ```bash
-curl -s http://127.0.0.1:8000/api/v1/bookings -H "X-Dev-User-Id: <user-id-from-above>" | python -m json.tool
+curl -s http://127.0.0.1:8000/api/v1/bookings -H "Authorization: Bearer $ACCESS_TOKEN" | python -m json.tool
 
 curl -s "http://127.0.0.1:8000/api/v1/resources/<resource-id-from-above>/availability?from=2026-09-01&to=2026-09-08" \
-  -H "X-Dev-User-Id: <user-id-from-above>" | python -m json.tool
+  -H "Authorization: Bearer $ACCESS_TOKEN" | python -m json.tool
 ```
 
 Edit or cancel it (`Idempotency-Key` is required on both, same as creation):
@@ -179,13 +201,13 @@ Edit or cancel it (`Idempotency-Key` is required on both, same as creation):
 ```bash
 curl -i -X PATCH http://127.0.0.1:8000/api/v1/bookings/<booking-id-from-above> \
   -H "Content-Type: application/json" \
-  -H "X-Dev-User-Id: <user-id-from-above>" \
+  -H "Authorization: Bearer $ACCESS_TOKEN" \
   -H "Idempotency-Key: $(python -c 'import uuid; print(uuid.uuid4())')" \
   -d '{"start": "2026-09-01T15:00:00Z", "end": "2026-09-01T16:00:00Z"}'
 
 curl -i -X POST http://127.0.0.1:8000/api/v1/bookings/<booking-id-from-above>/cancel \
   -H "Content-Type: application/json" \
-  -H "X-Dev-User-Id: <user-id-from-above>" \
+  -H "Authorization: Bearer $ACCESS_TOKEN" \
   -H "Idempotency-Key: $(python -c 'import uuid; print(uuid.uuid4())')" \
   -d '{}'
 ```
@@ -196,7 +218,7 @@ API entirely:
 
 ```bash
 curl -s http://127.0.0.1:8000/api/v1/bookings/<booking-id-from-above>/history \
-  -H "X-Dev-User-Id: <user-id-from-above>" | python -m json.tool
+  -H "Authorization: Bearer $ACCESS_TOKEN" | python -m json.tool
 ```
 
 No frontend yet — see Status above and [`CLAUDE.md`](CLAUDE.md).
@@ -238,7 +260,7 @@ pytest
 | Idempotent writes | **Live** — required `Idempotency-Key` on every mutation (Phase 5, 7) |
 | Booking detail / list, resource list / detail / availability | **Live** — cursor pagination, field-level authorization (Phase 6) |
 | Audit trail | **Live** — trigger-based, append-only by database grant, `GET /bookings/{id}/history` (Phase 8) |
-| Auth & scoped authorization | Not started (Phase 9) |
+| Auth & scoped authorization | **Live** — real OIDC session tokens, four roles, scoped resource admin, restricted resources (Phase 9) |
 | DST-correct recurring bookings | Not started (Phase 10–13) |
 | Enforceable waitlist | Not started (Phase 14–17) |
 | Notifications | Not started (Phase 18) |

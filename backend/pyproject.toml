@@ -8,6 +8,7 @@ dependencies = [
     "psycopg[binary]>=3.3,<4",
     "dj-database-url>=2.3,<3",
     "djangorestframework>=3.18,<3.19",
+    "pyjwt[crypto]>=2.10,<3",
 ]
 
 [project.optional-dependencies]

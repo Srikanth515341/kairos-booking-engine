@@ -21,6 +21,7 @@ from kairos.bookings.models import Booking
 from kairos.core.idempotency import run_idempotent_write
 from kairos.core.models import IdempotencyKey, IdempotencyKeyStatus
 from kairos.identity.models import AppUser
+from kairos.identity.oidc import issue_session_token
 from kairos.resources.models import Resource
 
 BOOKINGS_URL = "/api/v1/bookings"
@@ -33,6 +34,22 @@ def _iso(dt: datetime) -> str:
 def _headers(user: AppUser, idempotency_key: uuid.UUID) -> dict[str, str]:
     return {
         "HTTP_X_DEV_USER_ID": str(user.id),
+        "HTTP_IDEMPOTENCY_KEY": str(idempotency_key),
+    }
+
+
+def _bearer_headers(user: AppUser, idempotency_key: uuid.UUID) -> dict[str, str]:
+    """A REAL minted session token (Phase 9) — see
+    tests/bookings/test_views.py's identical helper for the full
+    rationale. Used on IDEM-01/02 specifically: idempotency's key-claim
+    INSERT is scoped to `(user_id, key)`, and IDEM-01/02 are the two most
+    fundamental idempotency behaviors (first use, exact replay) — proving
+    they work when `user_id` comes from a real authenticated principal,
+    not just the stub, is the representative case for this mechanism.
+    """
+    token, _ = issue_session_token(user.id)
+    return {
+        "HTTP_AUTHORIZATION": f"Bearer {token}",
         "HTTP_IDEMPOTENCY_KEY": str(idempotency_key),
     }
 
@@ -162,6 +179,10 @@ def test_session_settings_are_active_at_the_key_claim_insert_itself(
 
 @pytest.mark.django_db
 def test_idem_01_first_use(client: APIClient, app_user: AppUser, active_resource: Resource) -> None:
+    """Real minted session token (Phase 9) — proves the key-claim INSERT's
+    `(user_id, key)` scoping resolves `user_id` correctly from a real
+    authenticated principal.
+    """
     start = timezone.now() + timedelta(hours=1)
     key = uuid.uuid4()
     response = client.post(
@@ -172,7 +193,7 @@ def test_idem_01_first_use(client: APIClient, app_user: AppUser, active_resource
             "end": _iso(start + timedelta(hours=1)),
         },
         format="json",
-        **_headers(app_user, key),
+        **_bearer_headers(app_user, key),
     )
     assert response.status_code == 201
     assert "Idempotent-Replay" not in response.headers
@@ -193,6 +214,7 @@ def test_idem_01_first_use(client: APIClient, app_user: AppUser, active_resource
 def test_idem_02_exact_replay(
     client: APIClient, app_user: AppUser, active_resource: Resource
 ) -> None:
+    """Real minted session token (Phase 9) — same rationale as IDEM-01."""
     start = timezone.now() + timedelta(hours=1)
     key = uuid.uuid4()
     payload = {
@@ -201,10 +223,12 @@ def test_idem_02_exact_replay(
         "end": _iso(start + timedelta(hours=1)),
     }
 
-    first = client.post(BOOKINGS_URL, data=payload, format="json", **_headers(app_user, key))
+    first = client.post(BOOKINGS_URL, data=payload, format="json", **_bearer_headers(app_user, key))
     assert first.status_code == 201
 
-    replay = client.post(BOOKINGS_URL, data=payload, format="json", **_headers(app_user, key))
+    replay = client.post(
+        BOOKINGS_URL, data=payload, format="json", **_bearer_headers(app_user, key)
+    )
     assert replay.status_code == 201
     assert replay.headers["Idempotent-Replay"] == "true"
     assert replay.json() == first.json()
