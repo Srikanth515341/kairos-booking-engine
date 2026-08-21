@@ -118,6 +118,27 @@ kairos-booking-engine/
 │   │   │                   # failure so a deploy pipeline can gate on it; same functions Beat
 │   │   │                   # calls on schedule, the identical pattern Phase 13's
 │   │   │                   # rematerialize_series established), management/commands/cleanup_idempotency_keys.py
+│   │   │                   # (now calling idempotency.py's shared cleanup_expired_idempotency_keys
+│   │   │                   # — Phase 21), alerting.py (evaluate_alerts/fire_or_resolve/
+│   │   │                   # _execute_alert_email_delivery — Phase 21, RECON-07's mechanism),
+│   │   │                   # metrics.py (classify_metric_type/record_request_metric/
+│   │   │                   # p95_duration_ms/error_rate_by_cause/auth_failure_rate_by_shape/
+│   │   │                   # redis_availability/idempotency_key_stats/audit_actor_unknown_count/
+│   │   │                   # rate_limit_metric_slot — all live-queried, Phase 21), models.py
+│   │   │                   # (+ AlertEvent/RequestMetric/OperationalHeartbeat — Phase 21),
+│   │   │                   # migrations/0013-0014 (the three tables + kairos_app grants —
+│   │   │                   # SELECT/INSERT/UPDATE on alert_event and operational_heartbeat,
+│   │   │                   # SELECT/INSERT/DELETE on request_metric for pruning — Phase 21),
+│   │   │                   # exceptions.py's ServiceUnavailableError (+ cause field — Phase 21),
+│   │   │                   # drf.py's kairos_exception_handler (+ cause-stashing for both a 503
+│   │   │                   # and a 401 — Phase 21), middleware.py's MetricsMiddleware (Phase 21,
+│   │   │                   # after RequestIdMiddleware in MIDDLEWARE), views.py's
+│   │   │                   # AdminDashboardView/AdminDashboardPageView + the extracted
+│   │   │                   # _require_operations_or_system_admin (Phase 21), schema_assertion.py's
+│   │   │                   # schema_assertion_heartbeat_is_stale (Phase 21 — closed a gap left by
+│   │   │                   # Phase 20's own unused SCHEMA_ASSERTION_STALE_THRESHOLD_SECONDS
+│   │   │                   # constant), tasks.py's evaluate_alerts_task/send_alert_email_task/
+│   │   │                   # cleanup_idempotency_keys_task (Phase 21)
 │   │   ├── identity/       # app_user, resource_admin (UUID surrogate PK since Phase 8),
 │   │   │                   # user_group/user_group_membership (Phase 9 — PRD FR46, not in
 │   │   │                   # Spec v1.0 §3 at all, see Key Technical Decisions),
@@ -126,7 +147,11 @@ kairos-booking-engine/
 │   │   │                   # _reject_if_deactivated — Phase 19, OFF-02, checked in BOTH
 │   │   │                   # authenticators so a deactivated user's still-unexpired session
 │   │   │                   # token is rejected on every subsequent request, not merely at
-│   │   │                   # three specific write endpoints),
+│   │   │                   # three specific write endpoints; every AuthenticationFailed raise
+│   │   │                   # site now carries an explicit code= — invalid_session_token/
+│   │   │                   # unknown_user/deactivated_account/malformed_dev_header — Phase 21,
+│   │   │                   # "auth failure rate by shape," read back via DRF's own
+│   │   │                   # ErrorDetail.code by kairos.core.drf._auth_failure_shape),
 │   │   │                   # authorization.py (AuthorizationService, Phase 9 — the ONE
 │   │   │                   # place every permission decision is resolved),
 │   │   │                   # oidc.py (JWT mint/verify + local mock issuer, Phase 9),
@@ -193,7 +218,11 @@ kairos-booking-engine/
 │   │   │                   # NULLIF(...,'')-for-SYSTEM convention — never observable until
 │   │   │                   # Phase 19 became the first caller to pass actor_type=SYSTEM here
 │   │   │                   # (the offboarding cascade's cancel_and_notify path); fixed to match
-│   │   │                   # create_booking/edit_booking exactly
+│   │   │                   # create_booking/edit_booking exactly. _handle_write_database_error
+│   │   │                   # (+ FAILOVER_SQLSTATES — 57P01/57P02/57P03 — and a sqlstate-less
+│   │   │                   # DatabaseError, both mapped to ServiceUnavailableError(cause=
+│   │   │                   # "failover") vs. RETRYABLE_SQLSTATES' cause="lock_contention" — Phase
+│   │   │                   # 21, Rollout v1.0 §6.2's 503-split-by-cause)
 │   │   ├── waitlist/       # waitlist_entry (Phase 14), waitlist_offer (Phase 16) — its own
 │   │   │                   # app, not part of bookings/, since Spec's own ER diagram reaches
 │   │   │                   # both directly from app_user/resource, never through booking (see
@@ -233,7 +262,16 @@ kairos-booking-engine/
 │   │   │                   # four RECON-06 names that had no heartbeat writer at all before this
 │   │   │                   # phase); offer_cascade_heartbeat_is_stale mirrors hold_reaper_
 │   │   │                   # heartbeat_is_stale's shape, both now delegating to kairos.core.
-│   │   │                   # heartbeat.heartbeat_is_stale,
+│   │   │                   # heartbeat.heartbeat_is_stale. count_stuck_held_bookings (Phase 21) —
+│   │   │                   # a LIVE query (not a heartbeat) for holds past expires_at plus
+│   │   │                   # OFFER_CASCADE_STUCK_HOLD_GRACE_SECONDS, now offer_cascade's actual
+│   │   │                   # alert trigger (kairos.core.alerting.evaluate_alerts), REPLACING
+│   │   │                   # offer_cascade_heartbeat_is_stale for that purpose — the latter is
+│   │   │                   # unchanged and still exists, just no longer consulted by alerting,
+│   │   │                   # per Phase 20's own flagged false-alarm risk for this one check,
+│   │   │                   # resolved this phase. FAILOVER_SQLSTATES (mirrors kairos.bookings.
+│   │   │                   # services' identical Phase 21 addition) in the join-conflict except
+│   │   │                   # block,
 │   │   │                   # serializers.py (slot_already_available check before
 │   │   │                   # the idempotency key is claimed; WaitlistOfferResponseSerializer —
 │   │   │                   # Phase 16), views.py (join/list/cancel; WaitlistOfferConfirmView/
@@ -299,7 +337,11 @@ write path): `POST`/`GET /api/v1/bookings`, `GET`/`PATCH /api/v1/bookings/{id}`,
 (resource admin or `system_admin`), `POST /api/v1/resources/{id}/admins`,
 `DELETE /api/v1/resources/{id}/admins/{user_id}`,
 `GET /api/v1/admin/resources/{id}/utilization`, `POST /api/v1/admin/users/{id}/deactivate`
-(Phase 19), `GET /api/v1/admin/checks/latest` (Phase 20, read-only, `operations`/`system_admin`).
+(Phase 19), `GET /api/v1/admin/checks/latest` (Phase 20, read-only, `operations`/`system_admin`),
+`GET /api/v1/admin/dashboard` (Phase 21, read-only, same `operations`/`system_admin` gate —
+checks + open alerts + every Rollout v1.0 §6.2 metric in one response), plus
+`GET /admin/dashboard/` (Phase 21, deliberately outside `/api/v1` — a self-contained HTML page,
+no DRF auth of its own, polling the JSON endpoint above client-side).
 Every mutation (create, edit, cancel, recurring confirm, recurring-series cancel,
 waitlist join, waitlist cancel, offer confirm, offer decline, user deactivate) is idempotent
 (Phase 5/7/12/14/16/19 — `Idempotency-Key` is required; missing it is 400) — EXCEPT resource
@@ -500,6 +542,43 @@ never staging or production, Test Plan v1.0's own explicit instruction — plus 
 case (narrowed predicate) was ALSO verified live against real `kairos_dev`, inside an explicit
 `BEGIN`/`ROLLBACK` so nothing was ever actually left modified.
 
+Observability & alerting (Phase 21, RFC v1.0 §14; Rollout v1.0 §6.1, §6.2, RUNBOOK-02/06/07/09)
+— every heartbeat Phase 20 made queryable now actually pages an operator. `kairos/core/
+alerting.py`'s `evaluate_alerts` (scheduled every `ALERT_EVALUATION_INTERVAL_SECONDS`, 60s
+default, via `evaluate_alerts_task`) reads the six checks' latest `system_check_run` state plus a
+seventh signal (`AuditLog` rows with `actor_type='unknown'`, SEV-3) and fires/resolves an
+`AlertEvent` per Rollout v1.0 §6.1's severity table, edge-triggered via a partial unique index
+(`uniq_open_alert_per_key`) so an ongoing incident produces one email, not one per poll.
+`offer_cascade`'s trigger is `kairos.waitlist.services.count_stuck_held_bookings` — a LIVE query
+for holds sitting past `expires_at` plus `OFFER_CASCADE_STUCK_HOLD_GRACE_SECONDS` (5 min), not
+`offer_cascade_heartbeat_is_stale`'s "no run in 90s" (Phase 20's own flagged false-alarm risk for
+an event-triggered job — resolved this phase, not carried forward again). Delivery reuses Phase
+18's `NotificationService.send`/`EMAIL_BACKEND` directly, to `settings.ALERT_RECIPIENT_EMAIL`, via
+a new `send_alert_email_task` with the identical retry/backoff shape `send_notification_task`
+already has — `AlertEvent` carries its own `email_status`/`attempts`/`last_error`/`sent_at`
+rather than routing through `NotificationLog` (whose `recipient_user_id` is a real `AppUser`,
+which an ops mailbox isn't). Two new tables besides `AlertEvent`: `RequestMetric` (one row per
+HTTP request, written by new `kairos.core.middleware.MetricsMiddleware`, pruned on
+`REQUEST_METRIC_RETENTION_HOURS`) backs `kairos/core/metrics.py`'s live-computed Rollout v1.0
+§6.2 metrics — booking-write/availability-read P95 (Postgres `percentile_cont`), 503 rate split
+by `cause` (`ServiceUnavailableError` gained a `cause` field: `"lock_contention"` for the existing
+`RETRYABLE_SQLSTATES`, `"failover"` for a NEW `FAILOVER_SQLSTATES` — 57P01/57P02/57P03 — or a
+sqlstate-less connection failure), and auth-failure rate by shape (every `AuthenticationFailed`
+raise in `kairos/identity/authentication.py` now carries an explicit `code=`). Neither `cause`
+touches the Spec v1.0 §6 error envelope — `kairos_exception_handler` stashes it as a plain
+`response.kairos_error_cause` attribute the middleware reads back. `OperationalHeartbeat` (a
+generic, non-six-check heartbeat slot) backs the finally-scheduled `cleanup_idempotency_keys_task`
+(`IDEMPOTENCY_CLEANUP_INTERVAL_SECONDS`) — the command Phase 5 built with a docstring naming
+"Phase 21" as the phase that would schedule it. `GET /api/v1/admin/dashboard` (same
+`operations`/`system_admin` gate as `checks/latest`) and a self-contained `GET /admin/dashboard/`
+HTML page (no template engine, no new frontend framework, client-side polling with a pasted
+bearer token) are the "dashboard" this phase's DoD requires — no Grafana/Prometheus stack exists
+or was added. `rate_limit_metric_slot()` honestly reports `{"available": false, "note": "...
+Phase 22 dependency"}` rather than fabricating a number for a system that doesn't exist yet.
+RECON-07 ("every alert deliberately fired once and confirmed to reach its target... a release
+gate") is seven automated tests in `tests/test_alerting.py`, each seeding the real Rollout v1.0
+§6.1 condition and asserting both the correct `AlertEvent` and a real email in `mail.outbox`.
+
 Real authentication (Phase 9, RFC v1.0 §4): `Authorization: Bearer <session-token>`, validated
 by `OIDCSessionAuthentication`. A client obtains that session token via `POST /auth/token`
 with a verified OIDC ID token — in dev/test, `POST /auth/dev-mock-login` mints one against a
@@ -554,11 +633,11 @@ DSN (`kairos_app` deliberately has no DDL rights) — see "Running Locally" belo
 | 18 | Notifications | `NotificationService` (`kairos/core/notifications.py`) is a thin wrapper over Django's own `EMAIL_BACKEND` abstraction (console in dev, real SMTP in prod, `locmem` — Django's own capturing backend, `django.core.mail.outbox` — in test) rather than a bespoke backend hierarchy — reusing a framework guarantee instead of reinventing one, the same choice this project already made for `CompositePrimaryKey`/`set_config`/Postgres triggers. Every `notify_*` builder function only constructs a subject/body and calls `kairos/core/tasks.py`'s new `dispatch_notification`, which enqueues `send_notification_task.delay(...)` and returns immediately — the actual `send_mail()` call happens inside that Celery task, in a worker process, NEVER inline in an HTTP request thread or inside a request-path transaction (RFC v1.0 §15a). `dispatch_notification` mirrors `kairos.waitlist.tasks.dispatch_cascade` (Phase 17) exactly: wraps `.delay()` in `try/except` so a broker outage degrades (logged `notification_dispatch_failed_broker_unavailable`) rather than propagating out of `cancel_booking`'s `transaction.on_commit()` callback. `send_notification_task` is `autoretry_for=(Exception,)`, `retry_backoff=True`, `max_retries=NOTIFICATION_MAX_RETRIES` (PRD FR55's "recorded and retried") — the delivery logic itself lives in a plain function, `_execute_notification_delivery`, callable directly so a test can drive a failure-then-success sequence without depending on Celery's own retry scheduling/timing, the same "test the mechanism directly" precedent `expand_occurrences`/`reap_expired_holds` already established. New schema, `NotificationLog` (`kairos/core/models.py`, migrations 0010-0011) — Spec v1.0 §3 has zero notification concept at all, the identical kind of gap Phase 9's `user_group` table filled — one row per logical notification, `attempts` accumulating and `status` (`pending`/`sent`/`failed`) reflecting the latest outcome across every retry; `kairos_app` granted SELECT/INSERT/UPDATE (no DELETE, no audit trigger — this table is itself a delivery-outcome log, the same category as `system_check_run`, not one of the five audited business-state entities). Four of the five notification points wired to real callers: `notify_offer_created` (PRD FR52, expiry stated explicitly in the subject line) from `create_offer_for_freed_range` right after the offer row commits; `notify_admin_cancellation` (PRD FR53, includes the recorded reason) from `cancel_booking`'s SECOND `on_commit` hook, gated on `actor_type=ADMIN` so a self-cancel never triggers it; `notify_rematerialization` (PRD FR54) from `rematerialize_stale_series` on each successfully-recomputed occurrence; and `notify_rematerialization_conflict` (PRD FR13b, a genuine completion of Phase 13's own "resource_administrators: pending Phase 18 delivery" placeholder, not new scope) to both the series owner and every resource administrator scoped to that specific resource on a conflict. The fifth, `notify_rollback_hold_released` (Rollout v1.0 §4.5), was built per this phase's own explicit clarification: the template/message content and send mechanism exist and are fully tested standalone (distinct, non-generic wording from an ordinary offer-expiry notification — explicitly names the rollback, explicitly states queue position was preserved, deliberately avoids any "expire" framing), but NO real production trigger was invented for it — Rollout §4.5's hold release is a manual operational runbook (SQL an operator runs during an incident), not application code any phase has built, and manufacturing a fake caller just to wire one up would have been scope beyond this phase's actual job (see Open Questions). Definition of Done verified: all four wired notification points fire, proven via the capturing (`locmem`) backend; offer-created states the expiry explicitly; a simulated provider outage (patching `send_notification_task.delay` to raise) does NOT fail the underlying admin-cancellation — the booking still commits `CANCELLED`, proven directly; every dispatch call site is either inside a `transaction.on_commit()` callback or a worker context with no open transaction — verified by reading the code, no synchronous dispatch from a request-path transaction anywhere; rollback-hold-released messaging asserted distinct from ordinary offer-created messaging by direct content comparison. Full suite: 238 tests (225 + 13 new), no regressions, plus all 10 CI-tier concurrency tests re-run clean (this phase's changes touch `cancel_booking`, a CONC/WL/RECLAIM-exercised function). ⚠️ **Real bug caught by rebuilding the worker's Docker image and re-reading its startup banner** — `send_notification_task` was silently absent from the running worker's task list after a plain `docker compose restart` (which reuses the existing, stale image rather than rebuilding); fixed with `--build`, then re-verified live: the rebuilt worker's banner lists all six tasks, a deliberately malformed dispatch demonstrated genuine exponential retry-with-backoff (1s/0s/4s/2s/6s, jittered) against the real Redis broker before failing cleanly once `NOTIFICATION_MAX_RETRIES` was exhausted, and a valid dispatch printed the full email to the worker's console `EMAIL_BACKEND` and left exactly one `notification_log` row (`status='sent'`, `attempts=1`), confirmed via `psql` against `kairos_dev` — see Key Technical Decisions | Pending (on branch `phase-18-notifications`) |
 | 19 | Resource Administration & Offboarding | Resource CRUD (Spec v1.0 §5.14) is real: `POST /api/v1/resources` (`system_admin`-only, 403 not 404 — capability-gated), `PATCH /api/v1/resources/{id}` (resource admin or `system_admin`, Spec's own literal updatable-field list — `restricted_group` deliberately excluded, it names nowhere in that list), `POST`/`DELETE /resources/{id}/admins` (409 `already_resource_admin` — new domain exception, NOT a `RecordableConflictError`, since neither endpoint carries `Idempotency-Key`), and `GET /admin/resources/{id}/utilization` (resource admin/operations/`system_admin`; `total_bookings`/`total_booked_minutes`/`waitlist_joins`/`cancellation_count`/`offers_confirmed`/`offers_expired` over a `starts_at`-delimited date range — the same filter shape every other date-range list endpoint in this codebase already uses). No `DELETE /resources/{id}` exists anywhere, confirmed by a real 405 test — Spec's own reasoning (referential integrity/audit history). New `kairos/resources/services.py` applies write-path session settings on every write (resource/`resource_admin` are two of the five audited tables) despite carrying no idempotency wrapper at all — Spec v1.0 §7 never names these five endpoints in its coverage list. `POST /admin/users/{id}/deactivate` (Spec v1.0 §5.15; PRD FR49-51; `system_admin`-only, `Idempotency-Key` required — Spec DOES name this one) is the real offboarding cascade, `kairos.identity.services.deactivate_user`: each one-off future confirmed booking is transferred (to the resource's FCFS-earliest-granted admin, via new `transfer_booking_ownership`), cancelled-and-notified (reusing `cancel_booking` + Phase 18's `notify_admin_cancellation`), or retained, per that booking's OWN resource's `offboarding_policy` (a column Spec's DDL already defined, default `'transfer'` — PRD open question 8, "which policy is the default," was answered by the schema itself, not invented this phase). Outstanding holds/offers are released via the EXISTING `decline_offer` (hold release + cascade, PRD FR50, reused unchanged) and `WAITING` waitlist entries via the EXISTING `cancel_waitlist_entry` — both gained a new `actor_type` parameter (default `USER`, Phase 19 passes `SYSTEM`), the same "extend the existing function" pattern `create_booking`/`edit_booking` already established for `actor_type` in Phase 13. Active recurring series are flagged (PRD FR51) — reported in the response body and, when a resource admin exists, notified via new `notify_series_owner_deactivated` — no endpoint to actually transfer/terminate one exists anywhere (same FR16 gap Phase 12 already flagged). The whole cascade runs inside ONE shared `run_idempotent_write` transaction, matching `cancel_recurring_series`'s (Phase 12) identical reasoning: nothing here contends with the exclusion constraint the way CREATE does. ⚠️ **Real, if narrow, bug found and fixed**: `cancel_booking`'s session-settings call always used `req.actor.id` as `actor_id` regardless of `actor_type`, unlike `create_booking`/`edit_booking`'s established NULLIF-for-SYSTEM convention — invisible until Phase 19 became the first caller to pass `actor_type=SYSTEM` into it (the `cancel_and_notify` offboarding path); fixed to match, verified via OFF-01's own `audit_log.actor_id IS NULL` assertion. OFF-02 ("a deactivated user cannot book, waitlist, or confirm") is enforced at the AUTHENTICATION layer — both `OIDCSessionAuthentication` and `StubUserIdAuthentication` now reject a `status='deactivated'` `AppUser` with a real 401, checked once centrally rather than per-endpoint, so a still-unexpired session token can't keep acting and a future endpoint can't forget the check. `request_id()` (`kairos/core/views.py`) is extracted from four near-identical local copies (bookings/waitlist/resources/identity views.py) — this project's own "worth extracting once real duplication exists" threshold (`RecordableConflictError`, Phase 16), reached again. OFF-01 ★ passes as the full documented scenario (2 transferred, 1 cancelled-and-notified, 1 retained, 3 waitlist entries cancelled, 1 outstanding hold released AND proven to cascade to a genuinely next-eligible entry, 1 series flagged, every cascade action audited `actor_type='system'` with the offboarding reason, zero bookings left in an undefined state) plus a repeat-deactivation idempotent-no-op test; OFF-02 covers create/join/confirm, each asserting a real 401. Verified LIVE against the real dev server and `kairos_dev`, not just pytest: a full create-resource→grant-admin→PATCH→utilization round trip over real HTTP, then a real booking genuinely transferred `user_id` on deactivation (confirmed via `psql`, `audit_log.actor_type='system'`/`actor_id IS NULL`), then a deactivated user's freshly-minted session token rejected with a real 401 on the very next request. Full suite: 259 tests (238 + 21 new), no regressions, plus all 10 CI-tier concurrency tests re-run clean (405s) — this phase's `cancel_booking`/authentication.py changes sit directly in CONC-03/04/05, HOLD-01/02, WL-01–03, RECLAIM-01–03's own code paths | Pending (on branch `phase-19-admin-offboarding`) |
 | 20 | Reconciliation & Schema Assertion ⚠️ CRITICAL | The two checks that prove in production the core guarantee still exists (PRD M2/M3; RFC v1.0 §14). `kairos/core/schema_assertion.py` detects the CAUSE: `get_no_overlapping_bookings_definition()` is Phase 3's OWN `pg_get_constraintdef` query, extracted so `tests/test_schema_assertion.py` and the scheduled production job (`check_schema_assertion`) call the IDENTICAL function — explicit instruction this phase, since two independently-written copies could silently drift apart and disagree about a real predicate narrowing. `kairos/core/reconciliation.py` detects the CONSEQUENCE: a self-join for overlapping `confirmed`/`held` bookings using the SAME `&&` range operator `no_overlapping_bookings` itself is defined with, so `[)` bound semantics (Rollout RUNBOOK-01 cause #4's adjacency false-positive) are respected automatically, never hand-rolled. Both write a `system_check_run` heartbeat every run, scheduled hourly via Celery Beat and also runnable synchronously via new `manage.py run_correctness_checks` (RFC v1.0 §14's "on every deploy" trigger, exits non-zero on failure, the same pattern Phase 13's `rematerialize_series` established). New `GET /api/v1/admin/checks/latest` (Spec v1.0 §5.15; `operations`/`system_admin`) surfaces all six checks in Spec's own example order — a check that has never run reports honest `null`/`null`/`{}`, never a faked pass. `kairos/core/heartbeat.py`'s `heartbeat_is_stale` generalizes Phase 17's hold_reaper-only staleness check once RECON-06 needed the identical logic for `offer_cascade`/`series_materialization`/`tzdata_rematerialization` too — `offer_cascade` (Phase 16) had NO heartbeat writer at all before this phase; `create_offer_for_freed_range` now writes one every run, closing that gap so all four RECON-06-named jobs are genuinely covered, not three of four. The reconciliation failure message is a TESTED property of the payload (RECON-04), not documentation — it states the guarantee has been REMOVED and explicitly negates "a race occurred" as the correct reading. RECON-01 (inject, catch exactly the two flagged rows, restore, confirm the identical insert fails again with 23P01) and RECON-05's SECOND case (RUNBOOK-01 cause #1 itself — the constraint still exists, `pg_constraint` still returns it, but the predicate no longer covers `'held'`, exactly the case a bare existence check would miss) both pass, and RECON-05's narrowed-predicate case was ALSO verified manually, per this phase's own explicit instruction, live against real `kairos_dev` inside an explicit `psql` `BEGIN`/`ROLLBACK` — never staging or production left actually modified. RECON-02+08 share one ~1,000-row dataset (a deliberate CI-tier scale-down from Test Plan's literal "hundreds of resources, thousands of bookings," documented as such) including a CANCELLED booking DELIBERATELY overlapping a CONFIRMED one — the actual false-positive risk RECON-02 exists to catch, not merely a query returning zero against inert data — asserting both zero false positives and query cost within a generous CI budget. RECON-03+04 seed a violation, run the FULL scheduled job (not the bare query), hit the REAL `GET /admin/checks/latest` endpoint, and assert both the `fail` status and the exact alert-text content. RECON-06 is parametrized across all four named background jobs against the one shared `heartbeat_is_stale` function. ⚠️ **Real bug caught by the first test that actually exercised the FAIL branch**: both check functions originally did `logger.error(event, extra=findings)` where `findings` contained a key literally named `"message"` — Python's `logging` module reserves that name on every `LogRecord`, raising `KeyError` at the first real failure, not on the happy path any earlier code exercised. Fixed by excluding that key from `extra=` on both call sites. Verified LIVE against the real Docker stack: the worker rebuilt (`--build`, Phase 18's own "restart doesn't rebuild" lesson applied again) and its banner confirmed both new tasks registered (eight total); both dispatched manually against real `kairos_dev` data (`covers_confirmed`/`covers_held` both `true`, `overlaps_found: 0`); `manage.py run_correctness_checks` run directly, exit 0; the real endpoint queried over HTTP as a real `operations` user showed all six checks correctly, including `offer_cascade` honestly `null` (never triggered this session). Full suite: 273 tests (259 + 14 new), no regressions, plus all 10 CI-tier concurrency tests re-run clean (454s) | Pending (on branch `phase-20-correctness-monitoring`) |
+| 21 | Six-Job Observability & Heartbeats ⚠️ Load-bearing for go-live | Every alert-routing gap Phase 20 left open (RFC v1.0 §14; Rollout v1.0 §6.1/§6.2, RUNBOOK-02/06/07/09) is closed: `kairos/core/alerting.py`'s `evaluate_alerts` is the ONE function (scheduled hourly-independent, `ALERT_EVALUATION_INTERVAL_SECONDS`=60s, via new `evaluate_alerts_task`) that reads all seven signals — the six named checks PLUS `audit_actor_unknown` (SEV-3, `AuditLog.actor_type='unknown'` within a lookback window) — and fires/resolves an `AlertEvent` per Rollout v1.0 §6.1's own severity table (SEV-1: `schema_assertion`/`reconciliation`; SEV-2: `hold_reaper`/`offer_cascade`/`series_materialization`/`tzdata_rematerialization`). `fire_or_resolve` is edge-triggered — `uniq_open_alert_per_key` (a partial unique index on `resolved_at IS NULL`) makes a second OPEN row per `alert_key` structurally impossible, so re-evaluating an already-firing condition is a no-op, not a duplicate email every tick; the condition clearing marks the row resolved, and a later re-firing opens a brand-new row (full history survives). **Clarification #1 resolved and closed, not left open a second time**: `offer_cascade`'s alert no longer uses "no run in 90s" as its trigger at all (Phase 20's own flagged false-alarm risk for an event-triggered job) — the new `kairos.waitlist.services.count_stuck_held_bookings` (a live query, no stored heartbeat) counts holds sitting past `expires_at` + `OFFER_CASCADE_STUCK_HOLD_GRACE_SECONDS` (5 min) is the sole trigger now, proven in `test_offer_cascade_does_not_false_alarm_during_an_ordinary_quiet_period` to NOT fire during ordinary silence. Delivery reuses Phase 18's own pattern exactly rather than a new channel (explicit instruction this phase — no PagerDuty/Slack anywhere in the Implementation Plan): `AlertEvent` carries its own `email_status`/`attempts`/`last_error`/`sent_at` (mirroring `NotificationLog`'s shape, not routed through it — an alert's recipient is a fixed `settings.ALERT_RECIPIENT_EMAIL` mailbox, not an `AppUser`), sent via the SAME `NotificationService.send`/`EMAIL_BACKEND` (console/locmem/SMTP) through a new `send_alert_email_task` with the identical `autoretry_for`/`retry_backoff` shape `send_notification_task` already has. Two new schema-neighbor tables besides `AlertEvent`: `RequestMetric` (Rollout v1.0 §6.2 — one row per HTTP request, written by new `kairos.core.middleware.MetricsMiddleware`; booking-write/availability-read P95 via Postgres's own `percentile_cont`, 503 rate split by cause, auth-failure rate by shape, all computed LIVE over `METRICS_WINDOW_SECONDS`, never precomputed — pruned on `REQUEST_METRIC_RETENTION_HOURS` by the same `evaluate_alerts_task` tick) and `OperationalHeartbeat` (a generic, non-six-check heartbeat slot — `system_check_run`'s own CHECK constraint is deliberately closed to exactly six names — used for `cleanup_idempotency_keys`, finally scheduled via new `cleanup_idempotency_keys_task`/`IDEMPOTENCY_CLEANUP_INTERVAL_SECONDS` after that command's own Phase-5 docstring named "Phase 21" as the phase that would do it). "503 rate split by cause (lock timeout vs. failover)" is real, not aspirational: `ServiceUnavailableError` gained a `cause` field — `RETRYABLE_SQLSTATES` (55P03/40P01/57014, unchanged from Phase 4) map to `"lock_contention"`; a NEW `FAILOVER_SQLSTATES` (57P01/57P02/57P03, Class 57 operator-intervention) OR a DatabaseError with NO sqlstate at all (a genuine connection-level failure has none — SQLSTATEs come from a server response) map to `"failover"`, with a longer `FAILOVER_RETRY_AFTER_SECONDS`; `kairos.core.drf.kairos_exception_handler` stashes `cause` onto the response (`response.kairos_error_cause`) for the middleware to read, never a new response field (Spec v1.0 §6's envelope is unchanged). "Auth failure rate by shape" is real the identical way: every `AuthenticationFailed` raise in `kairos/identity/authentication.py` now carries an explicit `code=` (`invalid_session_token`/`unknown_user`/`deactivated_account`/`malformed_dev_header`), read back via DRF's own `ErrorDetail.code` the same `cause`-stashing mechanism uses. `GET /api/v1/admin/dashboard` (`operations`/`system_admin`, same gate as `checks/latest` — extracted into `_require_operations_or_system_admin` once a second view needed it) returns the six checks, every open alert, and every Rollout v1.0 §6.2 metric in one response; `GET /admin/dashboard/` (deliberately OUTSIDE `/api/v1`, no DRF auth of its own) is a single self-contained HTML page — no template engine (`TEMPLATES = []` since Phase 4), no new frontend framework, no separate service, per explicit instruction — that polls the JSON endpoint client-side with a pasted bearer token. **Clarification #2 resolved**: `rate_limit_metric_slot()` returns `{"available": false, "note": "...Phase 22 dependency"}` — a genuinely empty, honest slot, never a fabricated 0% that would read as a working metric on the dashboard. RECON-07 ("every alert deliberately fired once and confirmed to reach its target... a release gate, not a recommendation") is satisfied by seven dedicated `test_*_fires_and_reaches_its_target` tests in `tests/test_alerting.py`, each seeding the exact Rollout v1.0 §6.1 condition, calling the real `evaluate_alerts()`, and asserting BOTH the correct `AlertEvent` AND a real email in `mail.outbox` — automated, reproducible evidence, not a manual one-off. Verified LIVE against the real Docker stack: worker rebuilt (`--build`), banner confirmed all three new tasks registered (eleven total); `evaluate_alerts_task`/`cleanup_idempotency_keys_task` dispatched against real `kairos_dev` and succeeded (`{"alerts_fired": [], "metrics_pruned": 0}` — genuinely healthy); `GET /api/v1/admin/dashboard` queried over real HTTP with a real minted `operations` session token showed live data reflecting the exact requests just made (`auth_failures.by_shape.not_authenticated: 1` from an unauthenticated curl moments before); `GET /admin/dashboard/` reachable; a real alert fired directly against `kairos_dev`, printed to the console `EMAIL_BACKEND`, transitioned `email_status` to `sent`, then resolved. Full suite: 324 tests (273 + 51 new), no regressions, plus all 10 CI-tier concurrency tests re-run clean (428s, confirming the new `FAILOVER_SQLSTATES` branch in `_handle_write_database_error` didn't change retryable-SQLSTATE behavior) | Pending (on branch `phase-21-observability-heartbeats`) |
 
 ## Current Phase In Progress
 
-None. Phase 20 is complete pending review and merge. Phase 21 (Full Correctness Monitoring —
-alert routing) is next.
+None. Phase 21 is complete pending review and merge. Phase 22 (Rate Limiting) is next.
 
 ## NOT Yet Built
 
@@ -573,14 +652,22 @@ every `HOLD_REAPER_INTERVAL_SECONDS`). `waitlist_entry` (Phase 14) and `waitlist
 offer decline, OR now an expired-hold reclamation (Phase 17) — every trigger RFC v1.0 §10.2/
 §10.4 describes now has a real caller, AND (Phase 18) each of those events now actually
 notifies someone: offer creation dispatches `notify_offer_created` with the expiry stated
-explicitly (PRD FR52). Full alert ROUTING (Phase 21) is separately still missing —
-`hold_reaper_heartbeat_is_stale` (Phase 17) makes staleness DETECTABLE from the data, and
-`GET /api/v1/admin/checks/latest` (the surface WL-05 Part B's own text names) doesn't exist
-yet to expose it. Celery/Redis exist as of Phase 13 (`kairos/celery.py`, `infra/docker-
+explicitly (PRD FR52). Full alert ROUTING is real now (Phase 21) — `kairos/core/alerting.py`'s
+`evaluate_alerts` reads all six checks' heartbeats plus `audit_actor_unknown` and fires/resolves
+an `AlertEvent`, delivered as a plain-text email via the same Phase 18 `NotificationService`
+mechanism to `settings.ALERT_RECIPIENT_EMAIL`; `GET /api/v1/admin/checks/latest` (Phase 20) and
+the new `GET /api/v1/admin/dashboard` + `GET /admin/dashboard/` HTML page (Phase 21) both expose
+it. A real PagerDuty/Slack/on-call-paging integration is DELIBERATELY not built — no phase in the
+31-phase Implementation Plan calls for one (this is a solo project, confirmed explicitly before
+Phase 21 began); a real deployment would point `ALERT_RECIPIENT_EMAIL` at a distribution list or
+an email-to-page bridge, which this codebase doesn't assume anything about. Celery/Redis exist as
+of Phase 13 (`kairos/celery.py`, `infra/docker-
 compose.yml`'s `redis`/`worker`/`beat` services); registered tasks are now
 `rolling_materialize_series_task`/`rematerialize_stale_series_task`/`check_tzdata_drift_task`/
 `create_offer_for_freed_range_task` (Phase 16)/`reap_expired_holds_task` (Phase 17)/
-`send_notification_task` (Phase 18). `recurring_series` rows are created for
+`send_notification_task` (Phase 18)/`run_reconciliation_task`/`run_schema_assertion_task`
+(Phase 20)/`evaluate_alerts_task`/`send_alert_email_task`/`cleanup_idempotency_keys_task`
+(Phase 21 — eleven total, confirmed via the worker's own rebuilt startup banner). `recurring_series` rows are created for
 real via
 `POST /api/v1/bookings/recurring`
 (Phase 12), and the ROLLING MATERIALIZATION MECHANISM now exists (Phase 13,
@@ -605,15 +692,19 @@ offer commits. A fifth notification type, `notify_rollback_hold_released` (Rollo
 hold release is a manual operational runbook, not application code any phase automates; see
 Open Questions. All six correctness/background-job checks now WRITE a `system_check_run`
 heartbeat (Phase 20 closed the last gap, `offer_cascade`) and staleness is DETECTABLE from that
-data via `kairos.core.heartbeat.heartbeat_is_stale`, surfaced read-only via
-`GET /api/v1/admin/checks/latest` — but full ALERT ROUTING (paging, Slack, PagerDuty — actually
-notifying an on-call human when a check fails or goes stale) remains Phase 21; nothing before it
-alerts on staleness or absence of a run, it only makes staleness queryable. No replica routing
+data via `kairos.core.heartbeat.heartbeat_is_stale`, surfaced via `GET /api/v1/admin/checks/
+latest`, and — as of Phase 21 — actually ALERTED on: `kairos.core.alerting.evaluate_alerts`
+(scheduled every `ALERT_EVALUATION_INTERVAL_SECONDS`) fires an `AlertEvent` and emails
+`settings.ALERT_RECIPIENT_EMAIL` the moment a check fails or goes stale past its Rollout v1.0
+§6.1 threshold — no on-call human is paged via PagerDuty/Slack (deliberately out of scope, no
+phase in the plan calls for it), but nothing before Phase 21 alerted on staleness at all; now
+something does. No replica routing
 (Phase 30 — `data_freshness` is
 hardcoded `"primary"`, always true today since no replica exists). The audit trail covers
 `booking`/`resource`/`resource_admin`/`waitlist_entry`/`waitlist_offer` (Phase 16 adds the
-last one) — `actor_type='unknown'` alerting (as opposed to just recording the row) is Phase
-21. AUD-03(d)'s "system-initiated write" now has TWO real workers to exercise it (`actor_type=
+last one) — `actor_type='unknown'` now genuinely ALERTS (SEV-3, Phase 21), not merely records
+the row: `evaluate_alerts` queries `AuditLog` directly for any such row within
+`AUDIT_ACTOR_UNKNOWN_LOOKBACK_SECONDS`. AUD-03(d)'s "system-initiated write" now has TWO real workers to exercise it (`actor_type=
 'system'`, Phase 13's rolling materialization — proven via a spy-on-cursor test reading the
 session variable directly — AND Phase 16's hold creation via `create_offer_for_freed_range`,
 proven against the PERSISTED `audit_log` row instead, since `create_booking` already reuses
@@ -835,6 +926,18 @@ and `git log` first.
 | `offer_cascade` gained a real `system_check_run` heartbeat writer this phase, even though Phase 20's own Scope IN only explicitly names reconciliation + schema assertion as new checks to BUILD | RECON-06 (explicitly in scope via "Tests RECON-01 through RECON-08") names `offer_cascade` as one of the four background jobs to individually stall and verify — but `create_offer_for_freed_range` (Phase 16) had never written one at all. A small, well-precedented addition (the identical shape `reap_expired_holds`/the materialization jobs already use) to let RECON-06 be genuinely true for all four named checks, not three of four — the same "complete an already-half-built mechanism" reasoning Phase 18 used for `notify_rematerialization_conflict` | `kairos/waitlist/services.py` (`_record_offer_cascade_heartbeat`) |
 | RECON-02/RECON-08's dataset is 50 resources × 20 bookings (≈1,000 rows), not Test Plan v1.0's literal "hundreds of resources, thousands of bookings" | A CI-tier scale-down, the identical reasoning CONC-01's own reduced form already established (100 runs → 10) — documented explicitly in the test's own docstring, not silently substituted. Deliberately includes a CANCELLED booking overlapping a CONFIRMED one on the same resource (legal, since cancelled rows sit outside the constraint's predicate) specifically to exercise the WHERE-clause bug RECON-02 exists to catch, not just prove the query returns zero against inert data. Full PRD A1-scale timing is a staging-tier measurement (Test Plan v1.0 §13), same tier RECLAIM-04's full-scale form already lives in | `tests/test_reconciliation.py` |
 | RECON-01 and RECON-03/04's tests use `@pytest.mark.django_db(transaction=True)`, not the default rollback-wrapped `db` fixture | `DELETE`/further DDL in the SAME transaction as an earlier `ALTER TABLE ... ADD CONSTRAINT` raises a genuine Postgres error ("cannot ALTER TABLE because it has pending trigger events") when the audit trigger's pending AFTER-DELETE event hasn't been processed yet — caught empirically, not anticipated. Real, separately-committed statements (`transaction=True`) sidestep this entirely, the same real-commit requirement WL-01/WL-02 (Phase 16) already established for their own on_commit-triggered behavior | `tests/test_reconciliation.py`, `tests/test_admin_checks.py` |
+| **`offer_cascade`'s alert trigger is a LIVE stuck-holds count (`count_stuck_held_bookings`), not `offer_cascade_heartbeat_is_stale`'s "no run in 90s"** — resolved per this phase's own explicit clarification, before any alerting code was written | Phase 20's own Open Questions flagged that "no run in 90s" is a poor fit for an event-triggered job: long silence with zero cancellations is NORMAL, not a failure. Rollout v1.0 §6.1's own SECOND `offer_cascade` condition ("any offer active past expires_at + 5 min grace") already describes the real signal — a hold still `status='held'` this far past its own expiry means BOTH reclamation mechanisms (cleanup-on-write, the reaper) have failed to reach it, which IS worth paging on regardless of recent traffic. `offer_cascade_heartbeat_is_stale` itself is UNCHANGED and still exists (used nowhere in alerting now) — kept as a still-correct, still-tested staleness primitive in case a future phase wants it for something else | `kairos/waitlist/services.py` (`count_stuck_held_bookings`), `kairos/core/alerting.py` (`evaluate_alerts`), `OFFER_CASCADE_STUCK_HOLD_GRACE_SECONDS` |
+| `AlertEvent` is edge-triggered via a partial unique index (`uniq_open_alert_per_key`, `condition=Q(resolved_at__isnull=True)`) rather than a level-triggered "log every tick a condition is true" design | A poller running every 60s against an incident that lasts hours would otherwise send dozens of duplicate emails — the partial index makes "at most one OPEN row per `alert_key`" a DB-enforced invariant (the same "the constraint IS the check" philosophy the exclusion constraint itself embodies), not application discipline `fire_or_resolve` could get wrong under a race. A resolved-then-refired condition opens a NEW row rather than reusing the old one, so the full fired/resolved history survives per key, mirroring `audit_log`/`system_check_run`'s own "append, don't overwrite" instinct | `kairos/core/models.py` (`AlertEvent`), `kairos/core/alerting.py` (`fire_or_resolve`) |
+| Alert delivery reuses `NotificationService.send` directly and mirrors `NotificationLog`'s field shape on `AlertEvent` itself, rather than routing alerts through `NotificationLog` | `NotificationLog.recipient_user_id` is a real `AppUser` id by that table's own docstring (Phase 18) — an alert's recipient is a fixed operator mailbox (`settings.ALERT_RECIPIENT_EMAIL`), never an app user, so shoehorning it in would either need a fake `AppUser` or a nullable FK that every other `NotificationLog` consumer would then have to account for. Reusing the SEND mechanism (the actual `EMAIL_BACKEND` call) while keeping delivery STATE on `AlertEvent` itself is the precise scope of "reuse," per this phase's own explicit instruction — not a parallel notification-channel abstraction | `kairos/core/alerting.py` (`_execute_alert_email_delivery`), `kairos/core/models.py` (`AlertEvent`) |
+| No Grafana/Prometheus stack; the "dashboard" is one new authenticated JSON endpoint (`GET /api/v1/admin/dashboard`) plus one self-contained HTML page (`GET /admin/dashboard/`, client-side polling, pasted bearer token, no persistence) | Explicit instruction this phase, confirmed before building: no metrics/time-series library exists anywhere in this project (`pyproject.toml` has none) and `infra/docker-compose.yml` has only `postgres`/`redis`/`worker`/`beat` — standing up real Prometheus+Grafana would be a significant new infra footprint for one phase, and a real Grafana JSON config can't be verified "showing live values" by pytest the way a JSON endpoint can. Matches "No frontend until Phase 23" by scoping the HTML page as an internal ops tool, not a frontend feature | `kairos/core/views.py` (`AdminDashboardView`, `AdminDashboardPageView`) |
+| `RequestMetric` rows are written by a SEPARATE middleware (`MetricsMiddleware`), not folded into `RequestIdMiddleware` | `RequestIdMiddleware` is a Phase 4 concern (request-id correlation) with nothing to do with metrics; Django's `MIDDLEWARE` list order already gives `MetricsMiddleware` what it needs (nothing, in fact — it doesn't consume `request.request_id` — but ordering it after keeps the "id exists before anything else runs" invariant intact for whichever future middleware DOES need it). One request, one `RequestMetric` row, `cause` populated only when `kairos.core.drf.kairos_exception_handler` stashed one (a 503's `ServiceUnavailableError.cause`, or a 401's `AuthenticationFailed.code`) | `kairos/core/middleware.py` (`MetricsMiddleware`) |
+| Every rate/percentile metric (`p95_duration_ms`, `error_rate_by_cause`, `auth_failure_rate_by_shape`) is computed LIVE by query over a rolling window, never precomputed into a separate time-series store | The identical choice `heartbeat_is_stale`/`GET /admin/checks/latest` already made for staleness (Phase 20) — no library exists to precompute into, and nothing in this codebase ever queries these aggregates outside the dashboard request itself, so a materialized store would only be unused write amplification. `p95_duration_ms` uses Postgres's own `percentile_cont` rather than pulling every row into Python to sort | `kairos/core/metrics.py` |
+| `RETRYABLE_SQLSTATES` (55P03/40P01/57014) map to `ServiceUnavailableError(cause="lock_contention")`; a NEW `FAILOVER_SQLSTATES` (57P01/57P02/57P03, Class 57 operator-intervention) OR a `DatabaseError` with `sqlstate is None` map to `cause="failover"` with a longer `FAILOVER_RETRY_AFTER_SECONDS` | Rollout v1.0 §6.2 names the split explicitly: "lock timeout vs. failover — they need opposite responses" (a short retry vs. a longer wait for a primary that may still be electing). A genuine connection-level failure (server unreachable, mid-failover) carries NO sqlstate at all — SQLSTATEs come from a server response, and a connection that never reached one has none — so `sqlstate is None` is the correct, not merely convenient, signal for that bucket. Deliberately broad (mirrors `kairos.waitlist.tasks.dispatch_cascade`'s own documented broad-except tradeoff): enumerating every possible connection-layer exception risks missing one and silently reintroducing an unhandled 500 for exactly the outage this branch exists to degrade gracefully from | `kairos/bookings/services.py`, `kairos/waitlist/services.py` (`_handle_write_database_error` / the join except block) |
+| `cause` never becomes a new field on the Spec v1.0 §6 error envelope or a new response header — it's stashed as a plain attribute (`response.kairos_error_cause`) inside `kairos_exception_handler` and read back by `MetricsMiddleware` | Spec v1.0 §6's envelope shape is a source-document contract this project has never modified for internal-observability reasons; the client-facing 503/401 response is byte-identical to before this phase. Every prior test asserting exact response bodies (`set(body.keys())`-style assertions elsewhere in this codebase) needed zero changes because of this choice | `kairos/core/drf.py` (`kairos_exception_handler`, `_auth_failure_shape`) |
+| Every `AuthenticationFailed` raise site in `kairos/identity/authentication.py` now passes an explicit `code=` (`invalid_session_token`/`unknown_user`/`deactivated_account`/`malformed_dev_header`) | "Auth failure rate by shape" (Rollout v1.0 §6.2) needs to distinguish WHY a request failed, and DRF's `AuthenticationFailed`/`ErrorDetail` already has a `code` slot built for exactly this — reusing it means zero new response fields and zero new exception classes, just supplying the field DRF already provides at each of the (already enumerated, already tested) failure sites this file has had since Phase 9 | `kairos/identity/authentication.py`, `kairos/core/drf.py` (`_auth_failure_shape`) |
+| `OperationalHeartbeat` (a new, generic `name`-keyed table) exists ALONGSIDE `system_check_run`, not as a seventh value added to `system_check_run.check_name`'s CHECK constraint | This phase's own Scope IN names "all six checks" explicitly, not a seventh — widening a CHECK constraint that's been stable since Phase 13 for one non-correctness-monitoring job (idempotency-key cleanup) would blur what `system_check_run` means. `cleanup_idempotency_keys` (Phase 5's command, whose own docstring named "Phase 21" as the phase that would schedule it) is the first and, for now, only consumer — `update_or_create`-keyed on `name`, one row per job, no append-only history the way `system_check_run` needs | `kairos/core/models.py` (`OperationalHeartbeat`), `kairos/core/idempotency.py` (`cleanup_expired_idempotency_keys`) |
+| `rate_limit_metric_slot()` returns `{"available": false, "note": "...Phase 22 dependency"}` rather than a `0%`/placeholder number | This phase's own explicit clarification #2: rate limiting doesn't exist yet (Phase 22's job), and a fabricated 0% would render on the dashboard indistinguishable from "rate limiting is healthy and firing zero times" — actively misleading, not merely incomplete. An honest, structurally-obvious "not available" slot is what Phase 22 has somewhere real to report into | `kairos/core/metrics.py` (`rate_limit_metric_slot`) |
+| RECON-07 evidence is seven automated pytest tests (`tests/test_alerting.py`), not a manual one-off checklist in a PR description | "An alert never tested is an alert that does not exist... a release gate, not a recommendation" (this phase's own Scope IN) — a manual verification transcript can't be re-run by CI on the next change that touches alerting; a test that seeds the exact Rollout v1.0 §6.1 condition, calls the real `evaluate_alerts()`, and asserts both the `AlertEvent` and a real `mail.outbox` entry is evidence that stays true after this phase ends, not a snapshot of it being true once | `tests/test_alerting.py` |
 
 ## Running Locally
 
@@ -864,10 +967,11 @@ token; `POST /api/v1/auth/token` exchanges it for the session token every other 
 Background jobs (Phase 13) — `docker compose up -d` (the same command above) now ALSO starts
 `redis`, `worker`, and `beat`; nothing extra to run. Verified live: both containers connect
 to Redis and Postgres (as `kairos_app`) successfully, the worker's own startup log lists all
-registered tasks (eight as of Phase 20 —
+registered tasks (eleven as of Phase 21 —
 `rolling_materialize_series_task`/`rematerialize_stale_series_task`/`check_tzdata_drift_task`/
 `create_offer_for_freed_range_task`/`reap_expired_holds_task`/`send_notification_task`/
-`run_reconciliation_task`/`run_schema_assertion_task`), and a
+`run_reconciliation_task`/`run_schema_assertion_task`/`evaluate_alerts_task`/
+`send_alert_email_task`/`cleanup_idempotency_keys_task`), and a
 manually dispatched task of each kind completed successfully against the real running worker.
 `manage.py rematerialize_series` runs both materialization jobs synchronously, once, without
 a worker at all — the "on deploy" trigger RFC v1.0 §9.4 asks for, sharing the exact same
@@ -942,6 +1046,23 @@ the constraint was narrowed to `'confirmed'` alone, `pg_get_constraintdef` confi
 genuinely gone from the text, the exact substring check `check_schema_assertion` uses correctly
 flagged `covers_held=false`, and the `ROLLBACK` left `kairos_dev`'s real schema completely
 untouched — confirmed by a final `SELECT` showing the healthy definition restored.
+
+Observability & alerting (Phase 21) — verified live against the real Docker stack. The worker was
+rebuilt (`--build`) and its banner confirmed all three new tasks registered (`evaluate_alerts_
+task`/`send_alert_email_task`/`cleanup_idempotency_keys_task`, eleven tasks total).
+`evaluate_alerts_task` and `cleanup_idempotency_keys_task` dispatched manually against real
+`kairos_dev` both succeeded (`{"alerts_fired": [], "metrics_pruned": 0}` / `{"deleted_count": 0}`
+— genuinely healthy, nothing fabricated). `GET /api/v1/admin/dashboard` queried over real HTTP,
+authenticated as a real `operations`-role user with a freshly minted session token, returned live
+data that reflected the exact requests just made moments before (`metrics.auth_failures.by_shape.
+not_authenticated: 1` from an earlier unauthenticated curl to the same endpoint; `metrics.
+idempotency.cleanup_last_run_at` matching the just-dispatched cleanup task's timestamp) —
+`offer_cascade` still honestly `null` (never triggered this session). `GET /admin/dashboard/`
+returned a real 200 with the expected HTML shell. A real alert was fired directly against
+`kairos_dev` (`fire_or_resolve(alert_key=HOLD_REAPER, active=True, ...)`), printed a real email to
+the worker's console `EMAIL_BACKEND` (`Subject: [SEV_2] hold_reaper: alert fired`, `To: oncall@
+example.com`), transitioned `email_status` to `sent`, then was resolved — confirmed via a direct
+requery, not inferred from log lines alone.
 
 The frontend starts Phase 23.
 
@@ -1226,8 +1347,8 @@ content), and RECON-06 (parametrized across all four named background jobs — `
 with a stale/fresh heartbeat and asserted against the SAME shared `heartbeat_is_stale` function).
 RECON-07 ("every alert fired at least once by deliberate injection") is satisfied for the
 CI/automated tier by RECON-01/03/05's own genuine constraint-dropping injections (real failures,
-really caught); full alert-ROUTING (paging) verification has no infrastructure to test against
-yet (Phase 21). Verified LIVE against the real dev server, `kairos_dev`, and the real Celery
+really caught); the full RECON-07 requirement — an alert actually REACHING its target — is
+Phase 21's `tests/test_alerting.py` (see below). Verified LIVE against the real dev server, `kairos_dev`, and the real Celery
 worker (rebuilt via `docker compose up -d --build worker beat` — both new tasks registered in the
 worker's own startup banner), not just pytest: `run_reconciliation_task`/`run_schema_assertion_
 task` dispatched against real data and real `kairos_dev` state; the real
@@ -1240,8 +1361,38 @@ a healthy `kairos_dev`. RECON-05's predicate-narrowing case was ALSO verified li
 `covers_confirmed=true`/`covers_held=false` on a genuinely narrowed constraint, then confirming
 the `ROLLBACK` left the real schema completely unchanged.
 
+`tests/test_alerting.py` (Phase 21) — `fire_or_resolve`'s edge-triggering mechanics (a second
+evaluation while still active is a no-op; the condition clearing resolves it; a later re-firing
+opens a new row) and delivery (`test_a_fired_alert_sends_a_real_email_to_the_configured_
+recipient`, asserting `mail.outbox` directly). RECON-07 itself: seven `test_*_fires_and_reaches_
+its_target` tests, one per Rollout v1.0 §6.1 condition (schema_assertion FAIL, schema_assertion
+stale including RECON-05's narrowed-predicate case, reconciliation overlap, hold_reaper stale,
+offer_cascade stuck-holds — plus a dedicated false-alarm-during-quiet-period test proving the
+naive staleness trigger was genuinely replaced, not just deprioritized — series_materialization
+stale, tzdata_rematerialization FAIL, and audit_actor_unknown SEV-3), each seeding the real
+condition, calling the real `evaluate_alerts()`, and asserting both the correct `AlertEvent` and
+a real email in `mail.outbox` — automated, CI-reproducible evidence, not a manual transcript.
+`tests/test_metrics.py` — `classify_metric_type`'s full routing table; the 503 cause split proven
+at the exact unit `_handle_write_database_error` boundary for all six SQLSTATEs (three
+lock-contention, three failover) plus the sqlstate-less connection-failure case; `kairos_
+exception_handler`'s `cause`-stashing for both a 503 and a 401, proven directly as a pure
+function call; two REAL end-to-end auth-failure-shape tests over real HTTP (a malformed bearer
+token → `invalid_session_token`; a deactivated user's still-valid token → `deactivated_account`,
+proving the shape survives the FULL real `OIDCSessionAuthentication` path, not a mock); P95 via
+Postgres's real `percentile_cont`; `redis_availability()` proven true against the real running
+broker AND false against an unreachable one; `idempotency_key_stats`/`cleanup_expired_
+idempotency_keys`'s `OperationalHeartbeat` write; `audit_actor_unknown_count`'s window boundary;
+`rate_limit_metric_slot`'s explicit non-fabrication; `prune_old_request_metrics`'s retention
+boundary; and a real end-to-end proof that `MetricsMiddleware` records one row per real HTTP
+request. `tests/test_admin_dashboard.py` — permission gate (mirrors `checks/latest`'s), full
+response shape with live values, open alerts appearing and disappearing on the dashboard as
+they fire/resolve, and the HTML page's reachability without a template engine. Full suite:
+324 tests (273 + 51 new), no regressions, plus all 10 CI-tier concurrency tests re-run clean
+(428s — confirming the new `FAILOVER_SQLSTATES` branch didn't change retryable-SQLSTATE
+behavior at N=200 contention).
+
 Also runnable: `cd backend && ruff check . && ruff format --check . && mypy kairos` (all pass
-with zero findings as of Phase 20). CI (`.github/workflows/ci.yml`) runs the CI tier as three
+with zero findings as of Phase 21). CI (`.github/workflows/ci.yml`) runs the CI tier as three
 jobs — `lint`, `test`, `concurrency` (RECLAIM-04 excluded, see above) — on every PR. The spike
 scripts under `scripts/spike/` are runnable but are diagnostic, not a test suite — see
 `docs/spikes/S1-postgres-verification.md` for what each one does and its recorded output.
@@ -1416,24 +1567,25 @@ From Phase 20:
   genuinely full-scale RECON-02/08 run (matching Test Plan's literal numbers), THAT version
   belongs in the staging tier, alongside RECLAIM-04 and CONC-01's own full-scale escalation —
   not this one, and not by expanding this one in place.
-- **`offer_cascade`'s heartbeat semantics are genuinely different from the other five checks,
-  and Rollout v1.0 §6.1's own "no successful run in 90s" alert condition is awkward for it.**
-  The other five are interval-driven (a scheduled sweep that should run roughly every N
-  seconds, so silence past 2-3x N is a real signal); `offer_cascade` only runs when a
-  cancellation/decline/reclaim actually frees a range — long quiet periods with zero
-  cancellations are a NORMAL, healthy state, not staleness. This phase built the heartbeat
-  WRITE mechanism (matching Rollout's literal text) but did not resolve the underlying
-  question of whether "no run in 90s" is even the right alert condition for an event-triggered
-  job — flagged for whichever future phase (most likely 21, when real alert routing is built)
-  actually has to decide what "stale" means operationally for this one check.
-- **Full alert ROUTING (paging a human) is still entirely unbuilt** — `GET /admin/checks/latest`
-  makes every check's current state and history queryable, and `heartbeat_is_stale` makes
-  staleness computable, but nothing in this codebase yet turns a `fail` status or a stale
-  heartbeat into an actual page/Slack message/PagerDuty incident. RECON-07 ("every alert fired
-  at least once by deliberate injection") is satisfied here only for the underlying SIGNAL
-  (RECON-01/03/05's genuine constraint-dropping injections really do produce a real `fail`
-  status, really caught) — there is no alert-routing pipeline yet for a deliberate injection to
-  exercise end-to-end. Phase 21's explicit job.
+- ~~`offer_cascade`'s heartbeat semantics are genuinely different from the other five checks~~ —
+  **resolved by Phase 21**, per that phase's own explicit clarification #1: `offer_cascade`'s
+  alert no longer uses `offer_cascade_heartbeat_is_stale` ("no run in 90s") at all. The PRIMARY
+  trigger is `kairos.waitlist.services.count_stuck_held_bookings` — a live count of holds sitting
+  past `expires_at` plus `OFFER_CASCADE_STUCK_HOLD_GRACE_SECONDS`, Rollout v1.0 §6.1's own SECOND
+  named condition for this check — proven in `tests/test_alerting.py::test_offer_cascade_does_
+  not_false_alarm_during_an_ordinary_quiet_period` to genuinely not fire during ordinary silence.
+  `offer_cascade_heartbeat_is_stale` itself is UNCHANGED and still exists (unused by alerting now)
+  — not deleted, in case a future phase wants a pure staleness signal for something else.
+- ~~Full alert ROUTING (paging a human) is still entirely unbuilt~~ — **built by Phase 21**:
+  `kairos.core.alerting.evaluate_alerts` turns every `fail`/stale-heartbeat/`actor_type='unknown'`
+  signal into a real `AlertEvent` and a real email to `settings.ALERT_RECIPIENT_EMAIL`, edge-
+  triggered so an ongoing incident produces one email, not one per poll. RECON-07's full
+  requirement (an alert REACHING its target, not just the underlying signal existing) is
+  `tests/test_alerting.py`'s seven `test_*_fires_and_reaches_its_target` tests, each asserting a
+  real `mail.outbox` entry. What remains deliberately unbuilt: a real PagerDuty/Slack/on-call-
+  paging integration — no phase in the 31-phase Implementation Plan calls for one (confirmed
+  explicitly before Phase 21 began; this is a solo project) — a real deployment would point
+  `ALERT_RECIPIENT_EMAIL` at a distribution list or an email-to-page bridge instead.
 
 Genuine open questions from the source documents (offer window duration, nonexistent-time
 policy default, series bounds, etc.) are tracked in PRD v1.0 §11 and RFC v1.0 §18; they get

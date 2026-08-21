@@ -318,3 +318,180 @@ class NotificationLog(models.Model):
 
     def __str__(self) -> str:
         return f"{self.notification_type} -> {self.recipient_email} ({self.status})"
+
+
+# ============================================================
+# Alerting (Implementation Plan Phase 21; Rollout v1.0 §6.1)
+# ============================================================
+class AlertSeverity(models.TextChoices):
+    SEV_1 = "sev_1", "SEV-1"
+    SEV_2 = "sev_2", "SEV-2"
+    SEV_3 = "sev_3", "SEV-3"
+
+
+class AlertKey(models.TextChoices):
+    # The six checks Rollout v1.0 §6.1's table names, plus the
+    # actor_type='unknown' SEV-3 signal (audit trail, not a background
+    # job) — see kairos.core.alerting.evaluate_alerts, the ONE function
+    # that evaluates all seven.
+    SCHEMA_ASSERTION = "schema_assertion", "Schema assertion"
+    RECONCILIATION = "reconciliation", "Reconciliation"
+    HOLD_REAPER = "hold_reaper", "Hold reaper"
+    OFFER_CASCADE = "offer_cascade", "Offer cascade"
+    SERIES_MATERIALIZATION = "series_materialization", "Series materialization"
+    TZDATA_REMATERIALIZATION = "tzdata_rematerialization", "Tzdata re-materialization"
+    AUDIT_ACTOR_UNKNOWN = "audit_actor_unknown", "Audit actor unknown"
+
+
+class AlertDeliveryStatus(models.TextChoices):
+    PENDING = "pending", "Pending"
+    SENT = "sent", "Sent"
+    FAILED = "failed", "Failed"
+
+
+class AlertEvent(models.Model):
+    """One row per alert CONDITION firing, not per evaluation tick —
+    `kairos.core.alerting.fire_or_resolve` is the only writer, and it is
+    edge-triggered: `uniq_open_alert_per_key` (a partial unique index on
+    `resolved_at IS NULL`) makes it structurally impossible for two OPEN
+    alerts to exist for the same `alert_key` at once, so re-evaluating an
+    already-firing condition on the next `ALERT_EVALUATION_INTERVAL_
+    SECONDS` tick is a no-op rather than a second email. The condition
+    clearing sets `resolved_at`; a later re-firing opens a NEW row (never
+    reuses the old one), so the full history of when each alert fired and
+    cleared survives, the same "append, don't overwrite" instinct
+    `audit_log`/`system_check_run` already apply to different tables.
+
+    Delivery fields (`email_status`/`email_attempts`/`email_last_error`/
+    `email_sent_at`) mirror `NotificationLog`'s shape exactly, reused here
+    directly rather than routed through `NotificationLog` itself — an
+    alert's recipient is a fixed operator mailbox (`settings.
+    ALERT_RECIPIENT_EMAIL`), not an `AppUser`, and `NotificationLog.
+    recipient_user_id` is a real user id by that table's own docstring.
+    """
+
+    Severity = AlertSeverity
+    Key = AlertKey
+    DeliveryStatus = AlertDeliveryStatus
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    alert_key = models.TextField(choices=AlertKey.choices)
+    severity = models.TextField(choices=AlertSeverity.choices)
+    message = models.TextField()
+    context = models.JSONField(default=dict, encoder=DjangoJSONEncoder)
+    fired_at = models.DateTimeField(db_default=Now())
+    resolved_at = models.DateTimeField(null=True, blank=True)
+    email_status = models.TextField(
+        choices=AlertDeliveryStatus.choices, default=AlertDeliveryStatus.PENDING
+    )
+    email_attempts = models.IntegerField(default=0)
+    email_last_error = models.TextField(null=True, blank=True)  # noqa: DJ001
+    email_sent_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "alert_event"
+        constraints = [
+            models.CheckConstraint(
+                condition=models.Q(alert_key__in=list(AlertKey.values)),
+                name="alert_event_key_check",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(severity__in=list(AlertSeverity.values)),
+                name="alert_event_severity_check",
+            ),
+            models.UniqueConstraint(
+                fields=["alert_key"],
+                condition=models.Q(resolved_at__isnull=True),
+                name="uniq_open_alert_per_key",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["alert_key", "-fired_at"], name="idx_alert_event_key"),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.alert_key} ({self.severity}) fired {self.fired_at}"
+
+
+# ============================================================
+# Metrics (Implementation Plan Phase 21; Rollout v1.0 §6.2)
+# ============================================================
+class RequestMetricType(models.TextChoices):
+    BOOKING_WRITE = "booking_write", "Booking write"
+    AVAILABILITY_READ = "availability_read", "Availability read"
+    AUTH_FAILURE = "auth_failure", "Auth failure"
+    OTHER = "other", "Other"
+
+
+class RequestMetric(models.Model):
+    """One row per HTTP request (`kairos.core.middleware.
+    MetricsMiddleware`), read back by `kairos.core.metrics` for every
+    rolling-window rate/percentile the dashboard shows — booking-write and
+    availability-read P95 latency, the 503 rate split by cause, and the
+    auth-failure rate by shape. No metrics/time-series library exists in
+    this project (pyproject.toml has none); every aggregate is computed
+    live, by query, over `METRICS_WINDOW_SECONDS`, the same "derive from
+    real stored data, don't precompute" choice `heartbeat_is_stale`/
+    `GET /admin/checks/latest` already made for staleness.
+
+    `cause` is null for an ordinary request; populated for a 503
+    (`ServiceUnavailableError.cause`: "lock_contention" or "failover") or
+    an `auth_failure`-typed row (the failure shape — see `kairos.core.drf.
+    _auth_failure_shape`). `BigAutoField`, not a UUID: this table is
+    request-volume-scale and gets pruned on
+    `REQUEST_METRIC_RETENTION_HOURS` — no downstream reference ever needs
+    a row's id to be globally unique or non-guessable, unlike an audit
+    entity.
+    """
+
+    Type = RequestMetricType
+
+    id = models.BigAutoField(primary_key=True)
+    metric_type = models.TextField(choices=RequestMetricType.choices)
+    method = models.TextField()
+    path = models.TextField()
+    status_code = models.IntegerField()
+    duration_ms = models.IntegerField(null=True, blank=True)
+    cause = models.TextField(null=True, blank=True)  # noqa: DJ001
+    recorded_at = models.DateTimeField(db_default=Now())
+
+    class Meta:
+        db_table = "request_metric"
+        constraints = [
+            models.CheckConstraint(
+                condition=models.Q(metric_type__in=list(RequestMetricType.values)),
+                name="request_metric_type_check",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["metric_type", "-recorded_at"], name="idx_request_metric_type"),
+            models.Index(fields=["status_code", "-recorded_at"], name="idx_request_metric_status"),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.method} {self.path} -> {self.status_code}"
+
+
+class OperationalHeartbeat(models.Model):
+    """A generic heartbeat slot for an operational job that is NOT one of
+    the six `system_check_run.check_name` values — that table's own CHECK
+    constraint is deliberately closed to exactly six (Implementation Plan
+    Phase 21 Scope IN names "all six checks," not a seventh). Used today
+    for `kairos.core.management.commands.cleanup_idempotency_keys`
+    (scheduled for the first time this phase — see that command's own
+    docstring, written in Phase 5, naming Phase 21 explicitly). `name` is
+    the primary key: one row per named job, upserted via `update_or_
+    create`, not one row per run — there is no history requirement here
+    the way `system_check_run`'s append-only shape serves; only "when did
+    this last succeed" is ever asked.
+    """
+
+    name = models.TextField(primary_key=True)
+    last_run_at = models.DateTimeField()
+    findings = models.JSONField(default=dict, encoder=DjangoJSONEncoder)
+
+    class Meta:
+        db_table = "operational_heartbeat"
+
+    def __str__(self) -> str:
+        return f"{self.name} @ {self.last_run_at}"

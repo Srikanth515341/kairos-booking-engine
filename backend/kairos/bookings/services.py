@@ -16,7 +16,7 @@ from django.db import DatabaseError, connection, transaction
 from django.utils import timezone
 
 from kairos.bookings.models import Booking, BookingStatus, RecurringSeries
-from kairos.core.constants import OFFER_WINDOW_MINUTES
+from kairos.core.constants import FAILOVER_RETRY_AFTER_SECONDS, OFFER_WINDOW_MINUTES
 from kairos.core.db import apply_write_path_session_settings
 from kairos.core.exceptions import ServiceUnavailableError, SlotUnavailableError
 from kairos.core.models import AuditActorType
@@ -45,6 +45,18 @@ DEADLOCK_DETECTED = "40P01"
 QUERY_CANCELED = "57014"
 RETRYABLE_SQLSTATES = frozenset({LOCK_TIMEOUT, DEADLOCK_DETECTED, QUERY_CANCELED})
 
+# Class 57 "operator intervention" — the primary shut down, crashed, or is
+# refusing new connections mid-election (Rollout v1.0 §6.2's "failover"
+# shape, needing the OPPOSITE client response from lock contention: a
+# longer wait, not an immediate hammering retry). 57014 (query_canceled,
+# statement_timeout) is deliberately NOT in this set — it's contention-
+# shaped (see RETRYABLE_SQLSTATES's own comment), not a failover signal,
+# despite sharing the same "57" class prefix.
+ADMIN_SHUTDOWN = "57P01"
+CRASH_SHUTDOWN = "57P02"
+CANNOT_CONNECT_NOW = "57P03"
+FAILOVER_SQLSTATES = frozenset({ADMIN_SHUTDOWN, CRASH_SHUTDOWN, CANNOT_CONNECT_NOW})
+
 
 def _handle_write_database_error(exc: DatabaseError, log_context: dict[str, str]) -> NoReturn:
     """Shared SQLSTATE translation for every write path (create, cancel,
@@ -62,7 +74,26 @@ def _handle_write_database_error(exc: DatabaseError, log_context: dict[str, str]
             "booking_retryable_failure",
             extra={**log_context, "outcome": "service_unavailable", "sqlstate": sqlstate},
         )
-        raise ServiceUnavailableError from exc
+        raise ServiceUnavailableError(cause="lock_contention") from exc
+
+    # A genuine connection-level failure (the server closed the connection,
+    # refused it outright, or is mid-failover) surfaces via psycopg as a
+    # DatabaseError with NO sqlstate at all — SQLSTATEs come from a server
+    # response, and a connection that never reached the server has none.
+    # Bucketed with the explicit Class 57 codes above as "failover-shaped":
+    # broad by design (Implementation Plan Phase 21; mirrors kairos.
+    # waitlist.tasks.dispatch_cascade's own documented broad-except
+    # tradeoff) — enumerating every possible connection-layer exception
+    # risks missing one and silently reintroducing an unhandled 500 for
+    # exactly the outage this branch exists to degrade gracefully from.
+    if sqlstate in FAILOVER_SQLSTATES or sqlstate is None:
+        logger.error(
+            "booking_failover_shaped_failure",
+            extra={**log_context, "outcome": "service_unavailable", "sqlstate": sqlstate},
+        )
+        raise ServiceUnavailableError(
+            retry_after_seconds=FAILOVER_RETRY_AFTER_SECONDS, cause="failover"
+        ) from exc
 
     raise exc
 

@@ -6,7 +6,9 @@ from pathlib import Path
 import dj_database_url
 
 from kairos.core.constants import (
+    ALERT_EVALUATION_INTERVAL_SECONDS,
     HOLD_REAPER_INTERVAL_SECONDS,
+    IDEMPOTENCY_CLEANUP_INTERVAL_SECONDS,
     RECONCILIATION_INTERVAL_SECONDS,
     ROLLING_MATERIALIZATION_INTERVAL_SECONDS,
     SCHEMA_ASSERTION_INTERVAL_SECONDS,
@@ -84,6 +86,11 @@ INSTALLED_APPS = [
 
 MIDDLEWARE = [
     "kairos.core.middleware.RequestIdMiddleware",
+    # Implementation Plan Phase 21; Rollout v1.0 §6.2 — after
+    # RequestIdMiddleware deliberately (request.request_id must already
+    # exist, even though this middleware doesn't currently consume it,
+    # matching MIDDLEWARE's own documented ordering rule).
+    "kairos.core.middleware.MetricsMiddleware",
 ]
 
 ROOT_URLCONF = "kairos.urls"
@@ -187,6 +194,14 @@ CELERY_BEAT_SCHEDULE = {
         "task": "kairos.core.tasks.run_schema_assertion_task",
         "schedule": SCHEMA_ASSERTION_INTERVAL_SECONDS,
     },
+    "evaluate-alerts": {
+        "task": "kairos.core.tasks.evaluate_alerts_task",
+        "schedule": ALERT_EVALUATION_INTERVAL_SECONDS,
+    },
+    "cleanup-idempotency-keys": {
+        "task": "kairos.core.tasks.cleanup_idempotency_keys_task",
+        "schedule": IDEMPOTENCY_CLEANUP_INTERVAL_SECONDS,
+    },
 }
 
 # ============================================================
@@ -211,3 +226,14 @@ EMAIL_HOST_USER = os.environ.get("SMTP_USER", "")
 EMAIL_HOST_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
 EMAIL_USE_TLS = True
 DEFAULT_FROM_EMAIL = os.environ.get("NOTIFICATIONS_FROM_EMAIL", "kairos@example.com")
+
+# ============================================================
+# Alerting (Implementation Plan Phase 21; Rollout v1.0 §6.1)
+# ============================================================
+# Every alert (kairos.core.alerting) is delivered as a plain-text email to
+# this single operator mailbox via the SAME EMAIL_BACKEND above — not a
+# new channel/integration (no PagerDuty/Slack anywhere in the
+# Implementation Plan; this is a solo project, per explicit instruction
+# this phase). A real deployment would point this at a distribution list
+# or an email-to-page bridge; nothing in this codebase assumes which.
+ALERT_RECIPIENT_EMAIL = os.environ.get("ALERT_RECIPIENT_EMAIL", "oncall@example.com")

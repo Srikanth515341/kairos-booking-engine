@@ -19,10 +19,13 @@ closes.
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 from typing import Any
 
 from django.db import connection
 
+from kairos.core.constants import SCHEMA_ASSERTION_STALE_THRESHOLD_SECONDS
+from kairos.core.heartbeat import heartbeat_is_stale
 from kairos.core.models import SystemCheckRun
 
 logger = logging.getLogger(__name__)
@@ -98,3 +101,24 @@ def check_schema_assertion() -> dict[str, Any]:
         check_name=SystemCheckRun.CheckName.SCHEMA_ASSERTION, status=status, findings=findings
     )
     return findings
+
+
+def schema_assertion_heartbeat_is_stale(
+    *,
+    now: datetime | None = None,
+    threshold_seconds: int = SCHEMA_ASSERTION_STALE_THRESHOLD_SECONDS,
+) -> bool:
+    """Rollout v1.0 §6.1: schema_assertion alerts on "fails, OR no run in
+    2x interval" — the FAIL half is `check_schema_assertion`'s own
+    `status` field (read directly by `kairos.core.alerting.
+    evaluate_alerts`); this is the staleness half, previously missing
+    despite `SCHEMA_ASSERTION_STALE_THRESHOLD_SECONDS` already existing as
+    a named constant since Phase 20 with no caller (Implementation Plan
+    Phase 21 closes that gap — the constant was defined ahead of its own
+    consumer, the same "mechanism before its real caller" pattern this
+    project has used repeatedly, e.g. `actor_type='system'`, Phase 8→13).
+    Delegates to the one shared `heartbeat_is_stale`, exactly like
+    `hold_reaper_heartbeat_is_stale`/`series_materialization_heartbeat_is_
+    stale`/`tzdata_rematerialization_heartbeat_is_stale`.
+    """
+    return heartbeat_is_stale(SystemCheckRun.CheckName.SCHEMA_ASSERTION, threshold_seconds, now=now)

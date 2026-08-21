@@ -18,8 +18,10 @@ from django.utils import timezone as django_timezone
 from kairos.bookings.models import Booking, BookingStatus
 from kairos.bookings.services import BookingCreateRequest, create_booking
 from kairos.core.constants import (
+    FAILOVER_RETRY_AFTER_SECONDS,
     HOLD_REAPER_INTERVAL_SECONDS,
     OFFER_CASCADE_STALE_THRESHOLD_SECONDS,
+    OFFER_CASCADE_STUCK_HOLD_GRACE_SECONDS,
 )
 from kairos.core.db import apply_write_path_session_settings
 from kairos.core.exceptions import (
@@ -54,6 +56,11 @@ UNIQUE_VIOLATION = "23505"
 # module's KEY_CLAIM_CONTENDED_SQLSTATES): the SET of codes is identical,
 # but what they mean is specific to which statement raised them.
 RETRYABLE_SQLSTATES = frozenset({"55P03", "40P01", "57014"})
+
+# Same failover-shaped bucket as kairos.bookings.services.FAILOVER_
+# SQLSTATES (Implementation Plan Phase 21; Rollout v1.0 §6.2) — duplicated
+# for the identical reason RETRYABLE_SQLSTATES already is here.
+FAILOVER_SQLSTATES = frozenset({"57P01", "57P02", "57P03"})
 
 
 def slot_is_free(resource: Resource, start: datetime.datetime, end: datetime.datetime) -> bool:
@@ -151,7 +158,15 @@ def join_waitlist(req: WaitlistJoinRequest) -> WaitlistEntry:
                 "waitlist_join_retryable_failure",
                 extra={**log_context, "outcome": "service_unavailable", "sqlstate": sqlstate},
             )
-            raise ServiceUnavailableError from exc
+            raise ServiceUnavailableError(cause="lock_contention") from exc
+        if sqlstate in FAILOVER_SQLSTATES or sqlstate is None:
+            logger.error(
+                "waitlist_join_failover_shaped_failure",
+                extra={**log_context, "outcome": "service_unavailable", "sqlstate": sqlstate},
+            )
+            raise ServiceUnavailableError(
+                retry_after_seconds=FAILOVER_RETRY_AFTER_SECONDS, cause="failover"
+            ) from exc
         raise
 
     logger.info(
@@ -598,3 +613,42 @@ def offer_cascade_heartbeat_is_stale(
     docstring for why one shared function, not five bespoke ones).
     """
     return heartbeat_is_stale(SystemCheckRun.CheckName.OFFER_CASCADE, threshold_seconds, now=now)
+
+
+def count_stuck_held_bookings(
+    *,
+    now: datetime.datetime | None = None,
+    grace_seconds: int = OFFER_CASCADE_STUCK_HOLD_GRACE_SECONDS,
+) -> dict[str, Any]:
+    """Rollout v1.0 §6.1's SECOND `offer_cascade` alert condition — "any
+    offer active past expires_at + 5 min grace" — used as the PRIMARY
+    alert trigger for this check (Implementation Plan Phase 21's own
+    clarification #1, recorded in CLAUDE.md's Key Technical Decisions):
+    `offer_cascade_heartbeat_is_stale`'s "no run in 90s" false-alarms
+    during ordinary quiet periods, since this job only runs when a
+    cancellation/decline/reclaim actually frees a range — long silence is
+    normal, not a failure.
+
+    A hold still sitting `status='held'` this far past its OWN
+    `expires_at` means BOTH reclamation mechanisms (RFC v1.0 §10.4:
+    cleanup-on-write, the periodic reaper) have failed to reach it — the
+    reaper alone normally clears an expired hold within
+    `HOLD_REAPER_INTERVAL_SECONDS` (30s by default), so a grace period an
+    order of magnitude larger is a genuine incident signal, not ordinary
+    sweep jitter. Computed live by query every time this is called
+    (`kairos.core.alerting.evaluate_alerts`), not from a stored heartbeat
+    — there is nothing to go stale here, only a live count that is either
+    zero or isn't.
+    """
+    now = now or django_timezone.now()
+    cutoff = now - datetime.timedelta(seconds=grace_seconds)
+    stuck_ids = list(
+        Booking.objects.filter(status=BookingStatus.HELD, expires_at__lt=cutoff).values_list(
+            "id", flat=True
+        )
+    )
+    return {
+        "stuck_held_bookings": len(stuck_ids),
+        "stuck_booking_ids": [str(bid) for bid in stuck_ids],
+        "grace_seconds": grace_seconds,
+    }
