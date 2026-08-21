@@ -70,3 +70,14 @@ OFFER_WINDOW_MINUTES = int(os.environ.get("OFFER_WINDOW_MINUTES", "15"))
 # cost at real waitlist volume — RFC's own "tune from observed volume" note,
 # 30s is the initial proposal.
 HOLD_REAPER_INTERVAL_SECONDS = int(os.environ.get("HOLD_REAPER_INTERVAL_SECONDS", "30"))
+
+# Notification delivery retry (Implementation Plan Phase 18; PRD FR55 —
+# "delivery failure must not roll back or block the underlying state
+# transition, but must be recorded and retried"). Exponential backoff via
+# Celery's own retry_backoff (kairos.core.tasks.send_notification_task) —
+# a transient SMTP outage should be retried with growing spacing, not
+# hammered immediately or abandoned after one attempt.
+NOTIFICATION_MAX_RETRIES = int(os.environ.get("NOTIFICATION_MAX_RETRIES", "5"))
+NOTIFICATION_RETRY_BACKOFF_MAX_SECONDS = int(
+    os.environ.get("NOTIFICATION_RETRY_BACKOFF_MAX_SECONDS", "600")
+)

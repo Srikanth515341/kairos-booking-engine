@@ -211,3 +211,104 @@ class SystemCheckRun(models.Model):
 
     def __str__(self) -> str:
         return f"{self.check_name} @ {self.run_at} ({self.status})"
+
+
+class NotificationType(models.TextChoices):
+    # The four notification points Implementation Plan Phase 18 / PRD
+    # FR52-55 name. No corresponding schema exists in Spec v1.0 §3 at
+    # all (zero occurrences of "notification" in that document) — the
+    # same kind of gap Phase 9's user_group table filled; this is the
+    # minimal schema PRD FR55's "recorded and retried" concretely needs.
+    OFFER_CREATED = "offer_created", "Offer created"
+    ADMIN_CANCELLATION = "admin_cancellation", "Admin cancellation"
+    TZDATA_REMATERIALIZATION = "tzdata_rematerialization", "Tzdata re-materialization"
+    # Not literally the same PRD FR as the row above — a re-materialization
+    # CONFLICT (occurrence could not be recomputed, human decision needed,
+    # PRD FR13b) is a different audience (owner AND resource admin) and a
+    # different message than a successful, silent time change. kairos.
+    # bookings.tasks.rematerialize_stale_series already recorded conflicts
+    # as "needing notification" since Phase 13 — this type is what fulfills
+    # that promise, not new scope invented this phase.
+    TZDATA_REMATERIALIZATION_CONFLICT = (
+        "tzdata_rematerialization_conflict",
+        "Tzdata re-materialization conflict",
+    )
+    # No real caller yet — Rollout v1.0 §4.5's hold-release procedure is a
+    # manual operational runbook (SQL an operator runs during an incident),
+    # not application code any phase has built. Built standalone this
+    # phase per its own explicit instruction: the TEMPLATE and send
+    # mechanism must exist and be independently testable, but inventing a
+    # fake trigger path just to have a caller would be scope beyond this
+    # phase's actual job. See CLAUDE.md Open Questions.
+    ROLLBACK_HOLD_RELEASED = "rollback_hold_released", "Rollback hold released"
+
+
+class NotificationStatus(models.TextChoices):
+    PENDING = "pending", "Pending"
+    SENT = "sent", "Sent"
+    FAILED = "failed", "Failed"
+
+
+class NotificationLog(models.Model):
+    """PRD FR55's actual mechanism: "delivery failure must not roll back
+    or block the underlying state transition, but must be recorded and
+    retried." Written EXCLUSIVELY by `send_notification_task`
+    (kairos.core.tasks) INSIDE the worker that attempts delivery — never
+    by the service-layer functions that trigger a notification
+    (kairos.core.notifications' `notify_*` functions), which only build
+    the message and enqueue. That split is what keeps every notification
+    dispatch call sync-free from the request path (RFC v1.0 §15a): the
+    request thread (or the on_commit callback it registers) only ever
+    calls `.delay()`, never touches this table.
+
+    No FK to `app_user` for `recipient_user_id` — the SAME reasoning as
+    `AuditLog.actor_id` (Phase 8): a `RESTRICT`-on-delete FK would let a
+    notification's own historical record block a user's eventual
+    offboarding (Phase 19), and this table must survive independently of
+    whether the recipient still exists.
+    """
+
+    Type = NotificationType
+    Status = NotificationStatus
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    notification_type = models.TextField(choices=NotificationType.choices)
+    recipient_user_id = models.UUIDField()
+    recipient_email = models.TextField()
+    subject = models.TextField()
+    body = models.TextField()
+    # Structured payload behind the rendered subject/body — lets tests
+    # assert on specific facts (e.g. the exact expiry instant, PRD FR52)
+    # without parsing prose, and gives a future retry/replay tool
+    # something machine-readable to work from.
+    context = models.JSONField(default=dict, encoder=DjangoJSONEncoder)
+    status = models.TextField(
+        choices=NotificationStatus.choices, default=NotificationStatus.PENDING
+    )
+    attempts = models.IntegerField(default=0)
+    last_error = models.TextField(null=True, blank=True)  # noqa: DJ001
+    request_id = models.TextField(null=True, blank=True)  # noqa: DJ001
+    created_at = models.DateTimeField(db_default=Now())
+    sent_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "notification_log"
+        constraints = [
+            models.CheckConstraint(
+                condition=models.Q(notification_type__in=list(NotificationType.values)),
+                name="notification_log_type_check",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(status__in=list(NotificationStatus.values)),
+                name="notification_log_status_check",
+            ),
+        ]
+        indexes = [
+            models.Index(
+                fields=["recipient_user_id", "-created_at"], name="idx_notification_recipient"
+            ),
+            models.Index(fields=["notification_type", "-created_at"], name="idx_notification_type"),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.notification_type} -> {self.recipient_email} ({self.status})"

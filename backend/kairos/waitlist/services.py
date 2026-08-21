@@ -27,6 +27,7 @@ from kairos.core.exceptions import (
     SlotUnavailableError,
 )
 from kairos.core.models import AuditActorType, SystemCheckRun
+from kairos.core.notifications import notify_offer_created
 from kairos.identity.models import AppUser
 from kairos.resources.models import Resource
 
@@ -279,6 +280,23 @@ def create_offer_for_freed_range(
         logger.info(
             "waitlist_offer_created",
             extra={**log_context, "offer_id": str(offer.id), "entry_id": str(entry.id)},
+        )
+        # PRD FR52 / Implementation Plan Phase 18. Called directly, not
+        # deferred via transaction.on_commit(): this function is never
+        # itself wrapped in an open transaction.atomic() (the hold's own
+        # commit already happened inside create_booking, above; the two
+        # statements right above this one are plain autocommitted writes)
+        # — there is no later rollback that could un-free what this
+        # notification describes, the same reasoning that already lets
+        # reap_expired_holds call this whole function directly rather
+        # than through an on_commit deferral.
+        notify_offer_created(
+            recipient=entry.user,
+            resource_name=resource.name,
+            start=entry_start,
+            end=entry_end,
+            expires_at=hold.expires_at,
+            request_id=request_id,
         )
         return offer
 

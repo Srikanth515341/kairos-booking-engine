@@ -136,6 +136,13 @@ waitlist along even when nobody happens to be booking anything at that moment. V
 a real outage, not a simulated one: with Redis actually stopped, booking creation and
 cancellation still succeed, a booking over an expired hold still succeeds, and the only thing
 that degrades is exactly the one thing that should — no new offer goes out until Redis is back.
+And every one of those events now actually reaches someone (Phase 18): a waitlist offer states
+its expiry explicitly, an administrative cancellation includes the reason, and a timezone-rule
+change tells you exactly how your recurring time moved — all dispatched from a background
+worker, never from inside the request that triggered them, so a slow or failing email provider
+can never turn a successful cancellation into an apparent request failure. A delivery failure
+is retried with exponential backoff and recorded, not silently dropped or silently retried
+forever.
 See
 [`CLAUDE.md`](CLAUDE.md) for exactly what is and isn't built, and
 [`docs/06-implementation-plan.md`](docs/06-implementation-plan.md) for the full 31-phase
@@ -354,8 +361,7 @@ pytest
 | Holds occupy the exclusion domain | **Live** — proven under concurrency (HOLD-01/02/03) (Phase 15) |
 | Waitlist offers — creation, cascade, accept, decline | **Live** — hold-before-offer (PRD FR23), atomic accept, decline-and-cascade (WL-01/02/03) 🏁 Milestone 3 (Phase 16) |
 | Hold reclamation (reaper + cleanup-on-write) | **Live** — both RFC §10.4 mechanisms, verified against a real Redis outage (RECLAIM-01–04, WL-05/06) (Phase 17) |
-| Notification dispatch | Not started (Phase 18) |
-| Notifications | Not started (Phase 18) |
+| Notifications | **Live** — offer/admin-cancellation/re-materialization dispatch, async-only, retried with backoff and recorded (PRD FR52–55) (Phase 18) |
 | Admin & offboarding | Not started (Phase 19) |
 | Production correctness monitoring | Not started (Phase 20–21) |
 | Frontend | Not started (Phase 23–27) |

@@ -33,7 +33,9 @@ from kairos.bookings.services import (
 from kairos.core.constants import MAX_ADVANCE_HORIZON_DAYS
 from kairos.core.exceptions import SlotUnavailableError
 from kairos.core.models import AuditActorType, SystemCheckRun
+from kairos.core.notifications import notify_rematerialization, notify_rematerialization_conflict
 from kairos.core.timezones import tzdata_version
+from kairos.identity.models import ResourceAdmin
 
 logger = logging.getLogger(__name__)
 
@@ -199,6 +201,7 @@ def rematerialize_stale_series(*, now: datetime | None = None) -> dict[str, Any]
             ):
                 continue  # unaffected by the rule change
 
+            old_start, old_end = booking.time_range.lower, booking.time_range.upper
             try:
                 edit_booking(
                     BookingEditRequest(
@@ -219,6 +222,22 @@ def rematerialize_stale_series(*, now: datetime | None = None) -> dict[str, Any]
                         "user_id": str(booking.user_id),
                     },
                 )
+                # PRD FR54 / Implementation Plan Phase 18. Called directly
+                # — this function has no open transaction of its own
+                # around it (each occurrence's edit_booking call already
+                # committed independently, mirroring confirm_recurring_
+                # series/rolling_materialize_series's own per-occurrence
+                # isolation), so there is nothing left that could roll
+                # back and un-happen what this notification describes.
+                notify_rematerialization(
+                    recipient=booking.user,
+                    resource_name=series.resource.name,
+                    old_start=old_start,
+                    old_end=old_end,
+                    new_start=closest.start,
+                    new_end=closest.end,
+                    request_id=request_id,
+                )
             except SlotUnavailableError:
                 series_had_conflict = True
                 conflicts.append(
@@ -228,7 +247,7 @@ def rematerialize_stale_series(*, now: datetime | None = None) -> dict[str, Any]
                         "occurrence_date": closest.occurrence_date.isoformat(),
                         "notify": {
                             "series_owner": str(series.created_by_id),
-                            "resource_administrators": "pending Phase 18 delivery",
+                            "resource_administrators": "notified",
                         },
                     }
                 )
@@ -240,6 +259,28 @@ def rematerialize_stale_series(*, now: datetime | None = None) -> dict[str, Any]
                         "booking_id": str(booking.id),
                     },
                 )
+                # PRD FR13b: surfaced for human decision, not
+                # auto-resolved — sent to the series owner AND every
+                # resource administrator for THIS resource specifically
+                # (kairos.identity.authorization's own scoped-admin
+                # principle: an admin for a different resource has no
+                # reason to hear about this one). Closes the
+                # "resource_administrators: pending Phase 18 delivery"
+                # placeholder this function's conflict-recording has
+                # carried since Phase 13.
+                conflict_recipients = {series.created_by} | {
+                    grant.user
+                    for grant in ResourceAdmin.objects.filter(
+                        resource_id=series.resource_id
+                    ).select_related("user")
+                }
+                for recipient in conflict_recipients:
+                    notify_rematerialization_conflict(
+                        recipient=recipient,
+                        resource_name=series.resource.name,
+                        occurrence_date=closest.occurrence_date.isoformat(),
+                        request_id=request_id,
+                    )
 
         if not series_had_conflict:
             RecurringSeries.objects.filter(id=series.id).update(tzdata_version=current_version)

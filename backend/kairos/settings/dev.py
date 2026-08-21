@@ -10,3 +10,9 @@ ALLOWED_HOSTS: list[str] = ["localhost", "127.0.0.1"]
 # same one prod uses, just against a local stand-in identity provider
 # instead of a real one.
 KAIROS_OIDC_MOCK_ENABLED = True
+
+# Prints every notification to stdout instead of a real SMTP send
+# (Implementation Plan Phase 18) — no transactional-email provider
+# required to run this project locally, matching the mock-OIDC-issuer
+# precedent immediately above.
+EMAIL_BACKEND = "django.core.mail.backends.console.EmailBackend"
