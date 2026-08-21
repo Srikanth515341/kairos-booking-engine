@@ -45,11 +45,23 @@ class ServiceUnavailableError(Exception):
     SQLSTATE 55P03 (lock timeout), 40P01 (deadlock), or 57014 (statement
     timeout fired while waiting on contention). All three are retryable and
     map identically to 503 `service_unavailable` + `Retry-After`.
+
+    `cause` (Implementation Plan Phase 21; Rollout v1.0 §6.2) distinguishes
+    two SHAPES of 503 that need OPPOSITE client behavior: "lock_contention"
+    (the default — 55P03/40P01/57014, ordinary contention, a short retry is
+    correct) versus "failover" (a connection-level failure or a Class 57
+    operator-intervention SQLSTATE — the primary may be mid-election, and
+    hammering it immediately is the wrong response). Carried through to
+    `kairos.core.drf.kairos_exception_handler`, which stashes it onto the
+    response for `kairos.core.middleware.MetricsMiddleware` to record —
+    this is what makes "503 rate split by cause" a real, queryable metric
+    instead of two identical exceptions indistinguishable after the fact.
     """
 
-    def __init__(self, retry_after_seconds: int = 1) -> None:
+    def __init__(self, retry_after_seconds: int = 1, cause: str = "lock_contention") -> None:
         super().__init__("service outcome unknown — retry the same request")
         self.retry_after_seconds = retry_after_seconds
+        self.cause = cause
 
 
 class NotFoundError(Exception):

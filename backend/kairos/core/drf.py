@@ -59,6 +59,23 @@ def build_error_envelope(
     }
 
 
+def _auth_failure_shape(exc: Exception) -> str:
+    """Rollout v1.0 §6.2 / Implementation Plan Phase 21: "auth failure
+    rate by shape (narrow = probing, broad = provider issue)." Each raise
+    site in kairos.identity.authentication now passes an explicit `code=`
+    on its `AuthenticationFailed(...)` — DRF wraps a single string
+    `detail` in an `ErrorDetail`, which carries that code as `.code`. A
+    bare `NotAuthenticated` (no credentials offered at all — no
+    authenticator matched) has no such site-supplied code; DRF itself
+    defaults it to `"not_authenticated"`, which is itself a meaningful,
+    distinct shape (a client that never sent an Authorization header at
+    all, as opposed to one that sent a bad one).
+    """
+    detail = getattr(exc, "detail", None)
+    code = getattr(detail, "code", None)
+    return str(code) if code else "unknown"
+
+
 def _map_drf_exception(exc: Exception) -> tuple[str, str]:
     if isinstance(exc, drf_exceptions.ValidationError):
         return "validation_error", "The request failed validation."
@@ -97,6 +114,13 @@ def kairos_exception_handler(exc: Exception, context: dict[str, Any]) -> Respons
             status=503,
         )
         response["Retry-After"] = str(exc.retry_after_seconds)
+        # Rollout v1.0 §6.2 / Implementation Plan Phase 21: "503 rate split
+        # by cause (lock timeout vs. failover)." Not a header or body field
+        # (neither is part of Spec v1.0 §6's envelope) — a plain attribute
+        # kairos.core.middleware.MetricsMiddleware reads back off the
+        # response object itself, after this handler returns, to populate
+        # the one RequestMetric row it writes per request.
+        response.kairos_error_cause = exc.cause  # type: ignore[attr-defined]
         return response
 
     if isinstance(exc, RequestInProgressError):
@@ -195,4 +219,9 @@ def kairos_exception_handler(exc: Exception, context: dict[str, Any]) -> Respons
     code, message = _map_drf_exception(exc)
     details = default_response.data if isinstance(exc, drf_exceptions.ValidationError) else None
     default_response.data = build_error_envelope(code, message, details, request_id)
+    if isinstance(exc, (drf_exceptions.NotAuthenticated, drf_exceptions.AuthenticationFailed)):
+        # Same mechanism as the ServiceUnavailableError branch above, for
+        # the same reason: MetricsMiddleware reads this back to populate
+        # RequestMetric.cause for "auth failure rate by shape."
+        default_response.kairos_error_cause = _auth_failure_shape(exc)  # type: ignore[attr-defined]
     return default_response

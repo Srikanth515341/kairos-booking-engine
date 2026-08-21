@@ -17,7 +17,12 @@ from typing import Any
 
 from celery import shared_task
 
-from kairos.core.constants import NOTIFICATION_MAX_RETRIES, NOTIFICATION_RETRY_BACKOFF_MAX_SECONDS
+from kairos.core.constants import (
+    ALERT_EMAIL_MAX_RETRIES,
+    ALERT_EMAIL_RETRY_BACKOFF_MAX_SECONDS,
+    NOTIFICATION_MAX_RETRIES,
+    NOTIFICATION_RETRY_BACKOFF_MAX_SECONDS,
+)
 from kairos.core.reconciliation import check_reconciliation
 from kairos.core.schema_assertion import check_schema_assertion
 from kairos.core.tzdata_check import check_tzdata_drift
@@ -128,3 +133,51 @@ def run_reconciliation_task() -> dict[str, Any]:
 @shared_task(name="kairos.core.tasks.run_schema_assertion_task")
 def run_schema_assertion_task() -> dict[str, Any]:
     return check_schema_assertion()
+
+
+@shared_task(name="kairos.core.tasks.evaluate_alerts_task")
+def evaluate_alerts_task() -> dict[str, Any]:
+    """Implementation Plan Phase 21 — the alert-evaluation heartbeat
+    (`ALERT_EVALUATION_INTERVAL_SECONDS`). Also prunes expired
+    `RequestMetric` rows on the same tick rather than a second Beat entry
+    (see `kairos.core.metrics.prune_old_request_metrics`'s own docstring).
+    """
+    from kairos.core.alerting import evaluate_alerts
+    from kairos.core.metrics import prune_old_request_metrics
+
+    fired = evaluate_alerts()
+    pruned = prune_old_request_metrics()
+    return {"alerts_fired": [e.alert_key for e in fired], "metrics_pruned": pruned}
+
+
+@shared_task(
+    bind=True,
+    name="kairos.core.tasks.send_alert_email_task",
+    # Mirrors send_notification_task's own retry configuration exactly —
+    # an alert email is delivered through the identical EMAIL_BACKEND
+    # mechanism and deserves the identical "recorded and retried"
+    # treatment PRD FR55 requires of a user-facing notification.
+    autoretry_for=(Exception,),
+    retry_backoff=True,
+    retry_backoff_max=ALERT_EMAIL_RETRY_BACKOFF_MAX_SECONDS,
+    retry_jitter=True,
+    max_retries=ALERT_EMAIL_MAX_RETRIES,
+)
+def send_alert_email_task(self: Any, alert_event_id: str) -> None:
+    # Deferred import — same circular-import shape as send_notification_
+    # task's own deferred import of _execute_notification_delivery.
+    from kairos.core.alerting import _execute_alert_email_delivery
+
+    _execute_alert_email_delivery(alert_event_id)
+
+
+@shared_task(name="kairos.core.tasks.cleanup_idempotency_keys_task")
+def cleanup_idempotency_keys_task() -> dict[str, int]:
+    """The schedule `kairos.core.management.commands.
+    cleanup_idempotency_keys`'s own docstring deferred to "Phase 21's
+    job" since Phase 5 — calls the SAME `cleanup_expired_idempotency_keys`
+    function that command now calls too.
+    """
+    from kairos.core.idempotency import cleanup_expired_idempotency_keys
+
+    return cleanup_expired_idempotency_keys()

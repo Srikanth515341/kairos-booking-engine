@@ -36,7 +36,9 @@ def _reject_if_deactivated(user: AppUser) -> None:
     forget to apply.
     """
     if user.status == AppUserStatus.DEACTIVATED:
-        raise exceptions.AuthenticationFailed("this account has been deactivated")
+        raise exceptions.AuthenticationFailed(
+            "this account has been deactivated", code="deactivated_account"
+        )
 
 
 class OIDCSessionAuthentication(authentication.BaseAuthentication):
@@ -55,13 +57,20 @@ class OIDCSessionAuthentication(authentication.BaseAuthentication):
         try:
             user_id = verify_session_token(token)
         except SessionTokenError as exc:
-            raise exceptions.AuthenticationFailed(str(exc)) from exc
+            # Rollout v1.0 §6.2 / Implementation Plan Phase 21: "auth
+            # failure rate by shape (narrow = probing, broad = provider
+            # issue)." A malformed/expired/forged token is the shape most
+            # consistent with probing — the same code regardless of
+            # SessionTokenError's specific message, since Spec v1.0 never
+            # distinguishes them at the response level either (no
+            # information leak about WHICH way a token is invalid).
+            raise exceptions.AuthenticationFailed(str(exc), code="invalid_session_token") from exc
 
         try:
             user = AppUser.objects.get(id=user_id)
         except AppUser.DoesNotExist as exc:
             raise exceptions.AuthenticationFailed(
-                "session token does not match a known user"
+                "session token does not match a known user", code="unknown_user"
             ) from exc
 
         _reject_if_deactivated(user)
@@ -95,14 +104,14 @@ class StubUserIdAuthentication(authentication.BaseAuthentication):
             user_id = uuid.UUID(header_value)
         except ValueError as exc:
             raise exceptions.AuthenticationFailed(
-                f"{DEV_USER_ID_HEADER} is not a valid UUID"
+                f"{DEV_USER_ID_HEADER} is not a valid UUID", code="malformed_dev_header"
             ) from exc
 
         try:
             user = AppUser.objects.get(id=user_id)
         except AppUser.DoesNotExist as exc:
             raise exceptions.AuthenticationFailed(
-                f"{DEV_USER_ID_HEADER} does not match a known user"
+                f"{DEV_USER_ID_HEADER} does not match a known user", code="unknown_user"
             ) from exc
 
         _reject_if_deactivated(user)

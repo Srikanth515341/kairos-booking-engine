@@ -129,3 +129,69 @@ NOTIFICATION_MAX_RETRIES = int(os.environ.get("NOTIFICATION_MAX_RETRIES", "5"))
 NOTIFICATION_RETRY_BACKOFF_MAX_SECONDS = int(
     os.environ.get("NOTIFICATION_RETRY_BACKOFF_MAX_SECONDS", "600")
 )
+
+# ============================================================
+# Observability & alerting (Implementation Plan Phase 21; Rollout v1.0
+# §6.1, §6.2)
+# ============================================================
+# How often kairos.core.alerting.evaluate_alerts_task re-reads the six
+# checks' latest state (+ actor_type='unknown') and fires/resolves alerts.
+# Independent of any individual check's own interval — this is polling
+# ALREADY-WRITTEN heartbeats, not re-running the checks themselves.
+ALERT_EVALUATION_INTERVAL_SECONDS = int(os.environ.get("ALERT_EVALUATION_INTERVAL_SECONDS", "60"))
+
+# offer_cascade's REAL alert signal (Rollout v1.0 §6.1's second condition,
+# resolved per this phase's own clarification #1 — see CLAUDE.md Key
+# Technical Decisions): "no run in 90s" alone false-alarms during ordinary
+# quiet periods for an event-triggered job, so the PRIMARY trigger is a
+# live count of holds sitting past their own expires_at plus this grace
+# period with no corresponding cascade — not time since the job last ran.
+OFFER_CASCADE_STUCK_HOLD_GRACE_SECONDS = int(
+    os.environ.get("OFFER_CASCADE_STUCK_HOLD_GRACE_SECONDS", str(5 * 60))
+)
+
+# audit_actor_unknown alert (SEV-3): how far back kairos.core.alerting
+# looks for a fresh AuditLog row with actor_type='unknown' before treating
+# the condition as resolved. Short — a single bug-shaped write is worth
+# flagging immediately (kairos.core.models.AuditActorType's own docstring:
+# "a write arriving with no actor set is a bug"), but the alert shouldn't
+# stay open forever off one historical row once nothing new is arriving.
+AUDIT_ACTOR_UNKNOWN_LOOKBACK_SECONDS = int(
+    os.environ.get("AUDIT_ACTOR_UNKNOWN_LOOKBACK_SECONDS", str(5 * 60))
+)
+
+# kairos.core.management.commands.cleanup_idempotency_keys existed since
+# Phase 5 with its own docstring explicitly deferring scheduling to
+# "Phase 21's job" — this is that schedule.
+IDEMPOTENCY_CLEANUP_INTERVAL_SECONDS = int(
+    os.environ.get("IDEMPOTENCY_CLEANUP_INTERVAL_SECONDS", str(60 * 60))
+)
+
+# Rolling window kairos.core.metrics uses for every rate/percentile
+# aggregate (booking-write/availability-read P95, 503 rate by cause, auth
+# failure rate by shape) — computed live, by query, over this window, not
+# precomputed into any time-series store (no such library exists in this
+# project; see pyproject.toml).
+METRICS_WINDOW_SECONDS = int(os.environ.get("METRICS_WINDOW_SECONDS", str(15 * 60)))
+
+# RequestMetric retention (Rollout v1.0 §6.2) — one row per HTTP request
+# means unbounded growth without pruning; kept short since only the
+# rolling window above is ever queried, mirroring IDEMPOTENCY_RETENTION_
+# HOURS' own "nothing needs it past its own window" reasoning.
+REQUEST_METRIC_RETENTION_HOURS = int(os.environ.get("REQUEST_METRIC_RETENTION_HOURS", "24"))
+
+# Alert email delivery retry (mirrors NOTIFICATION_MAX_RETRIES/
+# NOTIFICATION_RETRY_BACKOFF_MAX_SECONDS exactly — an alert email reuses
+# the identical retry-with-backoff shape, not a new one).
+ALERT_EMAIL_MAX_RETRIES = int(os.environ.get("ALERT_EMAIL_MAX_RETRIES", "5"))
+ALERT_EMAIL_RETRY_BACKOFF_MAX_SECONDS = int(
+    os.environ.get("ALERT_EMAIL_RETRY_BACKOFF_MAX_SECONDS", "600")
+)
+
+# 503 cause split (Rollout v1.0 §6.2: "lock timeout vs. failover — they
+# need opposite responses"). Lock-contention-shaped SQLSTATEs
+# (55P03/40P01/57014, kairos.bookings.services.RETRYABLE_SQLSTATES) get
+# the existing short retry_after; a failover-shaped failure (the primary
+# is down or mid-election) needs a longer wait before a client hammers a
+# database that may not be back yet.
+FAILOVER_RETRY_AFTER_SECONDS = int(os.environ.get("FAILOVER_RETRY_AFTER_SECONDS", "5"))

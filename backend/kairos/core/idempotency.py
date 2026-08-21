@@ -21,6 +21,7 @@ import json
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import Any
 from uuid import UUID
 
@@ -342,3 +343,28 @@ def _record_conflict_outcome(
             response_body=envelope,
             completed_at=timezone.now(),
         )
+
+
+def cleanup_expired_idempotency_keys() -> dict[str, int]:
+    """Deletes `idempotency_key` rows older than `IDEMPOTENCY_RETENTION_
+    HOURS` (Spec v1.0 §7; PRD FR37) and records an `OperationalHeartbeat`
+    row — the shared mechanism `kairos.core.management.commands.
+    cleanup_idempotency_keys` (Phase 5) and `kairos.core.tasks.
+    cleanup_idempotency_keys_task` (Phase 21, the scheduling that
+    command's own docstring deferred to "Phase 21's job") both call,
+    rather than the management command duplicating this logic — the same
+    "one mechanism, callable both from `manage.py` and from Beat" choice
+    already made for `rematerialize_series`/`run_correctness_checks`
+    (Phases 13/20).
+    """
+    from kairos.core.constants import IDEMPOTENCY_RETENTION_HOURS
+    from kairos.core.models import OperationalHeartbeat
+
+    cutoff = timezone.now() - timedelta(hours=IDEMPOTENCY_RETENTION_HOURS)
+    deleted_count, _ = IdempotencyKey.objects.filter(created_at__lt=cutoff).delete()
+    findings = {"deleted_count": deleted_count}
+    OperationalHeartbeat.objects.update_or_create(
+        name="idempotency_cleanup",
+        defaults={"last_run_at": timezone.now(), "findings": findings},
+    )
+    return findings
