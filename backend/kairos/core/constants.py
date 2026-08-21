@@ -63,3 +63,10 @@ TZDATA_DRIFT_CHECK_INTERVAL_SECONDS = int(
 # working proposal pending product sign-off (PRD v1.0 §11 open question 1) —
 # tunable here, not a magic number at the hold-creation call site.
 OFFER_WINDOW_MINUTES = int(os.environ.get("OFFER_WINDOW_MINUTES", "15"))
+
+# Hold reaper sweep interval (Implementation Plan Phase 17; RFC v1.0 §10.4
+# mechanism 2). Trades cascade latency (how long an expired-but-unreclaimed
+# hold sits before the next eligible entry gets a shot at it) against sweep
+# cost at real waitlist volume — RFC's own "tune from observed volume" note,
+# 30s is the initial proposal.
+HOLD_REAPER_INTERVAL_SECONDS = int(os.environ.get("HOLD_REAPER_INTERVAL_SECONDS", "30"))

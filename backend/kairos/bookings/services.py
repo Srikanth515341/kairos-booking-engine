@@ -22,7 +22,7 @@ from kairos.core.exceptions import ServiceUnavailableError, SlotUnavailableError
 from kairos.core.models import AuditActorType
 from kairos.identity.models import AppUser
 from kairos.resources.models import Resource
-from kairos.waitlist.tasks import create_offer_for_freed_range_task
+from kairos.waitlist.tasks import dispatch_cascade
 
 logger = logging.getLogger(__name__)
 
@@ -101,8 +101,11 @@ def create_booking(req: BookingCreateRequest) -> Booking:
     """The write. No availability check precedes it — that is the entire
     point of RFC v1.0 §3: the EXCLUDE constraint IS the check, and no window
     exists between "looks free" and "is free" for a second writer to land
-    in. Idempotency (Phase 5) and hold reclamation (Phase 17) are not yet
-    part of this transaction — both are documented, temporary gaps.
+    in. Idempotency is applied by the caller (`run_idempotent_write`,
+    Phase 5), wrapping this whole function — not part of THIS transaction.
+    Hold reclamation (Phase 17), by contrast, genuinely IS part of this
+    transaction: the cleanup-on-write DELETE below runs on every call, for
+    every caller, unconditionally.
 
     Called once per occurrence by confirm_recurring_series (Phase 12,
     RFC v1.0 §5d) exactly as it's called for a one-off booking — same
@@ -135,6 +138,34 @@ def create_booking(req: BookingCreateRequest) -> Booking:
                     actor_id=(str(req.user.id) if req.actor_type != AuditActorType.SYSTEM else ""),
                     actor_type=req.actor_type,
                     request_id=req.request_id,
+                )
+                # ========================================================
+                # CLEANUP-ON-WRITE (RFC v1.0 §10.4 mechanism 1; Spec v1.0
+                # §4.1 step 2) — reclaims expired holds for THIS resource,
+                # scoped to the range about to be written, inside the SAME
+                # transaction as the insert below. A constraint predicate
+                # cannot express expiry (Postgres requires index predicates
+                # to be IMMUTABLE; `now()` is not), so an expired hold
+                # would otherwise block this write FOREVER, independent of
+                # whether the reaper (below) is healthy or Redis is even
+                # reachable. This is the self-healing property RECLAIM-01
+                # exists to prove: a stalled reaper, or a Redis outage,
+                # never makes a resource permanently unbookable, because
+                # the very next writer clears the stale hold themselves.
+                # Runs for EVERY caller of create_booking — an ordinary
+                # booking, a recurring occurrence, rolling materialization,
+                # AND the offer-cascade worker's own hold creation — never
+                # skipped, never conditional on who's calling. If you are
+                # reading this while considering removing or narrowing it:
+                # STOP. Without it, PRD FR18 ("an expired hold must not
+                # block any booking") depends entirely on the reaper's
+                # uptime, which RFC v1.0 §4.3 explicitly says must not be
+                # true.
+                # ========================================================
+                cursor.execute(
+                    "DELETE FROM booking WHERE resource_id = %s AND status = 'held' "
+                    "AND expires_at <= now() AND time_range && tstzrange(%s, %s)",
+                    [str(req.resource.id), req.start, req.end],
                 )
             # ============================================================
             # RFC v1.0 §10.1: a hold (status='held') occupies the SAME
@@ -300,11 +331,8 @@ def cancel_booking(req: BookingCancelRequest) -> BookingCancelResult:
                 resource_id = booking.resource_id
                 range_start, range_end = booking.time_range.lower, booking.time_range.upper
                 transaction.on_commit(
-                    lambda: create_offer_for_freed_range_task.delay(
-                        str(resource_id),
-                        range_start.isoformat(),
-                        range_end.isoformat(),
-                        req.request_id,
+                    lambda: dispatch_cascade(
+                        str(resource_id), range_start, range_end, req.request_id
                     )
                 )
     except DatabaseError as exc:

@@ -7,11 +7,14 @@ registered task list, with no error anywhere.
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 
 from celery import shared_task
 
 from kairos.resources.models import Resource
+
+logger = logging.getLogger(__name__)
 
 
 @shared_task
@@ -42,3 +45,44 @@ def create_offer_for_freed_range_task(
         datetime.fromisoformat(freed_end_iso),
         request_id,
     )
+
+
+def dispatch_cascade(resource_id: str, start: datetime, end: datetime, request_id: str) -> None:
+    """The ONE place `create_offer_for_freed_range_task.delay(...)` is
+    called from (`cancel_booking` and `decline_offer` both go through
+    this, never `.delay()` directly) — wrapped so a broker outage
+    degrades rather than raises.
+
+    RFC v1.0 §4.3: Celery/Redis is a LIVENESS dependency, never a
+    correctness one. Both callers register their dispatch inside
+    `transaction.on_commit()`, which runs synchronously right after a
+    real, already-successful commit — an unhandled exception here would
+    propagate out of that commit and surface as a request failure for an
+    operation (cancel/decline) that ALREADY SUCCEEDED at the database
+    level, exactly the "an outage turns a success into an apparent
+    failure" mistake WL-06 exists to catch. Test Plan v1.0 WL-06's own
+    assertion is explicit: booking creation and cancellation must still
+    succeed with Redis down; only the offer/cascade — genuinely
+    Redis-dependent — degrades, silently from the caller's perspective,
+    logged here as the alert signal Spec v1.0 §14/RFC v1.0 §4.3 call for
+    (full alert-routing infrastructure is Phase 21; this is the same
+    "log the signal now, wire real alerting later" precedent Phase 13's
+    tzdata-drift check already established).
+    """
+    try:
+        create_offer_for_freed_range_task.delay(
+            resource_id, start.isoformat(), end.isoformat(), request_id
+        )
+    except Exception:
+        logger.error(
+            "cascade_dispatch_failed_broker_unavailable",
+            extra={"request_id": request_id, "resource_id": resource_id},
+            exc_info=True,
+        )
+
+
+@shared_task(name="kairos.waitlist.tasks.reap_expired_holds_task")
+def reap_expired_holds_task() -> dict[str, object]:
+    from kairos.waitlist.services import reap_expired_holds
+
+    return reap_expired_holds()

@@ -91,5 +91,13 @@ jobs:
           python-version: "3.12"
       - name: Install dependencies
         run: pip install -e ".[dev]"
-      - name: Run the concurrency proof suite (CONC-01 through CONC-05)
-        run: pytest tests/concurrency -v
+      - name: Run the concurrency proof suite (CI tier)
+        # RECLAIM-04 (Phase 17) is excluded deliberately, not forgotten:
+        # Test Plan v1.0 §13 places it in the STAGING/pre-release tier,
+        # not CI tier (RECLAIM-01-03 ARE CI tier and run here normally) —
+        # 200 writers x 50 runs is expensive enough that per-commit
+        # execution would make CI unusable, the identical reasoning behind
+        # CONC-01's own full 100-run+N=500 escalation living outside this
+        # job (deferred to Phase 28). Run it manually before a release:
+        # pytest tests/concurrency/test_reclaim_04.py -v -s
+        run: pytest tests/concurrency --ignore=tests/concurrency/test_reclaim_04.py -v

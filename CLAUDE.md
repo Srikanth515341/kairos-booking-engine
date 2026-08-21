@@ -109,8 +109,10 @@ kairos-booking-engine/
 │   │   │                   # machinery as a confirmed booking, expires_at computed from
 │   │   │                   # OFFER_WINDOW_MINUTES, load-bearing comment at the call site.
 │   │   │                   # cancel_booking's on_commit hook (Phase 7 log stub) now really
-│   │   │                   # dispatches kairos.waitlist.tasks.create_offer_for_freed_range_task
-│   │   │                   # (Phase 16, RFC §5c step 4)
+│   │   │                   # dispatches kairos.waitlist.tasks.dispatch_cascade (Phase 16, RFC
+│   │   │                   # §5c step 4). create_booking also runs the cleanup-on-write DELETE
+│   │   │                   # (Phase 17, RFC §10.4 mechanism 1) inside its own transaction,
+│   │   │                   # before every INSERT, unconditionally, for every caller
 │   │   ├── waitlist/       # waitlist_entry (Phase 14), waitlist_offer (Phase 16) — its own
 │   │   │                   # app, not part of bookings/, since Spec's own ER diagram reaches
 │   │   │                   # both directly from app_user/resource, never through booking (see
@@ -124,12 +126,17 @@ kairos-booking-engine/
 │   │   │                   # services.py (join_waitlist/cancel_waitlist_entry,
 │   │   │                   # find_eligible_entries — the @> containment query, PRD FR21, first
 │   │   │                   # real caller in Phase 16; create_offer_for_freed_range/
-│   │   │                   # accept_offer/decline_offer — Phase 16), tasks.py
-│   │   │                   # (create_offer_for_freed_range_task — Phase 16, the SAME
+│   │   │                   # accept_offer/decline_offer — Phase 16; reap_expired_holds/
+│   │   │                   # hold_reaper_heartbeat_is_stale — Phase 17, RFC §10.4 mechanism 2),
+│   │   │                   # tasks.py (create_offer_for_freed_range_task — Phase 16, the SAME
 │   │   │                   # tasks.py-must-be-named-that-for-autodiscovery lesson Phase 13
 │   │   │                   # already established; deferred-import trick to avoid a real
 │   │   │                   # circular import with kairos.bookings.services — see Key Technical
-│   │   │                   # Decisions), serializers.py (slot_already_available check before
+│   │   │                   # Decisions; dispatch_cascade — Phase 17, wraps .delay() so a
+│   │   │                   # broker outage degrades rather than raises out of an on_commit
+│   │   │                   # callback, WL-06; reap_expired_holds_task — Phase 17, on
+│   │   │                   # CELERY_BEAT_SCHEDULE at HOLD_REAPER_INTERVAL_SECONDS),
+│   │   │                   # serializers.py (slot_already_available check before
 │   │   │                   # the idempotency key is claimed; WaitlistOfferResponseSerializer —
 │   │   │                   # Phase 16), views.py (join/list/cancel; WaitlistOfferConfirmView/
 │   │   │                   # DeclineView — Phase 16), urls.py
@@ -248,6 +255,34 @@ triggers, since it retains the earliest `joined_at` in the FCFS ordering; this i
 gives `WaitlistEntryStatus.EXPIRED` (present in the schema since Phase 14, unused until now)
 its actual meaning.
 
+Hold reclamation (Phase 17, RFC v1.0 §10.4) — both mechanisms, because a constraint predicate
+cannot express expiry (`now()` isn't IMMUTABLE) and neither alone suffices. Mechanism 1,
+cleanup-on-write: `create_booking` now DELETEs any expired hold overlapping the range it's
+about to write, inside the SAME transaction, before the INSERT — unconditionally, for every
+caller (an ordinary booking, a recurring occurrence, rolling materialization, the cascade
+worker's own hold creation). This is the self-healing property RECLAIM-01 proves: a stalled
+reaper, or Redis being down entirely, never makes a resource permanently unbookable, because
+the very next writer clears the stale hold themselves. Mechanism 2, the reaper:
+`reap_expired_holds` (`kairos.waitlist.services`), on `CELERY_BEAT_SCHEDULE` at
+`HOLD_REAPER_INTERVAL_SECONDS` (default 30s) — walks every expired hold, reclaims each via the
+IDENTICAL conditional-UPDATE-to-`cancelled` shape `accept_offer` itself races against
+(`WHERE status='held' AND expires_at<=now()`), and on a genuine win (not lost to a concurrent
+acceptance) marks the offer `expired`, the entry `expired`, and cascades to the next eligible
+entry via `create_offer_for_freed_range` — the SAME worker cancellation and decline already
+use. One independent transaction per hold, so one contested hold losing its race to acceptance
+never rolls back the reclamation of every other expired hold in the same sweep. Every run
+writes a `system_check_run` row (`check_name='hold_reaper'`) regardless of whether anything
+was found — the heartbeat itself, not an alert (full alerting is Phase 21); `hold_reaper_
+heartbeat_is_stale` reads that heartbeat back and is the actual mechanism behind WL-05 Part B,
+scoped honestly to what Phase 17 owns (the DATA a future alert would consume), not the
+alert-firing/`GET /admin/checks/latest` surface itself (Phase 21). `cancel_booking`'s and
+`decline_offer`'s cascade dispatch both now go through ONE new function, `dispatch_cascade`,
+which wraps `.delay()` in a broad `try/except` and logs `cascade_dispatch_failed_broker_
+unavailable` on failure rather than letting a broker outage propagate out of a
+`transaction.on_commit()` callback and turn an already-committed, successful cancel/decline
+into an apparent request failure — verified LIVE against a real Redis outage, not simulated
+(see Key Technical Decisions and the Phase 17 Completed Phases row for the full transcript).
+
 Real authentication (Phase 9, RFC v1.0 §4): `Authorization: Bearer <session-token>`, validated
 by `OIDCSessionAuthentication`. A client obtains that session token via `POST /auth/token`
 with a verified OIDC ID token — in dev/test, `POST /auth/dev-mock-login` mints one against a
@@ -298,33 +333,35 @@ DSN (`kairos_app` deliberately has no DDL rights) — see "Running Locally" belo
 | 14 | Waitlist Entries & Containment Eligibility | New `kairos.waitlist` app (own app, not inside `bookings/` — Spec's own ER diagram reaches `waitlist_entry` directly from `app_user`/`resource`, never through `booking`; see Key Technical Decisions). `WaitlistEntry` reproduces Spec v1.0 §3's DDL: `joined_at` is a genuine `db_default=Now()` column, never `auto_now_add` (same Phase 8 `AuditLog.occurred_at` fix, applied here as the actual mechanism behind SEC-03(a) — there is no serializer field for a client value to bind to at all, not merely one that gets ignored). `uniq_live_waitlist_per_user_slot` (32 characters, past Django's 30-char portability limit — the identical `idx_series_materialized_through`/E033 situation from Phase 11) is added via its own raw-SQL migration; `idx_waitlist_entry_lookup` (GiST, `django.contrib.postgres.indexes.GistIndex`) and `idx_waitlist_entry_order` both fit under the limit and are ordinary `Meta.indexes`. `POST /waitlist-entries` (Spec v1.0 §5.11) inserts directly — no availability pre-check, the same "the constraint/index IS the check" philosophy Phase 4 established for booking creation — with 409 `already_on_waitlist` (new domain exception, SQLSTATE 23505 on the partial unique index) and 422 `slot_already_available` (new domain exception; advisory check-then-act, evaluated in `WaitlistJoinSerializer.validate()` BEFORE the idempotency key is claimed, mirroring `BookingCreateSerializer`'s "don't consume a key slot on a request that can't succeed" precedent). `GET /waitlist-entries` (Spec v1.0 §5.12) is always self-scoped (no `user_id` param — "no permission check to get wrong," Spec's own words) and reports `queue_position` (PRD FR27, batched one query per distinct resource on the page — RFC v1.0 §7.2's N+1 guard, same principle as Phase 6's availability view) and an `active_offer` field that's always `null` until Phase 16. `POST /waitlist-entries/{id}/cancel` — owner-only self-withdrawal, NOT literally in Spec v1.0 §5.11/§5.12 (which document only join and list) but required by this phase's own Definition of Done ("join, list, and cancel... all work"), built on `BookingCancelView`'s exact owner-only/idempotent-double-cancel-is-200 shape minus the admin-override branch Spec never describes for a waitlist entry. `kairos.waitlist.services.find_eligible_entries` is the load-bearing containment query (`@>`, not `&&` — PRD FR21, the phase's designated load-bearing comment site #4 per Implementation Plan §1.3) — no live caller yet (offer cascade is Phase 16), proven directly against ORM-created rows, the "mechanism before its real caller" pattern already used for `actor_type='system'` (Phase 8→13). `core/migrations/0008` grants `kairos_app` full DML on `waitlist_entry` (it transitions status in place, unlike append-only `audit_log`/`system_check_run`) and attaches `audit_waitlist_entry` — 0003's own comment had already promised this trigger "when those tables exist." `kairos.core.idempotency`'s `_record_conflict_outcome` was generalized (code/message/http_status now caller-supplied instead of hardcoded to `slot_unavailable`) so `already_on_waitlist` gets the identical Spec v1.0 §7-point-7 "conflict outcomes are recorded too" treatment `slot_unavailable` already had — anticipated by that module's own docstring, which already named Phase 14 as a future reuser. WL-04 passes directly against `find_eligible_entries` (a freed 10:00–10:30 does NOT make a 10:00–11:00 waitlister eligible; a freed 10:00–11:00 does); SEC-03(a)/(b)/(c) all pass. Full suite: 201 tests (195 + 6 concurrency), 24 new, no regressions — including a pre-existing AUD-02 test that hardcoded the three Phase-8 audited tables, updated (not silently left stale) to include `waitlist_entry` as a fourth | Pending (on branch `phase-14-waitlist-entries`) |
 | 15 | Holds: The Shared Exclusion Domain ⚠️ CRITICAL | Makes a hold a REAL reservation by putting it in the SAME `booking` table, inside the SAME exclusion domain a confirmed booking occupies (RFC v1.0 §10.1) — the whole point of the v0.1→v1.0 redesign this phase implements: a separate `waitlist_offer`-table constraint (v0.1's design) cannot exclude against `booking`, so an ordinary user could take a slot out from under an outstanding offer. `BookingCreateRequest`/`create_booking` (`kairos/bookings/services.py`) gained a `status` field (default `CONFIRMED`, unchanged for every prior caller) rather than a bespoke `create_hold()` — a hold's INSERT needs the IDENTICAL session-settings/SQLSTATE-translation/`refresh_from_db` machinery a confirmed booking's does, the same "one write path, one correctness proof" reasoning Phase 13 already used for `actor_type`. `expires_at` is computed INSIDE `create_booking` from the new `OFFER_WINDOW_MINUTES` constant (`kairos/core/constants.py`, RFC v1.0 §10.5 / PRD open question 1, default 15) whenever `status=HELD`, keeping the `hold_has_expiry` DB CHECK invariant enforced in one place rather than trusting every future caller to set it consistently. The RFC v1.0 §10.1 load-bearing comment (Implementation Plan §1.3 item 3) lives at the `Booking.objects.create(...)` call site itself, in ADDITION to Phase 2's existing comment at the constraint's own definition — two different developers, editing two different files, each need the warning where THEY are looking. HOLD-01 ★ (the Test Plan's own "most important test in the document") passes as a real, end-to-end proof: a hold created directly (no offer worker exists until Phase 16 — the identical "mechanism before its real caller" pattern already used for `actor_type='system'` and containment eligibility), an unrelated user's REAL `POST /bookings` for the exact same range returns 409 `slot_unavailable` over real HTTP, and W's acceptance — the literal RFC v1.0 §10.3/Spec v1.0 §4.3 conditional `UPDATE ... WHERE status='held' AND user_id=$2 AND expires_at > now()`, executed directly since Phase 16 hasn't built its endpoint yet, per this phase's own explicit instruction — flips the SAME row (same `id`, `status` transitioned, `expires_at` now NULL, no second row). Two companion tests prove the predicate's other two guard clauses matter: an expired hold's acceptance affects 0 rows, and the wrong `user_id` affects 0 rows too (Spec's `user_id` clause — RFC v1.0 §10.3's own SQL snippet calls this column `held_for_principal`, which doesn't exist in Spec v1.0 §3's actual DDL; `booking.user_id` already serves this role, established at the model layer since Phase 2/3, this phase is just the first to literally exercise it here). HOLD-02 (50 barrier-released raw-SQL `booking` INSERTs against an actively held range, 50 runs) asserts ZERO successes UNCONDITIONALLY every run — a safety invariant, not CONC-01's zero-is-a-liveness-characteristic-so-retry pattern — via the same `tests/concurrency/harness.py` used by CONC-01–05, mirroring CLAUDE.md's own documented CONC-03/04 precedent of proving the database constraint directly rather than through real HTTP concurrency. HOLD-03 (opaque in availability) and "`GET /bookings` never returns held rows" both turned out to already be true and already covered by Phase 6 tests using an ORM-constructed held row; this phase added COMPLEMENTARY tests proving the SAME properties hold for a hold created through the REAL mechanism this phase built, rather than either claiming Phase 6's coverage as its own or duplicating it without reason. RECON-05's predicate-covers-`'held'` schema-assertion test (`tests/test_schema_assertion.py`) turned out to already exist too — written in Phase 3, ahead of `'held'` having a real writer — verified still passing and its stale "since 'held' rows don't exist until Phase 15" docstring corrected, not silently left inaccurate. Full suite: 207 tests (201 + 6 new), no regressions | Pending (on branch `phase-15-holds-exclusion-domain`) |
 | 16 | Offers: Creation, Acceptance, Cascade 🏁 MILESTONE 3 | Completes the waitlist: `waitlist_offer` (Spec v1.0 §3 — `hold_booking` a `OneToOneField` per the `UNIQUE hold_booking_id` column, `uniq_active_offer_per_entry` partial unique index, no EXCLUDE constraint with Spec's own forbidding comment reproduced verbatim in the migration per this phase's explicit Scope IN), `kairos_app` grants + audit trigger (`core/migrations/0009`). `create_offer_for_freed_range` (`kairos/waitlist/services.py`) is the RFC v1.0 §10.2/Spec v1.0 §4.2 worker — walks `find_eligible_entries`' (Phase 14) FCFS-ordered candidates, attempts a hold via `create_booking(status=HELD, actor_type=SYSTEM)` (Phase 15) for each in turn, advancing to the next on `SlotUnavailableError` (Spec's own "re-query and try the next candidate"), and only constructs the `WaitlistOffer` row once a hold has actually committed (PRD FR23: hold before offer, structurally, not by caller discipline). `cancel_booking`'s Phase 7 `on_commit()` log stub now really dispatches `create_offer_for_freed_range_task.delay(...)` (RFC v1.0 §5c step 4) via a NEW `kairos/waitlist/tasks.py` (Celery's `autodiscover_tasks()` module-naming lesson, Phase 13, applied a second time) — a genuine circular-import risk between `kairos.bookings.services` (needs the task) and `kairos.waitlist.services` (needs `create_booking`) is broken with a deferred, call-time-only import inside the task function, verified via `manage.py check` actually succeeding. `POST /waitlist-offers/{id}/confirm` executes `accept_offer` — the literal RFC v1.0 §10.3/Spec v1.0 §4.3 conditional `UPDATE` (status, owner, AND `expires_at > now()` in one statement) — structurally incapable of `slot_unavailable` (no INSERT on this path); 0 rows → 409 `offer_expired`. `POST /waitlist-offers/{id}/decline` releases the hold (`status`→`cancelled`, `expires_at`→`NULL` — the `hold_has_expiry` CHECK requires the latter, a real bug caught building WL-02 and traced back into `decline_offer` itself, fixed in both places) and dispatches the SAME cascade worker for the freed range; unlike every other cancel-shaped endpoint here, an already-resolved offer is a 409 `offer_already_resolved`, not a 200 no-op — Spec's own explicit, deliberate choice. The declining entry's status becomes `EXPIRED` (present in the schema since Phase 14, unused until now) rather than back to `WAITING`, which is what stops it from immediately re-winning the very cascade its own decline triggers. `RecordableConflictError` (new base class in `core/exceptions.py`) consolidates `SlotUnavailableError`/`AlreadyOnWaitlistError`/`OfferExpiredError`/`OfferAlreadyResolvedError` — `kairos_exception_handler` and `run_idempotent_write` each collapsed four near-identical branches into one, justified once the pattern reached its fourth instance, not before. HOLD-01 through Phase 15's tests are joined by: WL-01 (two threads, real `cancel_booking` calls under `transaction=True`, ground truth via `count_overlapping_pairs` — B1/B2 built as adjacent rather than Test Plan's literal overlapping example times, since two overlapping bookings cannot both be `confirmed` simultaneously in the first place, the exact guarantee this project enforces; see Key Technical Decisions), WL-02 (100 barrier-released runs — reaper-expiry simulated as `UPDATE ... SET status='cancelled', expires_at=NULL ...`, split 50/50 between expires-in-the-future and expires-in-the-past to deterministically exercise both orderings rather than gambling on timing jitter; `ClientOutcome` gained an additive `rowcount` field since a conditional UPDATE matching zero rows isn't an error), and WL-03 (cascade reaches entry 2 not 3 after decline; skips a withdrawn entry 2 to reach entry 3). Full suite: 223 tests (207 + 16 new), no regressions | Pending (on branch `phase-16-offers-cascade`) |
+| 17 | Dual Reclamation: Reaper & Cleanup-on-Write ⚠️ CRITICAL | Both RFC v1.0 §10.4 mechanisms, because a constraint predicate cannot express expiry and neither alone suffices. Mechanism 1 — cleanup-on-write: a `DELETE FROM booking WHERE resource_id=... AND status='held' AND expires_at<=now() AND time_range && tstzrange(...)`, added inside `create_booking`'s (`kairos/bookings/services.py`) own transaction, immediately before the INSERT, unconditionally for EVERY caller (ordinary booking, recurring occurrence, rolling materialization, the cascade worker's own hold creation) — with the RFC v1.0 §10.1-style load-bearing comment (Implementation Plan §1.3 item 5) at the DELETE's own call site. Mechanism 2 — the reaper: `reap_expired_holds` (`kairos/waitlist/services.py`), scheduled via `CELERY_BEAT_SCHEDULE` at the new `HOLD_REAPER_INTERVAL_SECONDS` (default 30s, `core/constants.py`) — one independent transaction per expired hold (mirroring `confirm_recurring_series`/`rolling_materialize_series`'s per-occurrence isolation), reclaiming each via the IDENTICAL conditional-UPDATE-to-`cancelled` shape `accept_offer` races against, cascading via the SAME `create_offer_for_freed_range` cancellation/decline already use, and writing a `system_check_run` heartbeat (`check_name='hold_reaper'`) every run regardless of findings. `hold_reaper_heartbeat_is_stale` reads that heartbeat back — WL-05 Part B's actual mechanism, scoped honestly to the DATA a future alert would consume (full alert routing and `GET /admin/checks/latest` are Phase 21, not built here). `dispatch_cascade` (new, `kairos/waitlist/tasks.py`) is now the ONE place `create_offer_for_freed_range_task.delay(...)` is called from (`cancel_booking` and `decline_offer` both go through it) — wraps the call in `try/except` so a broker outage degrades (logs `cascade_dispatch_failed_broker_unavailable`) rather than raising out of a `transaction.on_commit()` callback and turning an already-committed, successful cancel/decline into an apparent request failure. RECLAIM-01 (booking succeeds over a stale hold with no reaper running, hold genuinely gone via DELETE — not superseded), RECLAIM-02 (reaper cascades to the next eligible entry with zero booking traffic, proven by calling `reap_expired_holds` directly — Test Plan's own "controllable time" requirement, not a real 30s wait), and RECLAIM-03 (100 barrier-released runs, cleanup-on-write's DELETE+INSERT racing the literal RFC v1.0 §10.3 acceptance UPDATE, correctness inferred by correlating outcomes since a party's own DELETE rowcount isn't directly observable through the harness) all pass. RECLAIM-04 (200 writers × 50 runs, N=200-identical-slot-style contention plus 4 pre-seeded expired holds cleanup-on-write must clear every attempt) was ACTUALLY RUN at full DoD-specified scale, not merely written: **269 real SQLSTATE 40P01 deadlocks occurred, in roughly half of the 50 runs** (some runs: zero; others: 9–16) — not the "zero deadlocks" the DoD's literal text names. Per this phase's own explicit instruction, this is the SECOND of the two anticipated honest outcomes, not a phase failure: safety held on every single one of the 10,000 attempts (never more than one success per round, 50/50), zero unexplained SQLSTATEs, zero rounds even needed the zero-success retry budget, and 40P01 was ALREADY a documented, retryable SQLSTATE `BookingService` treats as 503 (Phase 4) before this phase ever ran — cleanup-on-write's extra DELETE measurably raises deadlock frequency versus CONC-01's own N=200 baseline (empirically ~2/10 runs there), a real, honestly-reported finding, not a design failure requiring cleanup-on-write's removal. RECLAIM-04 is deliberately EXCLUDED from the default `pytest tests/concurrency` CI sweep (`.github/workflows/ci.yml` now `--ignore`s it) — Test Plan v1.0 §13 places it in the staging/pre-release tier, not CI tier, the identical tiering CONC-01's own full-scale escalation already has. WL-05 Part A and WL-06 were verified LIVE against the real `docker compose` stack — genuinely stopping `beat`/`redis` containers (`docker compose stop beat` / `stop redis`), not mocked — per this phase's own explicit instruction that a mocked simulation would not prove what RFC v1.0 §4.3's real degradation behavior requires: Part A seeded a hold expiring in 3s with `beat` stopped, confirmed it sat `status='held'` 12+ seconds past expiry with zero error anywhere in the worker/server logs; WL-06 stopped `redis` and confirmed, over real HTTP against `manage.py runserver` under `kairos.settings.dev` (real, non-eager Celery — `CELERY_TASK_ALWAYS_EAGER` is test-settings-only): booking creation (201) and cancellation (200) both succeeded, cancellation's cascade dispatch failed with a genuine `kombu.exceptions.OperationalError` caught and logged by `dispatch_cascade` rather than crashing the response, a booking over an expired hold succeeded via cleanup-on-write (the stale hold row was gone afterward) with zero `waitlist_offer` rows ever created, and the worker reconnected cleanly once `redis` restarted. WL-05 Part B is covered by ordinary pytest (`hold_reaper_heartbeat_is_stale`); `test_dispatch_cascade.py` is a lightweight automated regression guard for the try/except itself (`CELERY_TASK_ALWAYS_EAGER` means pytest can never reproduce a genuine broker outage — this only protects against someone removing the try/except later). Full suite: 236 tests (223 + 13 new — RECLAIM-04 counted but excluded from the routine sweep), no regressions | Pending (on branch `phase-17-dual-reclamation`) |
 
 ## Current Phase In Progress
 
-None. Phase 16 is complete pending review and merge. Phase 17 (Dual Reclamation: Reaper & Cleanup-on-Write ⚠️ CRITICAL) is next.
+None. Phase 17 is complete pending review and merge. Phase 18 (Notifications) is next.
 
 ## NOT Yet Built
 
-No frontend. `held` rows exist as of Phase 15 (`create_booking(..., status=HELD)`) and
-genuinely occupy the exclusion domain (HOLD-01/02); Phase 16 gave them a REAL caller
-(cancellation and offer-decline both create/release holds via the actual cascade worker now,
-not just tests). But nothing yet EXPIRES an UNANSWERED hold — booking creation still does not
-run the cleanup-on-write DELETE from Spec §4.1 step 2, and there is no reaper. A hold whose
-`expires_at` passes with no one accepting OR declining it sits there forever (a real hold
-created by a real caller — a test's own transaction rollback still cleans those up). Both
-reclamation mechanisms (RFC v1.0 §10.4) are Phase 17 — WL-02 simulates what the reaper's own
-conditional UPDATE will need to do (proven directly, no real periodic job dispatching it yet).
-`waitlist_entry` (Phase 14) and `waitlist_offer` (Phase 16) both exist and are both real now:
-`create_offer_for_freed_range` (Phase 16) is `find_eligible_entries`' (Phase 14) first real
-caller, dispatched via `transaction.on_commit()` after a cancellation OR an offer decline.
-What's still missing from the FULL waitlist picture: expiry-driven cascade (Phase 17 — decline
-is the only "sooner than expiry" trigger that exists today) and notification dispatch (Phase
-18 — an offer is created and a hold reserved, but no one is actually notified of either yet).
-Celery/Redis exist as of Phase 13 (`kairos/celery.py`, `infra/docker-compose.yml`'s
-`redis`/`worker`/`beat` services); registered tasks are now
+No frontend. `held` rows exist as of Phase 15 and genuinely occupy the exclusion domain
+(HOLD-01/02); Phase 16 gave them a real caller (cancellation and offer-decline both create/
+release holds via the actual cascade worker); Phase 17 makes an UNANSWERED hold stop blocking
+anything too — both reclamation mechanisms (RFC v1.0 §10.4) are real now: cleanup-on-write
+(inside every `create_booking` call) and the reaper (`reap_expired_holds`, on Celery Beat
+every `HOLD_REAPER_INTERVAL_SECONDS`). `waitlist_entry` (Phase 14) and `waitlist_offer`
+(Phase 16) both exist and are both real: `create_offer_for_freed_range` (Phase 16) is
+`find_eligible_entries`' (Phase 14) first real caller, dispatched after a cancellation, an
+offer decline, OR now an expired-hold reclamation (Phase 17) — every trigger RFC v1.0 §10.2/
+§10.4 describes now has a real caller. Notification dispatch (Phase 18) is what's still
+missing: an offer is created, a hold reserved, a hold reclaimed and cascaded — but no one is
+actually notified of any of it yet (PRD FR52's explicit expiry notice on offer creation has no
+delivery mechanism at all). Full alert ROUTING (Phase 21) is separately still missing —
+`hold_reaper_heartbeat_is_stale` (Phase 17) makes staleness DETECTABLE from the data, and
+`GET /api/v1/admin/checks/latest` (the surface WL-05 Part B's own text names) doesn't exist
+yet to expose it. Celery/Redis exist as of Phase 13 (`kairos/celery.py`, `infra/docker-
+compose.yml`'s `redis`/`worker`/`beat` services); registered tasks are now
 `rolling_materialize_series_task`/`rematerialize_stale_series_task`/`check_tzdata_drift_task`/
-`create_offer_for_freed_range_task` (Phase 16) — hold reclamation and notification dispatch
-(Phases 17/18) still have no task. `recurring_series` rows are created for real via
+`create_offer_for_freed_range_task` (Phase 16)/`reap_expired_holds_task` (Phase 17) — only
+notification dispatch (Phase 18) still has no task. `recurring_series` rows are created for
+real via
 `POST /api/v1/bookings/recurring`
 (Phase 12), and the ROLLING MATERIALIZATION MECHANISM now exists (Phase 13,
 `kairos/bookings/tasks.py`) — but Phase 12's confirm STILL rejects a series whose occurrences
@@ -533,6 +570,17 @@ and `git log` first.
 | `POST /waitlist-offers/{id}/decline` requires `Idempotency-Key` despite Spec v1.0 §7's coverage list not naming it (mirroring `/confirm`, which IS named) | The third application of this project's own established broader-than-Spec precedent (`POST /recurring-series/{id}/cancel`, Phase 12; `POST /waitlist-entries/{id}/cancel`, Phase 14) — consistency, plus Spec v1.0 §7 point 7's GENERAL "conflict outcomes are recorded too" rule applies to `offer_already_resolved` exactly as it does to every other `RecordableConflictError` | `kairos/waitlist/views.py` (`WaitlistOfferDeclineView`) |
 | WL-01's B1/B2 setup uses ADJACENT (non-overlapping) confirmed bookings, not literally the overlapping example times Test Plan v1.0's prose gives | Two genuinely overlapping ranges cannot both be `status='confirmed'` on one resource simultaneously — that's the exact guarantee this whole project exists to enforce, so Test Plan's literal "B1 (09:00–10:00) and B2 (09:30–10:30) both confirmed" cannot describe two simultaneously-live rows as written. Read "two OVERLAPPING SIMULTANEOUS cancellations" as the cancellations executing concurrently in TIME (barrier-released), not the bookings' ranges overlapping each other — consistent with the test's own real purpose (proving the cascade code path is safe under genuine concurrent execution, the same rigor already given the bare constraint by CONC-01/HOLD-02) | `tests/concurrency/test_wl_01.py` |
 | WL-01 calls `cancel_booking` (the real Python service function, via real OS threads under `transaction=True`) rather than raw psycopg SQL | Unlike CONC-01–05/HOLD-02 (which deliberately prove the bare constraint, independent of application code), WL-01's actual subject IS the application-level cascade path — `create_booking(status=HELD)`'s retry-on-conflict loop and the `on_commit`-dispatched worker — so testing it via raw SQL would prove nothing about the code this phase actually wrote. Django provides a genuine per-thread connection automatically, and `CELERY_TASK_ALWAYS_EAGER` makes the dispatched cascade run synchronously within whichever thread's `on_commit` fires it | `tests/concurrency/test_wl_01.py` |
+| Cleanup-on-write's DELETE runs INSIDE `create_booking`, unconditionally for every caller — not as a separate opt-in step, not skipped for the cascade worker's own hold-creation calls | Its scope (`resource_id` + `time_range &&`) makes it correct regardless of what kind of row is about to be written: if an expired hold sits in the way, whoever writes next clears it, whether that writer is an ordinary user, a background job, or the cascade worker creating a DIFFERENT hold nearby. Making it conditional on the caller would need a reason to exclude some caller from PRD FR18 ("an expired hold must not block ANY booking") — none exists | `kairos/bookings/services.py` (`create_booking`) |
+| The cleanup DELETE uses `tstzrange(%s, %s)` (two bound datetime params) rather than building a range literal string for the raw SQL | Avoids manual string interpolation of a range boundary entirely — `tstzrange()` is a genuine SQL function taking two ordinary parameterized values, safer and simpler than the `range_literal()` string-building helper `tests/concurrency/harness.py` needs (that helper exists because raw psycopg test code has no Django ORM to lean on; application code does) | `kairos/bookings/services.py` (`create_booking`) |
+| `reap_expired_holds` reclaims each expired hold in its OWN independent transaction, not one transaction for the whole sweep | Mirrors `confirm_recurring_series`/`rolling_materialize_series`'s established per-item isolation (Phase 12/13): one hold losing its race to a concurrent acceptance (RECLAIM-03) must never roll back the reclamation of every OTHER expired hold the same sweep found — an all-or-nothing transaction would turn one contested row into a liveness failure for unrelated ones | `kairos/waitlist/services.py` (`reap_expired_holds`) |
+| The reaper's reclaim UPDATE is `WHERE id=... AND status='held' AND expires_at<=now()` — a CONDITIONAL update guarded on current status, identical in shape to `accept_offer`'s own guard, never a blind/unconditional one | This IS RECLAIM-03's race-safety claim made concrete: whichever of the reaper's UPDATE or acceptance's UPDATE commits first wins the row outright (Postgres serializes access to it); the loser's WHERE clause simply matches zero rows on re-evaluation. RFC v1.0 §10.4's own words — "the race... is safe in both orderings" — describe exactly this mechanism, not a coincidence of timing | `kairos/waitlist/services.py` (`reap_expired_holds`) |
+| `dispatch_cascade` (new, `kairos/waitlist/tasks.py`) is the ONE place `.delay()` is ever called from — `cancel_booking` and `decline_offer` both go through it, neither calls `create_offer_for_freed_range_task.delay(...)` directly any more | A `transaction.on_commit()` callback runs synchronously right after a REAL, already-successful commit — an exception escaping it propagates into the original request/caller, turning an already-committed cancel/decline into an apparent failure. WL-06 requires exactly the opposite ("booking creation and cancellation succeed... degraded liveness, the safe direction"). One wrapper, reused by both callers, rather than duplicating the `try/except` — verified LIVE, not just reasoned about (see the Phase 17 Completed Phases row) | `kairos/waitlist/tasks.py` (`dispatch_cascade`) |
+| `dispatch_cascade` catches a broad `Exception`, not a specific `kombu`/`redis` exception class | The LIVE WL-06 verification's actual traceback bottoms out in `kombu.exceptions.OperationalError` wrapping `redis.exceptions.ConnectionError` — but enumerating exact broker-library exception classes risks missing one and silently reintroducing the exact crash this wrapper exists to prevent. The cost of catching broadly here is low (this call site's only job is a fire-and-forget dispatch with no other side effect to mask) and the cost of catching too narrowly is a repeat of the WL-06 failure mode itself | `kairos/waitlist/tasks.py` (`dispatch_cascade`) |
+| `hold_reaper_heartbeat_is_stale` (new) reads `system_check_run` directly and returns a bool — it does NOT alert, page, or expose an endpoint | Implementation Plan Phase 17's own Scope IN is explicit: "Heartbeat alerting → Phase 21 (the heartbeat is written here)." WL-05 Part B's literal text names `GET /api/v1/admin/checks/latest` as the surface an alert would surface through — that endpoint doesn't exist yet (no phase before 21 builds it). Testing the DATA (is staleness genuinely detectable from what Phase 17 writes) rather than inventing an endpoint or alert pipeline out of scope is the honest middle path — the same discipline this project applied to Phase 13's "records a notification is due, sends nothing" gap | `kairos/waitlist/services.py` (`hold_reaper_heartbeat_is_stale`), `tests/waitlist/test_reclamation.py` |
+| RECLAIM-04 was ACTUALLY RUN at full DoD scale (200 writers × 50 runs) before this phase's own Definition of Done was marked satisfied — not estimated, not left at a reduced scale | Explicit instruction: "State which outcome actually occurred, with real numbers, before claiming this Definition of Done item is satisfied." Real result: 269 SQLSTATE 40P01 deadlocks across the 50 runs (roughly half the runs saw at least one; the other half saw zero) — NOT the DoD's literal "zero deadlocks." Per the SAME instruction's own anticipated second outcome: this is a documented liveness finding, not a failure — safety (never more than one success per round) held on all 10,000 attempts, every failure SQLSTATE was already in the documented retryable set, and 40P01 was ALREADY mapped to a retryable 503 by `BookingService` since Phase 4, before this phase ever touched it | `tests/concurrency/test_reclaim_04.py` |
+| RECLAIM-04 is excluded from the `concurrency` CI job (`--ignore`d in `.github/workflows/ci.yml`), though the test file exists and was run manually | Test Plan v1.0 §13 places RECLAIM-04 in the STAGING/pre-release tier explicitly (RECLAIM-01–03 are CI tier and run in the job normally) — 200×50 = 10,000 raw attempts taking over 6 minutes is expensive enough that per-commit execution would make CI unusable, Test Plan's own stated reason for the tier's existence, and the identical treatment CONC-01's own full 100-run+N=500 escalation already has (deferred to Phase 28, run manually/scheduled) | `.github/workflows/ci.yml`, `tests/concurrency/test_reclaim_04.py` |
+| WL-05 Part A and WL-06 were verified by ACTUALLY stopping the real `beat`/`redis` Docker containers and driving a real `manage.py runserver` (`kairos.settings.dev`, genuinely non-eager Celery) over real HTTP — not simulated, not mocked, no pytest test claims to cover them | Explicit instruction: a mocked simulation would not prove RFC v1.0 §4.3's real degradation behavior under a real outage; `CELERY_TASK_ALWAYS_EAGER` (test settings) means `.delay()` never touches a broker under pytest AT ALL regardless of Redis's real state, so no pytest test could have proven this even if it tried. `test_dispatch_cascade.py` is explicit about being a regression guard for the try/except's continued EXISTENCE, not a substitute for the live proof | manual verification, this session (see the Phase 17 Completed Phases row for the transcript); `tests/waitlist/test_dispatch_cascade.py` |
+| `kairos_dev` required a fresh `manage.py migrate` (superuser DSN) before the WL-05/WL-06 live verification — Phase 14/15/16/17's migrations had never been applied to it | `kairos_dev` is a separate, long-lived database from the ephemeral `kairos_test` pytest creates and destroys per run; nothing in the ordinary `pytest` workflow ever touches it. Routine to catch (the exact "Migrations need DDL privileges kairos_app doesn't have" step README already documents), not a new gap — flagged here only because it was a genuine precondition for this phase's live verification specifically | `README.md` §"Running Locally" |
 
 ## Running Locally
 
@@ -562,14 +610,29 @@ token; `POST /api/v1/auth/token` exchanges it for the session token every other 
 Background jobs (Phase 13) — `docker compose up -d` (the same command above) now ALSO starts
 `redis`, `worker`, and `beat`; nothing extra to run. Verified live: both containers connect
 to Redis and Postgres (as `kairos_app`) successfully, the worker's own startup log lists all
-three registered tasks, and a manually dispatched task of each kind (`check_tzdata_drift_task`,
-`rolling_materialize_series_task`) completed successfully against the real running worker.
+registered tasks (five as of Phase 17 —
+`rolling_materialize_series_task`/`rematerialize_stale_series_task`/`check_tzdata_drift_task`/
+`create_offer_for_freed_range_task`/`reap_expired_holds_task`), and a manually dispatched task
+of each kind completed successfully against the real running worker.
 `manage.py rematerialize_series` runs both materialization jobs synchronously, once, without
 a worker at all — the "on deploy" trigger RFC v1.0 §9.4 asks for, sharing the exact same
 functions Celery Beat calls on schedule (hourly by default —
 `ROLLING_MATERIALIZATION_INTERVAL_SECONDS`/`TZDATA_REMATERIALIZATION_INTERVAL_SECONDS`; the
-drift check is daily, `TZDATA_DRIFT_CHECK_INTERVAL_SECONDS` — all three tunable via
-`.env.example`).
+drift check is daily, `TZDATA_DRIFT_CHECK_INTERVAL_SECONDS`; the hold reaper is every 30s,
+`HOLD_REAPER_INTERVAL_SECONDS`, Phase 17 — all tunable via `.env.example`).
+
+Reclamation (Phase 17) — verified live against the real Docker stack, with `beat`/`redis`
+genuinely stopped (`docker compose stop beat` / `stop redis`), not simulated: with `beat`
+down, a hold seeded with a 3-second expiry sat `status='held'` 12+ seconds past `expires_at`
+with zero errors anywhere; with `redis` down, `POST /bookings`, `POST /bookings/{id}/cancel`,
+and a booking over an already-expired hold (cleanup-on-write) all still succeeded over real
+HTTP against `manage.py runserver` (`kairos.settings.dev`), the cancellation's cascade
+dispatch failed with a genuine `kombu.exceptions.OperationalError` caught and logged
+(`cascade_dispatch_failed_broker_unavailable`) rather than surfacing as a request failure, zero
+`waitlist_offer` rows were created, and the worker reconnected cleanly once `redis` restarted.
+`kairos_dev` needed a fresh `manage.py migrate` first — Phase 14 through 17's migrations had
+never been applied to it before this session (only `kairos_test`, which `pytest` creates and
+destroys fresh every run, had been current).
 
 The frontend starts Phase 23.
 
@@ -589,13 +652,16 @@ asserts ZERO successes unconditionally every run, not "at most one," since the r
 never actually free), WL-01 (Phase 16: two real threads calling `cancel_booking` itself, not
 raw SQL — the cascade code path is this test's actual subject — 50 runs, ground truth via
 `count_overlapping_pairs`), WL-02 (Phase 16: 100 runs, simulated-reaper-expiry vs. real
-acceptance racing on one hold row, split 50/50 between orderings). Each CONC round is retried
-up to 10 times only if it produced zero successes (a documented, load-correlated liveness
-characteristic — see Key Technical Decisions); more than one success on any single attempt
-fails immediately and is never retried — HOLD-02/WL-01/WL-02 have no such retry logic, since
-their outcome is a SAFETY invariant (zero successes; exactly one race winner) checked
-unconditionally on every single attempt, not a liveness characteristic to route around.
-CONC-03/04/HOLD-02/WL-02 exercise raw UPDATE/INSERT SQL directly through the same
+acceptance racing on one hold row, split 50/50 between orderings), RECLAIM-03 (Phase 17: 100
+runs, cleanup-on-write's DELETE+INSERT vs. the real acceptance UPDATE). RECLAIM-04 (Phase 17:
+200×50, deadlock-under-load) is a fifth file in this directory but is EXCLUDED from this
+default sweep — see below. Each CONC round is retried up to 10 times only if it produced zero
+successes (a documented, load-correlated liveness characteristic — see Key Technical
+Decisions); more than one success on any single attempt fails immediately and is never
+retried — HOLD-02/WL-01/WL-02/RECLAIM-03 have no such retry logic, since their outcome is a
+SAFETY invariant (zero successes; exactly one race winner) checked unconditionally on every
+single attempt, not a liveness characteristic to route around. CONC-03/04/HOLD-02/WL-02/
+RECLAIM-03/RECLAIM-04 exercise raw UPDATE/INSERT/DELETE SQL directly through the same
 barrier-released harness as the others, not through the service/view layer — proving the
 constraint itself, independent of application code (the HTTP-level translation HOLD-02 does
 NOT re-prove is instead covered by `tests/bookings/test_holds.py`'s real-HTTP step; WL-01
@@ -769,10 +835,37 @@ hold's `expires_at` in the future, 50 in the past — deterministically covering
 racing a simulated reaper-expiry `UPDATE` against the real RFC v1.0 §10.3 acceptance `UPDATE`
 on the identical row; exactly one affects 1 row, the other 0, every single run.
 
+`tests/bookings/test_cleanup_on_write.py` (Phase 17) — RECLAIM-01: a booking succeeds over a
+seeded expired hold with no reaper anywhere in the test (the DELETE inside `create_booking` is
+the only thing that could have cleared it), the hold row is genuinely GONE afterward (not
+merely superseded); a hold that HASN'T expired yet survives an overlapping write attempt (which
+itself then correctly 409s); an expired hold on a non-overlapping range is untouched by a write
+elsewhere on the same resource (the DELETE's own `time_range &&` scoping).
+`tests/waitlist/test_reclamation.py` (Phase 17) — RECLAIM-02: `reap_expired_holds` cascades to
+the next eligible entry with zero booking traffic (called directly — Test Plan's own
+"controllable time" requirement, not a real 30s wait); a hold with no eligible entry is
+released without cascading; every run writes a `hold_reaper` heartbeat; a reclaimed hold's
+audit row shows `actor_type='system'`. WL-05 Part B: no heartbeat at all is stale; a heartbeat
+older than the threshold is stale; a fresh one isn't.
+`tests/concurrency/test_reclaim_03.py` (Phase 17) — RECLAIM-03: 100 barrier-released runs,
+cleanup-on-write's DELETE+INSERT (mirroring `create_booking`'s own statement order) racing the
+literal RFC v1.0 §10.3 acceptance `UPDATE`; correctness inferred by correlating the two
+outcomes (whichever wins, the other's failure mode is structurally determined), ground truth
+exactly one active row every run.
+`tests/concurrency/test_reclaim_04.py` (Phase 17) — RECLAIM-04, run manually at full DoD scale
+(200 writers × 50 runs) with real, reported numbers (see the Phase 17 Completed Phases row) —
+deliberately excluded from the CI `concurrency` job (Test Plan v1.0 §13's staging tier); run
+before a release with `pytest tests/concurrency/test_reclaim_04.py -v -s`.
+`tests/waitlist/test_dispatch_cascade.py` (Phase 17) — a regression guard proving
+`dispatch_cascade` swallows and logs a broker failure rather than propagating it; WL-05 Part A
+and WL-06 themselves were verified LIVE against a real Docker stack, not by any pytest test
+(`CELERY_TASK_ALWAYS_EAGER` makes a genuine broker outage unreproducible under pytest) — see
+the Phase 17 Completed Phases row for the full transcript.
+
 Also runnable: `cd backend && ruff check . && ruff format --check . && mypy kairos` (all pass
-with zero findings as of Phase 16). CI (`.github/workflows/ci.yml`) runs all of this as three
-jobs — `lint`, `test`, `concurrency` — on every PR. The spike scripts under `scripts/spike/`
-are runnable but are diagnostic, not a test suite — see
+with zero findings as of Phase 17). CI (`.github/workflows/ci.yml`) runs the CI tier as three
+jobs — `lint`, `test`, `concurrency` (RECLAIM-04 excluded, see above) — on every PR. The spike
+scripts under `scripts/spike/` are runnable but are diagnostic, not a test suite — see
 `docs/spikes/S1-postgres-verification.md` for what each one does and its recorded output.
 
 ## Open Questions
