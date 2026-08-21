@@ -16,7 +16,7 @@ from kairos.core.exceptions import NotFoundError, PolicyValidationError, SlotAlr
 from kairos.identity.authorization import AuthorizationService
 from kairos.resources.models import Resource, ResourceStatus
 
-from .models import WaitlistEntry
+from .models import WaitlistEntry, WaitlistOffer
 from .services import slot_is_free
 
 
@@ -74,10 +74,48 @@ class WaitlistEntryResponseSerializer(serializers.Serializer[WaitlistEntry]):
         positions: dict[uuid.UUID, int] = self.context.get("queue_positions", {})
         return positions.get(obj.id)
 
-    def get_active_offer(self, obj: WaitlistEntry) -> None:
-        # No offer mechanism exists yet (Phase 16) — every entry's active
-        # offer is None regardless of status, always present as a key
-        # (never omitted) to match Spec v1.0 §5.12's shape and this
+    def get_active_offer(self, obj: WaitlistEntry) -> dict[str, str] | None:
+        # Present only when an ACTIVE offer actually exists for this entry
+        # (Spec v1.0 §5.12: "present only when status: 'offered'") — always
+        # present AS A KEY regardless (null otherwise), matching this
         # codebase's "always-present, sometimes null" field convention
         # (see BookingResponseSerializer's cancelled_at/cancelled_by).
-        return None
+        # Batched by the view (one query for the whole page, RFC v1.0
+        # §7.2's N+1 guard — the same principle queue_position already
+        # applies), never queried per row here.
+        offers: dict[uuid.UUID, WaitlistOffer] = self.context.get("active_offers", {})
+        offer = offers.get(obj.id)
+        if offer is None:
+            return None
+        return {
+            "id": str(offer.id),
+            "expires_at": offer.expires_at.isoformat().replace("+00:00", "Z"),
+        }
+
+
+class WaitlistOfferResponseSerializer(serializers.Serializer[WaitlistOffer]):
+    """POST /waitlist-offers/{id}/decline's 200 response body (Spec v1.0
+    §5.13: "offer with status: 'declined'"). `/confirm`'s response is the
+    BOOKING, not the offer (Spec v1.0 §5.13's own wording) — reuses
+    `BookingResponseSerializer` directly instead, with `waitlist_offer_id`
+    added at the view layer (see `WaitlistOfferConfirmView`).
+    """
+
+    id = serializers.UUIDField()
+    waitlist_entry_id = serializers.SerializerMethodField()
+    hold_booking_id = serializers.SerializerMethodField()
+    resource_id = serializers.SerializerMethodField()
+    start = serializers.DateTimeField(source="time_range.lower")
+    end = serializers.DateTimeField(source="time_range.upper")
+    status = serializers.CharField()
+    expires_at = serializers.DateTimeField()
+    created_at = serializers.DateTimeField()
+
+    def get_waitlist_entry_id(self, obj: WaitlistOffer) -> str:
+        return str(obj.waitlist_entry_id)
+
+    def get_hold_booking_id(self, obj: WaitlistOffer) -> str:
+        return str(obj.hold_booking_id)
+
+    def get_resource_id(self, obj: WaitlistOffer) -> str:
+        return str(obj.resource_id)

@@ -14,15 +14,14 @@ from rest_framework.response import Response
 from rest_framework.views import exception_handler as drf_default_exception_handler
 
 from kairos.core.exceptions import (
-    AlreadyOnWaitlistError,
     IdempotencyKeyConflictError,
     NotFoundError,
     PolicyValidationError,
     PreviewExpiredError,
+    RecordableConflictError,
     RequestInProgressError,
     ServiceUnavailableError,
     SlotAlreadyAvailableError,
-    SlotUnavailableError,
     UnacknowledgedConflictsError,
 )
 
@@ -76,15 +75,14 @@ def _map_drf_exception(exc: Exception) -> tuple[str, str]:
 def kairos_exception_handler(exc: Exception, context: dict[str, Any]) -> Response | None:
     request_id = request_id_from_context(context)
 
-    if isinstance(exc, SlotUnavailableError):
+    if isinstance(exc, RecordableConflictError):
+        # Generic across every "legitimate final 409/422 outcome" domain
+        # exception (SlotUnavailableError, AlreadyOnWaitlistError,
+        # OfferExpiredError, OfferAlreadyResolvedError, Phase 14/16) — one
+        # branch, not one isinstance check per exception type.
         return Response(
-            build_error_envelope(
-                "slot_unavailable",
-                "This time slot is no longer available.",
-                None,
-                request_id,
-            ),
-            status=409,
+            build_error_envelope(exc.code, exc.message, None, request_id),
+            status=exc.http_status,
         )
 
     if isinstance(exc, ServiceUnavailableError):
@@ -142,17 +140,6 @@ def kairos_exception_handler(exc: Exception, context: dict[str, Any]) -> Respons
                 "unacknowledged_conflicts",
                 "The preview reported conflicts or time adjustments this request did not "
                 "acknowledge.",
-                None,
-                request_id,
-            ),
-            status=409,
-        )
-
-    if isinstance(exc, AlreadyOnWaitlistError):
-        return Response(
-            build_error_envelope(
-                "already_on_waitlist",
-                "You already have a live waitlist entry for this resource and time range.",
                 None,
                 request_id,
             ),

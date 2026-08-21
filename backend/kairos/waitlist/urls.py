@@ -1,6 +1,11 @@
 from django.urls import path
 
-from .views import WaitlistEntryCancelView, WaitlistEntryCollectionView
+from .views import (
+    WaitlistEntryCancelView,
+    WaitlistEntryCollectionView,
+    WaitlistOfferConfirmView,
+    WaitlistOfferDeclineView,
+)
 
 urlpatterns = [
     path(
@@ -10,5 +15,15 @@ urlpatterns = [
         "waitlist-entries/<uuid:pk>/cancel",
         WaitlistEntryCancelView.as_view(),
         name="waitlist-entry-cancel",
+    ),
+    path(
+        "waitlist-offers/<uuid:pk>/confirm",
+        WaitlistOfferConfirmView.as_view(),
+        name="waitlist-offer-confirm",
+    ),
+    path(
+        "waitlist-offers/<uuid:pk>/decline",
+        WaitlistOfferDeclineView.as_view(),
+        name="waitlist-offer-decline",
     ),
 ]

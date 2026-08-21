@@ -30,10 +30,9 @@ from django.utils import timezone
 from kairos.core.db import apply_write_path_session_settings
 from kairos.core.drf import build_error_envelope
 from kairos.core.exceptions import (
-    AlreadyOnWaitlistError,
     IdempotencyKeyConflictError,
+    RecordableConflictError,
     RequestInProgressError,
-    SlotUnavailableError,
 )
 from kairos.core.models import IdempotencyKey, IdempotencyKeyStatus
 from kairos.identity.models import AppUser
@@ -160,32 +159,24 @@ def run_idempotent_write(
             )
             raise RequestInProgressError from exc
         raise
-    except SlotUnavailableError:
+    except RecordableConflictError as exc:
+        # Generic across every domain exception whose outcome is a
+        # legitimate final 409/422 (Spec v1.0 §7 point 7) — SlotUnavailableError
+        # (booking create/edit), AlreadyOnWaitlistError (Phase 14),
+        # OfferExpiredError/OfferAlreadyResolvedError (Phase 16). One
+        # branch reading the exception's own code/message/http_status,
+        # not one isinstance clause per exception type (see
+        # RecordableConflictError's own docstring for why this was
+        # consolidated in Phase 16, not before).
         _record_conflict_outcome(
             user,
             key,
             endpoint,
             fingerprint,
             request_id,
-            code="slot_unavailable",
-            message="This time slot is no longer available.",
-            http_status=409,
-        )
-        raise
-    except AlreadyOnWaitlistError:
-        # Generalizes the identical Spec v1.0 §7 point 7 rule
-        # (SlotUnavailableError's branch above) to waitlist join (Phase
-        # 14) — this module's own docstring already named Phase 14 as a
-        # future reuser of this exact mechanism, not a new one.
-        _record_conflict_outcome(
-            user,
-            key,
-            endpoint,
-            fingerprint,
-            request_id,
-            code="already_on_waitlist",
-            message="You already have a live waitlist entry for this resource and time range.",
-            http_status=409,
+            code=exc.code,
+            message=exc.message,
+            http_status=exc.http_status,
         )
         raise
 
