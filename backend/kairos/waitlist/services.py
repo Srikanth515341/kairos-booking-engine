@@ -12,15 +12,24 @@ import uuid
 from dataclasses import dataclass
 
 from django.db import DatabaseError, connection, transaction
+from django.utils import timezone as django_timezone
 
 from kairos.bookings.models import Booking, BookingStatus
+from kairos.bookings.services import BookingCreateRequest, create_booking
 from kairos.core.db import apply_write_path_session_settings
-from kairos.core.exceptions import AlreadyOnWaitlistError, ServiceUnavailableError
+from kairos.core.exceptions import (
+    AlreadyOnWaitlistError,
+    OfferAlreadyResolvedError,
+    OfferExpiredError,
+    ServiceUnavailableError,
+    SlotUnavailableError,
+)
 from kairos.core.models import AuditActorType
 from kairos.identity.models import AppUser
 from kairos.resources.models import Resource
 
-from .models import WaitlistEntry, WaitlistEntryStatus
+from .models import WaitlistEntry, WaitlistEntryStatus, WaitlistOffer, WaitlistOfferStatus
+from .tasks import create_offer_for_freed_range_task
 
 logger = logging.getLogger(__name__)
 
@@ -65,12 +74,10 @@ def find_eligible_entries(
     # the entry's requested range or the entry is not eligible.
     # PRD v1.0 FR21.
     #
-    # Ordered FCFS (PRD FR22) — Phase 16's offer-cascade job consumes this
-    # ordering directly to offer to the highest-ranked eligible entry
-    # first. No live caller yet (holds/offers are Phase 15/16): proven
-    # directly against ORM-created rows here, the same "mechanism before
-    # its real caller" pattern already used for actor_type='system'
-    # (Phase 8/13) and rolling materialization (Phase 13).
+    # Ordered FCFS (PRD FR22) — create_offer_for_freed_range (below,
+    # Phase 16) consumes this ordering directly to offer to the
+    # highest-ranked eligible entry first, advancing to the next one on a
+    # hold-creation conflict.
     return list(
         WaitlistEntry.objects.filter(
             resource_id=resource_id,
@@ -168,12 +175,19 @@ def cancel_waitlist_entry(req: WaitlistCancelRequest) -> WaitlistCancelResult:
     The conditional UPDATE is guarded on the entry's CURRENT status
     ('waiting'), mirroring cancel_booking's identical guard-on-current-
     status pattern (kairos.bookings.services) — cancelling an
-    already-cancelled entry is a 200 no-op, not an error. 'offered' isn't
-    reachable yet (Phase 16 is the first real writer of that status), so
-    unlike cancel_booking this guard has only one live non-terminal state
-    to cover today; Phase 16 revisiting offer decline/cascade should
-    extend this the same way cancel_booking will eventually need to
-    account for 'held'.
+    already-cancelled entry is a 200 no-op, not an error.
+
+    Documented, NOT fixed this phase: an 'offered' entry (reachable for
+    real as of Phase 16) also fails this guard (0 rows) and is reported
+    back as `already_cancelled=True` with its REAL current status
+    ('offered', not 'cancelled') in the response body — truthful, but a
+    user calling THIS endpoint on an outstanding offer gets a silent
+    200 no-op instead of either an error steering them to
+    `decline_offer` (below) or this function correctly performing that
+    release itself. Fixing it correctly means this function absorbing
+    decline_offer's hold-release-and-cascade logic, which is a real
+    change, not a guard tweak — flagged for a future phase rather than
+    silently patched under this one's own unrelated scope.
     """
     log_context = {
         "request_id": req.request_id,
@@ -198,3 +212,207 @@ def cancel_waitlist_entry(req: WaitlistCancelRequest) -> WaitlistCancelResult:
         extra={**log_context, "outcome": "success"},
     )
     return WaitlistCancelResult(entry=entry, already_cancelled=not updated)
+
+
+def create_offer_for_freed_range(
+    resource: Resource,
+    freed_start: datetime.datetime,
+    freed_end: datetime.datetime,
+    request_id: str,
+) -> WaitlistOffer | None:
+    """RFC v1.0 §10.2 / Spec v1.0 §4.2 — the worker `transaction.on_commit()`
+    enqueues (via `create_offer_for_freed_range_task`) after a cancellation
+    or an offer decline frees a range. Not an HTTP-request-scoped
+    function: `request_id` here is a correlation id carried forward
+    through the audit trail (Phase 8's convention), not tied to any
+    live request the caller is blocking on.
+
+    PRD FR23: the hold is created BEFORE the offer — the loop below never
+    constructs a `WaitlistOffer` row until `create_booking` has already
+    succeeded, so an offer without a hold cannot exist even transiently.
+    """
+    log_context = {"request_id": request_id, "resource_id": str(resource.id)}
+    candidates = find_eligible_entries(resource.id, freed_start, freed_end)
+
+    for entry in candidates:
+        entry_start, entry_end = entry.time_range.lower, entry.time_range.upper
+        try:
+            hold = create_booking(
+                BookingCreateRequest(
+                    resource=resource,
+                    user=entry.user,
+                    start=entry_start,
+                    end=entry_end,
+                    request_id=request_id,
+                    actor_type=AuditActorType.SYSTEM,
+                    status=BookingStatus.HELD,
+                )
+            )
+        except SlotUnavailableError:
+            # Spec v1.0 §4.2: something already occupies the range — a
+            # race with a direct booking, or another worker attempting
+            # the same freed range. Re-query and try the next candidate —
+            # the SAME retry-on-conflict pattern used everywhere else in
+            # this design (RFC v1.0 §10.2 point 3), not a new one invented
+            # for this subsystem.
+            logger.info(
+                "offer_hold_conflict",
+                extra={**log_context, "entry_id": str(entry.id)},
+            )
+            continue
+
+        # create_booking(..., status=HELD) always sets expires_at (Phase
+        # 15's hold_has_expiry DB CHECK requires it) — the assertion is
+        # for mypy, not a runtime possibility.
+        assert hold.expires_at is not None
+        offer = WaitlistOffer.objects.create(
+            waitlist_entry=entry,
+            hold_booking=hold,
+            resource=resource,
+            time_range=(entry_start, entry_end),
+            status=WaitlistOfferStatus.ACTIVE,
+            expires_at=hold.expires_at,
+        )
+        WaitlistEntry.objects.filter(id=entry.id).update(status=WaitlistEntryStatus.OFFERED)
+        logger.info(
+            "waitlist_offer_created",
+            extra={**log_context, "offer_id": str(offer.id), "entry_id": str(entry.id)},
+        )
+        return offer
+
+    logger.info("no_eligible_waitlist_entry", extra=log_context)
+    return None
+
+
+@dataclass(frozen=True)
+class AcceptOfferRequest:
+    offer: WaitlistOffer
+    user: AppUser
+    request_id: str
+
+
+def accept_offer(req: AcceptOfferRequest) -> Booking:
+    """RFC v1.0 §10.3 / Spec v1.0 §4.3, executed exactly. No
+    `slot_unavailable` is structurally possible on this path — there is
+    no INSERT here, only a conditional UPDATE against a row that already
+    occupies the exclusion domain (Spec v1.0 §5.13: "If it ever fires,
+    the hold mechanism is broken and it is an incident, not a
+    user-facing error").
+    """
+    log_context = {
+        "request_id": req.request_id,
+        "user_id": str(req.user.id),
+        "offer_id": str(req.offer.id),
+    }
+    with transaction.atomic():
+        with connection.cursor() as cursor:
+            apply_write_path_session_settings(
+                cursor,
+                actor_id=str(req.user.id),
+                actor_type=AuditActorType.USER,
+                request_id=req.request_id,
+            )
+        # The literal Spec v1.0 §4.3 conditional UPDATE — status, owner,
+        # AND expiry all guard the same statement, so a wrong user or an
+        # expired hold both fail identically (0 rows), never a partial
+        # success.
+        updated = Booking.objects.filter(
+            id=req.offer.hold_booking_id,
+            status=BookingStatus.HELD,
+            user=req.user,
+            expires_at__gt=django_timezone.now(),
+        ).update(status=BookingStatus.CONFIRMED, expires_at=None)
+        if not updated:
+            logger.info("offer_expired", extra=log_context)
+            raise OfferExpiredError
+        WaitlistOffer.objects.filter(id=req.offer.id, status=WaitlistOfferStatus.ACTIVE).update(
+            status=WaitlistOfferStatus.CONFIRMED
+        )
+        WaitlistEntry.objects.filter(id=req.offer.waitlist_entry_id).update(
+            status=WaitlistEntryStatus.FULFILLED
+        )
+        booking = Booking.objects.get(id=req.offer.hold_booking_id)
+
+    logger.info("offer_accepted", extra={**log_context, "outcome": "success"})
+    return booking
+
+
+@dataclass(frozen=True)
+class DeclineOfferRequest:
+    offer: WaitlistOffer
+    user: AppUser
+    request_id: str
+
+
+def decline_offer(req: DeclineOfferRequest) -> WaitlistOffer:
+    """Spec v1.0 §5.13: releases the hold immediately (never waits for
+    expiry) and cascades sooner than expiry would, via the SAME
+    `create_offer_for_freed_range` worker a cancellation dispatches,
+    enqueued through the identical `transaction.on_commit()` pattern (RFC
+    v1.0 §5c step 4) so a rollback can never leave a worker acting on a
+    range that wasn't really freed.
+
+    Guarded on the offer's CURRENT status ('active'), but — unlike
+    `cancel_booking`/`cancel_waitlist_entry` — an already-resolved offer
+    is NOT a 200 no-op: Spec v1.0 §5.13 names `offer_already_resolved` as
+    its own distinct failure code, a deliberate choice this function
+    honors rather than reusing the idempotent-cancel convention.
+
+    The declining entry's own status becomes 'expired', not back to
+    'waiting' — this is what stops it from immediately re-winning the
+    very cascade its own decline triggers (`find_eligible_entries` filters
+    `WHERE status='waiting'`); it also gives `WaitlistEntryStatus.EXPIRED`
+    — otherwise unused before this phase — its actual meaning: this
+    entry's specific opportunity is over, distinct from CANCELLED (the
+    user withdrew the request entirely, Phase 14) or FULFILLED (accepted).
+    """
+    log_context = {
+        "request_id": req.request_id,
+        "user_id": str(req.user.id),
+        "offer_id": str(req.offer.id),
+    }
+    with transaction.atomic():
+        with connection.cursor() as cursor:
+            apply_write_path_session_settings(
+                cursor,
+                actor_id=str(req.user.id),
+                actor_type=AuditActorType.USER,
+                request_id=req.request_id,
+            )
+        updated = WaitlistOffer.objects.filter(
+            id=req.offer.id, status=WaitlistOfferStatus.ACTIVE
+        ).update(status=WaitlistOfferStatus.DECLINED)
+        if not updated:
+            raise OfferAlreadyResolvedError
+
+        # expires_at must be cleared, not just status changed — the
+        # hold_has_expiry DB CHECK constraint (Phase 2) requires
+        # expires_at IS NULL for any non-'held' row. Caught empirically
+        # (SQLSTATE 23514) while building WL-02's reaper simulation,
+        # which needed the identical fix.
+        Booking.objects.filter(id=req.offer.hold_booking_id, status=BookingStatus.HELD).update(
+            status=BookingStatus.CANCELLED,
+            cancelled_at=django_timezone.now(),
+            expires_at=None,
+        )
+        WaitlistEntry.objects.filter(id=req.offer.waitlist_entry_id).update(
+            status=WaitlistEntryStatus.EXPIRED
+        )
+
+        resource_id = req.offer.resource_id
+        range_start, range_end = req.offer.time_range.lower, req.offer.time_range.upper
+        # Registered INSIDE this atomic block, so Django defers it until
+        # the OUTER transaction (run_idempotent_write's) actually commits
+        # — the same cancel_booking precedent (kairos.bookings.services),
+        # never fired from inside the write itself, where a later rollback
+        # could leave a worker acting on a range that was never really
+        # freed.
+        transaction.on_commit(
+            lambda: create_offer_for_freed_range_task.delay(
+                str(resource_id), range_start.isoformat(), range_end.isoformat(), req.request_id
+            )
+        )
+
+    offer = WaitlistOffer.objects.get(id=req.offer.id)
+    logger.info("offer_declined", extra={**log_context, "outcome": "success"})
+    return offer

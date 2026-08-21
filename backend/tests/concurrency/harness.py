@@ -72,6 +72,13 @@ class ClientOutcome:
     success: bool
     sqlstate: str | None
     latency_s: float
+    # None for actions that don't matter (INSERTs — success/failure alone
+    # decides the outcome). Populated for a conditional UPDATE/DELETE
+    # (Phase 16, WL-02) where the WHERE clause can match zero rows WITHOUT
+    # raising any error at all — a plain success/failure split can't
+    # distinguish "my UPDATE won the race" from "it silently matched
+    # nothing," which is the entire question WL-02 asks.
+    rowcount: int | None = None
 
 
 def django_test_dsn() -> str:
@@ -126,9 +133,13 @@ def run_concurrent(
             try:
                 with conn.cursor() as cur:
                     action(cur)
+                    rowcount = cur.rowcount
                 conn.commit()
                 outcome = ClientOutcome(
-                    success=True, sqlstate=None, latency_s=time.perf_counter() - start
+                    success=True,
+                    sqlstate=None,
+                    latency_s=time.perf_counter() - start,
+                    rowcount=rowcount,
                 )
             except psycopg.Error as exc:
                 conn.rollback()

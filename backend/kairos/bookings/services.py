@@ -22,6 +22,7 @@ from kairos.core.exceptions import ServiceUnavailableError, SlotUnavailableError
 from kairos.core.models import AuditActorType
 from kairos.identity.models import AppUser
 from kairos.resources.models import Resource
+from kairos.waitlist.tasks import create_offer_for_freed_range_task
 
 logger = logging.getLogger(__name__)
 
@@ -289,15 +290,22 @@ def cancel_booking(req: BookingCancelRequest) -> BookingCancelResult:
             )
             booking = Booking.objects.get(id=req.booking.id)
             if updated:
-                # RFC v1.0 §5c step 4 — real dispatch arrives in Phase 16.
-                # Registered here, INSIDE this atomic block, so Django
-                # defers it until the OUTER transaction (run_idempotent_
-                # write's, which also records the idempotency outcome)
-                # actually commits — never fired from inside the write
-                # itself, where a later rollback could leave a worker
-                # acting on a range that was never really freed.
+                # RFC v1.0 §5c step 4 (Phase 16). Registered here, INSIDE
+                # this atomic block, so Django defers it until the OUTER
+                # transaction (run_idempotent_write's, which also records
+                # the idempotency outcome) actually commits — never fired
+                # from inside the write itself, where a later rollback
+                # could leave a worker acting on a range that was never
+                # really freed.
+                resource_id = booking.resource_id
+                range_start, range_end = booking.time_range.lower, booking.time_range.upper
                 transaction.on_commit(
-                    lambda: logger.info("would_enqueue_waitlist_check", extra=log_context)
+                    lambda: create_offer_for_freed_range_task.delay(
+                        str(resource_id),
+                        range_start.isoformat(),
+                        range_end.isoformat(),
+                        req.request_id,
+                    )
                 )
     except DatabaseError as exc:
         _handle_write_database_error(exc, log_context)

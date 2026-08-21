@@ -10,6 +10,7 @@ from rest_framework import status
 from rest_framework.request import Request
 from rest_framework.response import Response
 
+from kairos.bookings.serializers import BookingResponseSerializer
 from kairos.core.exceptions import NotFoundError, PolicyValidationError
 from kairos.core.idempotency import run_idempotent_write
 from kairos.core.models import AuditActorType
@@ -17,12 +18,20 @@ from kairos.core.pagination import decode_cursor, encode_cursor, parse_limit
 from kairos.core.views import KairosAPIView
 from kairos.identity.models import AppUser
 
-from .models import WaitlistEntry, WaitlistEntryStatus
-from .serializers import WaitlistEntryResponseSerializer, WaitlistJoinSerializer
+from .models import WaitlistEntry, WaitlistEntryStatus, WaitlistOffer, WaitlistOfferStatus
+from .serializers import (
+    WaitlistEntryResponseSerializer,
+    WaitlistJoinSerializer,
+    WaitlistOfferResponseSerializer,
+)
 from .services import (
+    AcceptOfferRequest,
+    DeclineOfferRequest,
     WaitlistCancelRequest,
     WaitlistJoinRequest,
+    accept_offer,
     cancel_waitlist_entry,
+    decline_offer,
     join_waitlist,
 )
 
@@ -71,6 +80,29 @@ def _queue_positions(entries: list[WaitlistEntry]) -> dict[uuid.UUID, int]:
     return positions
 
 
+def _active_offers(entries: list[WaitlistEntry]) -> dict[uuid.UUID, WaitlistOffer]:
+    """One query for the whole page (RFC v1.0 §7.2's N+1 guard), not one
+    per entry — mirrors `_queue_positions` above."""
+    return {
+        offer.waitlist_entry_id: offer
+        for offer in WaitlistOffer.objects.filter(
+            waitlist_entry_id__in=[e.id for e in entries], status=WaitlistOfferStatus.ACTIVE
+        )
+    }
+
+
+def _entry_response(entry: WaitlistEntry) -> dict[str, Any]:
+    return dict(
+        WaitlistEntryResponseSerializer(
+            entry,
+            context={
+                "queue_positions": _queue_positions([entry]),
+                "active_offers": _active_offers([entry]),
+            },
+        ).data
+    )
+
+
 class WaitlistEntryCollectionView(KairosAPIView):
     """POST /api/v1/waitlist-entries (Spec v1.0 §5.11) and
     GET /api/v1/waitlist-entries (Spec v1.0 §5.12)."""
@@ -95,11 +127,7 @@ class WaitlistEntryCollectionView(KairosAPIView):
                     request_id=request_id,
                 )
             )
-            positions = _queue_positions([entry])
-            body = dict(
-                WaitlistEntryResponseSerializer(entry, context={"queue_positions": positions}).data
-            )
-            return status.HTTP_201_CREATED, body
+            return status.HTTP_201_CREATED, _entry_response(entry)
 
         result = run_idempotent_write(
             user=user,
@@ -159,10 +187,15 @@ class WaitlistEntryCollectionView(KairosAPIView):
             next_cursor = encode_cursor(last.joined_at.isoformat(), str(last.id))
 
         positions = _queue_positions(rows)
+        offers = _active_offers(rows)
         return Response(
             {
                 "data": [
-                    WaitlistEntryResponseSerializer(e, context={"queue_positions": positions}).data
+                    dict(
+                        WaitlistEntryResponseSerializer(
+                            e, context={"queue_positions": positions, "active_offers": offers}
+                        ).data
+                    )
                     for e in rows
                 ],
                 "next_cursor": next_cursor,
@@ -202,13 +235,7 @@ class WaitlistEntryCancelView(KairosAPIView):
             result = cancel_waitlist_entry(
                 WaitlistCancelRequest(entry=entry, actor=user, request_id=request_id)
             )
-            positions = _queue_positions([result.entry])
-            body = dict(
-                WaitlistEntryResponseSerializer(
-                    result.entry, context={"queue_positions": positions}
-                ).data
-            )
-            return status.HTTP_200_OK, body
+            return status.HTTP_200_OK, _entry_response(result.entry)
 
         result = run_idempotent_write(
             user=user,
@@ -218,6 +245,97 @@ class WaitlistEntryCancelView(KairosAPIView):
             # as booking cancel/edit (kairos.bookings.views): the body
             # alone (empty here) never mentions which entry this is about.
             body={"entry_id": str(pk), **dict(request.data)},
+            request_id=request_id,
+            actor_type=AuditActorType.USER,
+            perform_write=perform_write,
+        )
+
+        response = Response(result.response_body, status=result.response_status)
+        if result.is_replay:
+            response["Idempotent-Replay"] = "true"
+        return response
+
+
+def _get_offer_for_owner(pk: uuid.UUID, user: AppUser) -> WaitlistOffer:
+    try:
+        offer = WaitlistOffer.objects.select_related("waitlist_entry").get(id=pk)
+    except WaitlistOffer.DoesNotExist as exc:
+        raise NotFoundError from exc
+    # Permission: the entry's owner. Otherwise 404 (Spec v1.0 §5.13) — same
+    # object-level protection convention as every other endpoint here.
+    if offer.waitlist_entry.user_id != user.id:
+        raise NotFoundError
+    return offer
+
+
+class WaitlistOfferConfirmView(KairosAPIView):
+    """POST /api/v1/waitlist-offers/{id}/confirm (Spec v1.0 §5.13)."""
+
+    def post(self, request: Request, pk: uuid.UUID) -> Response:
+        idempotency_key = _require_idempotency_key(request)
+        user = cast(AppUser, request.user)
+        offer = _get_offer_for_owner(pk, user)
+        request_id = _request_id(request)
+
+        def perform_write() -> tuple[int, dict[str, Any]]:
+            booking = accept_offer(
+                AcceptOfferRequest(offer=offer, user=user, request_id=request_id)
+            )
+            # Spec v1.0 §5.13: "the booking (the hold row, now confirmed),
+            # with waitlist_offer_id populated" — booking has no such
+            # column (Spec v1.0 §3's DDL doesn't define one), so it's
+            # added here at the response layer rather than broadening
+            # BookingResponseSerializer's shared shape for every OTHER
+            # booking response that doesn't promise this field.
+            body = dict(BookingResponseSerializer(booking).data)
+            body["waitlist_offer_id"] = str(offer.id)
+            return status.HTTP_201_CREATED, body
+
+        result = run_idempotent_write(
+            user=user,
+            key=idempotency_key,
+            endpoint=f"POST /api/v1/waitlist-offers/{pk}/confirm",
+            body={"offer_id": str(pk), **dict(request.data)},
+            request_id=request_id,
+            actor_type=AuditActorType.USER,
+            perform_write=perform_write,
+        )
+
+        response = Response(result.response_body, status=result.response_status)
+        if result.is_replay:
+            response["Idempotent-Replay"] = "true"
+        return response
+
+
+class WaitlistOfferDeclineView(KairosAPIView):
+    """POST /api/v1/waitlist-offers/{id}/decline (Spec v1.0 §5.13). Not in
+    Spec v1.0 §7's Idempotency-Key coverage list any more than
+    `POST /recurring-series/{id}/cancel` or `POST /waitlist-entries/{id}/
+    cancel` were (Phase 12/14) — this project's own established
+    broader-than-Spec's-literal-list precedent applies here a third time,
+    for the identical reason: consistency, and Spec v1.0 §7 point 7's
+    general "conflict outcomes are recorded too" rule (`offer_already_
+    resolved` is exactly such an outcome).
+    """
+
+    def post(self, request: Request, pk: uuid.UUID) -> Response:
+        idempotency_key = _require_idempotency_key(request)
+        user = cast(AppUser, request.user)
+        offer = _get_offer_for_owner(pk, user)
+        request_id = _request_id(request)
+
+        def perform_write() -> tuple[int, dict[str, Any]]:
+            declined = decline_offer(
+                DeclineOfferRequest(offer=offer, user=user, request_id=request_id)
+            )
+            body = dict(WaitlistOfferResponseSerializer(declined).data)
+            return status.HTTP_200_OK, body
+
+        result = run_idempotent_write(
+            user=user,
+            key=idempotency_key,
+            endpoint=f"POST /api/v1/waitlist-offers/{pk}/decline",
+            body={"offer_id": str(pk), **dict(request.data)},
             request_id=request_id,
             actor_type=AuditActorType.USER,
             perform_write=perform_write,

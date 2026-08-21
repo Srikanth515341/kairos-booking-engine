@@ -40,8 +40,11 @@ Implementation Plan — all committed under [`docs/`](docs/).
 
 ## Status
 
-🏁 **Milestone 2 reached** (`v0.2.0-milestone-2-recurrence-dst-correct`) — recurring bookings
-now work end to end, DST-correct, through a real two-step HTTP flow. 🏁 **Milestone 1** — the
+🏁 **Milestone 3 reached** (`v0.3.0-milestone-3-waitlist-enforceable`) — the waitlist is fully
+enforceable end to end: join, hold, offer, accept, decline, cascade, all backed by the same
+constraint that protects an ordinary booking. 🏁 **Milestone 2** (`v0.2.0-milestone-2-recurrence-
+dst-correct`) — recurring bookings work end to end, DST-correct, through a real two-step HTTP
+flow. 🏁 **Milestone 1** — the
 core guarantee proven under genuine concurrency: 200
 independently-connected clients, released simultaneously against one identical slot,
 exactly one succeeds — verified 10 consecutive times and running in CI on every commit
@@ -117,9 +120,14 @@ SAME `booking` table, in the SAME `status IN ('confirmed','held')` exclusion dom
 confirmed booking occupies — so an outstanding offer cannot be taken out from under the
 person it was made to, not by another user's booking, not under concurrent load. 50
 independently-connected clients released simultaneously against an actively held range: zero
-succeed, every time. There's no HTTP endpoint for this yet (offer dispatch is Phase 16) — the
-hold mechanism itself is proven directly, the same way the recurrence engine was proven ahead
-of its own API surface back in Phase 11. See
+succeed, every time. And the whole loop closes now (Phase 16): cancelling a booking really
+does dispatch a background worker that finds the next eligible waitlister, reserves the slot
+with a hold, and creates the offer — the hold always exists before the offer does, so there's
+never a moment where an offer is live but nothing is actually holding the range for it.
+`POST /waitlist-offers/{id}/confirm` accepts an offer atomically (the hold becomes the
+confirmed booking, in place — no second row); `POST /waitlist-offers/{id}/decline` releases it
+immediately and cascades to the next person in line, sooner than the offer would otherwise
+expire. See
 [`CLAUDE.md`](CLAUDE.md) for exactly what is and isn't built, and
 [`docs/06-implementation-plan.md`](docs/06-implementation-plan.md) for the full 31-phase
 build plan.
@@ -334,8 +342,10 @@ pytest
 | Rolling / tzdata re-materialization | **Live** — mechanism proven directly; no real caller yet, see CLAUDE.md (Phase 13) |
 | system_check_run / correctness-monitor records | **Live** — `series_materialization`/`tzdata_rematerialization` only; full six-check alerting is Phase 21 |
 | Waitlist join / list / cancel | **Live** — containment eligibility query (PRD FR21), no offer cascade caller yet (Phase 14) |
-| Holds occupy the exclusion domain | **Live** — proven under concurrency (HOLD-01/02/03), no reclamation or offer cascade caller yet (Phase 15) |
-| Hold reclamation, offer cascade, notification dispatch | Not started (Phase 16–17) |
+| Holds occupy the exclusion domain | **Live** — proven under concurrency (HOLD-01/02/03) (Phase 15) |
+| Waitlist offers — creation, cascade, accept, decline | **Live** — hold-before-offer (PRD FR23), atomic accept, decline-and-cascade (WL-01/02/03) 🏁 Milestone 3 (Phase 16) |
+| Hold reclamation (reaper + cleanup-on-write) | Not started (Phase 17) |
+| Notification dispatch | Not started (Phase 18) |
 | Notifications | Not started (Phase 18) |
 | Admin & offboarding | Not started (Phase 19) |
 | Production correctness monitoring | Not started (Phase 20–21) |
