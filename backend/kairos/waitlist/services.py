@@ -162,6 +162,10 @@ class WaitlistCancelRequest:
     entry: WaitlistEntry
     actor: AppUser
     request_id: str
+    # USER for every caller through Phase 16 (default, unchanged). Phase
+    # 19's offboarding cascade overrides this to SYSTEM: the entry's own
+    # owner didn't choose to withdraw, the deactivation policy did.
+    actor_type: str = AuditActorType.USER
 
 
 @dataclass(frozen=True)
@@ -201,8 +205,8 @@ def cancel_waitlist_entry(req: WaitlistCancelRequest) -> WaitlistCancelResult:
         with connection.cursor() as cursor:
             apply_write_path_session_settings(
                 cursor,
-                actor_id=str(req.actor.id),
-                actor_type=AuditActorType.USER,
+                actor_id=(str(req.actor.id) if req.actor_type != AuditActorType.SYSTEM else ""),
+                actor_type=req.actor_type,
                 request_id=req.request_id,
             )
         updated = WaitlistEntry.objects.filter(
@@ -362,6 +366,11 @@ class DeclineOfferRequest:
     offer: WaitlistOffer
     user: AppUser
     request_id: str
+    # USER for every caller through Phase 16 (default, unchanged). Phase
+    # 19's offboarding cascade overrides this to SYSTEM: an outstanding
+    # hold is released because its beneficiary was deactivated, not
+    # because they chose to decline.
+    actor_type: str = AuditActorType.USER
 
 
 def decline_offer(req: DeclineOfferRequest) -> WaitlistOffer:
@@ -395,8 +404,8 @@ def decline_offer(req: DeclineOfferRequest) -> WaitlistOffer:
         with connection.cursor() as cursor:
             apply_write_path_session_settings(
                 cursor,
-                actor_id=str(req.user.id),
-                actor_type=AuditActorType.USER,
+                actor_id=(str(req.user.id) if req.actor_type != AuditActorType.SYSTEM else ""),
+                actor_type=req.actor_type,
                 request_id=req.request_id,
             )
         updated = WaitlistOffer.objects.filter(

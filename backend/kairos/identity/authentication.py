@@ -18,10 +18,25 @@ from django.conf import settings
 from rest_framework import authentication, exceptions
 from rest_framework.request import Request
 
-from kairos.identity.models import AppUser
+from kairos.identity.models import AppUser, AppUserStatus
 from kairos.identity.oidc import SessionTokenError, verify_session_token
 
 DEV_USER_ID_HEADER = "X-Dev-User-Id"
+
+
+def _reject_if_deactivated(user: AppUser) -> None:
+    """Test Plan OFF-02 / PRD FR49-51 (Implementation Plan Phase 19): a
+    deactivated user must be locked out of the API entirely, not merely
+    blocked from the three write endpoints OFF-02's own text names
+    (book, waitlist, confirm). A still-unexpired session token is the
+    only thing that would otherwise let a deactivated principal keep
+    acting — checked here, at AUTHENTICATION time, on every request
+    through either authenticator, rather than as a permission check
+    layered on top of specific views, which a future endpoint could
+    forget to apply.
+    """
+    if user.status == AppUserStatus.DEACTIVATED:
+        raise exceptions.AuthenticationFailed("this account has been deactivated")
 
 
 class OIDCSessionAuthentication(authentication.BaseAuthentication):
@@ -49,6 +64,7 @@ class OIDCSessionAuthentication(authentication.BaseAuthentication):
                 "session token does not match a known user"
             ) from exc
 
+        _reject_if_deactivated(user)
         return user, None
 
     def authenticate_header(self, request: Request) -> str:
@@ -89,6 +105,7 @@ class StubUserIdAuthentication(authentication.BaseAuthentication):
                 f"{DEV_USER_ID_HEADER} does not match a known user"
             ) from exc
 
+        _reject_if_deactivated(user)
         return user, None
 
     def authenticate_header(self, request: Request) -> str:

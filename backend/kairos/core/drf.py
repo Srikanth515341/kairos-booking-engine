@@ -14,6 +14,7 @@ from rest_framework.response import Response
 from rest_framework.views import exception_handler as drf_default_exception_handler
 
 from kairos.core.exceptions import (
+    AlreadyResourceAdminError,
     IdempotencyKeyConflictError,
     NotFoundError,
     PolicyValidationError,
@@ -140,6 +141,17 @@ def kairos_exception_handler(exc: Exception, context: dict[str, Any]) -> Respons
                 "unacknowledged_conflicts",
                 "The preview reported conflicts or time adjustments this request did not "
                 "acknowledge.",
+                None,
+                request_id,
+            ),
+            status=409,
+        )
+
+    if isinstance(exc, AlreadyResourceAdminError):
+        return Response(
+            build_error_envelope(
+                "already_resource_admin",
+                "This user already administers this resource.",
                 None,
                 request_id,
             ),

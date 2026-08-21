@@ -11,8 +11,12 @@ require the credential it's about to issue.
 
 from __future__ import annotations
 
+import uuid
+from typing import Any, cast
+
 from django.conf import settings
 from rest_framework import exceptions as drf_exceptions
+from rest_framework import status
 from rest_framework.authentication import BaseAuthentication
 from rest_framework.permissions import AllowAny
 from rest_framework.request import Request
@@ -20,7 +24,12 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from kairos.core.exceptions import NotFoundError, PolicyValidationError
+from kairos.core.idempotency import run_idempotent_write
+from kairos.core.models import AuditActorType
+from kairos.core.views import KairosAPIView
+from kairos.core.views import request_id as _request_id
 from kairos.identity.authentication import OIDCSessionAuthentication
+from kairos.identity.authorization import AuthorizationService
 from kairos.identity.models import AppUser
 from kairos.identity.oidc import (
     OIDCError,
@@ -28,7 +37,25 @@ from kairos.identity.oidc import (
     mint_mock_id_token,
     verify_id_token,
 )
-from kairos.identity.serializers import DevMockLoginSerializer, TokenExchangeSerializer
+from kairos.identity.serializers import (
+    DevMockLoginSerializer,
+    TokenExchangeSerializer,
+    UserDeactivateSerializer,
+)
+from kairos.identity.services import DeactivateUserRequest, deactivate_user
+
+IDEMPOTENCY_KEY_HEADER = "Idempotency-Key"
+
+
+def _require_idempotency_key(request: Request) -> uuid.UUID:
+    # Spec v1.0 §7's coverage list names this endpoint explicitly.
+    header_value = request.headers.get(IDEMPOTENCY_KEY_HEADER)
+    if not header_value:
+        raise PolicyValidationError(IDEMPOTENCY_KEY_HEADER, "header is required")
+    try:
+        return uuid.UUID(header_value)
+    except ValueError as exc:
+        raise PolicyValidationError(IDEMPOTENCY_KEY_HEADER, "must be a valid UUID") from exc
 
 
 def _resolve_or_provision_user(*, email: str, display_name: str) -> AppUser:
@@ -115,3 +142,69 @@ class DevMockLoginView(APIView):
 
         id_token = mint_mock_id_token(subject=email, email=email, display_name=display_name)
         return Response({"id_token": id_token})
+
+
+class UserDeactivateView(KairosAPIView):
+    """POST /api/v1/admin/users/{id}/deactivate (Spec v1.0 §5.15; PRD
+    FR49-51; Test Plan OFF-01/OFF-02). `system_admin`-only — checked
+    BEFORE looking up the target user, so a non-admin caller gets a
+    uniform 403 regardless of whether the target id exists, never
+    leaking which user ids are real (unlike `PATCH /resources/{id}`,
+    where existence is already public via `GET /resources`, a real user
+    id is not similarly browsable anywhere in this API).
+    """
+
+    def post(self, request: Request, pk: uuid.UUID) -> Response:
+        idempotency_key = _require_idempotency_key(request)
+        user = cast(AppUser, request.user)
+        if not AuthorizationService.is_system_admin(user):
+            raise drf_exceptions.PermissionDenied()
+
+        try:
+            target = AppUser.objects.get(id=pk)
+        except AppUser.DoesNotExist as exc:
+            raise NotFoundError from exc
+
+        serializer = UserDeactivateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        reason = serializer.validated_data["reason"]
+
+        request_id = _request_id(request)
+
+        def perform_write() -> tuple[int, dict[str, Any]]:
+            result = deactivate_user(
+                DeactivateUserRequest(
+                    target=target, actor=user, reason=reason, request_id=request_id
+                )
+            )
+            body = {
+                "user_id": str(result.user_id),
+                "status": result.status,
+                "bookings_transferred": result.bookings_transferred,
+                "bookings_cancelled": result.bookings_cancelled,
+                "bookings_retained": result.bookings_retained,
+                "waitlist_entries_cancelled": result.waitlist_entries_cancelled,
+                "offers_released": result.offers_released,
+                "series_flagged_for_admin": result.series_flagged_for_admin,
+            }
+            return status.HTTP_200_OK, body
+
+        result = run_idempotent_write(
+            user=user,
+            key=idempotency_key,
+            endpoint=f"POST /api/v1/admin/users/{pk}/deactivate",
+            # target user id folded into the fingerprinted body — same
+            # reasoning as every other {id}-scoped mutation in this
+            # codebase (kairos.bookings.views): the body alone ({"reason":
+            # ...}) never mentions WHICH user this deactivation targets.
+            body={"user_id": str(pk), **dict(request.data)},
+            request_id=request_id,
+            actor_type=AuditActorType.ADMIN,
+            reason=reason,
+            perform_write=perform_write,
+        )
+
+        response = Response(result.response_body, status=result.response_status)
+        if result.is_replay:
+            response["Idempotent-Replay"] = "true"
+        return response

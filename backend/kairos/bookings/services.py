@@ -304,10 +304,18 @@ def cancel_booking(req: BookingCancelRequest) -> BookingCancelResult:
                 # admin override (Spec v1.0 §5.6) — the view already knows
                 # which this is (that's what decides whether `reason` is
                 # required at all) and passes it through rather than this
-                # function re-deriving it.
+                # function re-deriving it. actor_id is empty for a
+                # SYSTEM-initiated cancel (Phase 19's offboarding cascade,
+                # the first caller to pass actor_type=SYSTEM here) — the
+                # same NULLIF(..., '')-becomes-NULL convention create_
+                # booking/edit_booking already established; `req.actor`
+                # still supplies `cancelled_by` below (a real, meaningful
+                # value: the admin who triggered the offboarding), only
+                # the SESSION-VARIABLE actor_id — and therefore audit_log.
+                # actor_id — is emptied.
                 apply_write_path_session_settings(
                     cursor,
-                    actor_id=str(req.actor.id),
+                    actor_id=(str(req.actor.id) if req.actor_type != AuditActorType.SYSTEM else ""),
                     actor_type=req.actor_type,
                     request_id=req.request_id,
                     reason=req.reason,
@@ -370,6 +378,41 @@ def cancel_booking(req: BookingCancelRequest) -> BookingCancelResult:
         extra={**log_context, "outcome": "success"},
     )
     return BookingCancelResult(booking=booking, already_cancelled=not updated)
+
+
+@dataclass(frozen=True)
+class BookingTransferRequest:
+    booking: Booking
+    new_owner: AppUser
+    request_id: str
+
+
+def transfer_booking_ownership(req: BookingTransferRequest) -> Booking:
+    """PRD FR49 / Implementation Plan Phase 19 — the `offboarding_policy=
+    'transfer'` outcome: a deactivated user's future booking on a
+    resource with this policy moves to that resource's administrator
+    rather than being cancelled. Only `user_id` changes — `time_range` is
+    untouched, so this can never conflict with `no_overlapping_bookings`
+    (the row already legitimately occupies this exact range; changing
+    who it belongs to doesn't change what it occupies). Always
+    `actor_type=SYSTEM`: no self-service or admin-override caller exists
+    for this operation, only the offboarding cascade.
+    """
+    log_context = {
+        "request_id": req.request_id,
+        "booking_id": str(req.booking.id),
+        "new_owner_id": str(req.new_owner.id),
+    }
+    with transaction.atomic():
+        with connection.cursor() as cursor:
+            apply_write_path_session_settings(
+                cursor, actor_id="", actor_type=AuditActorType.SYSTEM, request_id=req.request_id
+            )
+        Booking.objects.filter(id=req.booking.id).update(user=req.new_owner)
+        booking = Booking.objects.get(id=req.booking.id)
+
+    logger.info("booking_ownership_transferred", extra={**log_context, "outcome": "success"})
+    return booking
 
 
 @dataclass(frozen=True)

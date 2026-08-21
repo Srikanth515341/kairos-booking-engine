@@ -88,20 +88,48 @@ kairos-booking-engine/
 │   │   │                   # send_notification_task/dispatch_notification (Phase 18, the
 │   │   │                   # SAME dispatch-wrapper-swallows-broker-failures shape
 │   │   │                   # kairos.waitlist.tasks.dispatch_cascade established in Phase 17),
-│   │   │                   # management/commands/cleanup_idempotency_keys.py
+│   │   │                   # migrations/0012 (NotificationType.SERIES_OWNER_DEACTIVATED — Phase
+│   │   │                   # 19, PRD FR51), exceptions.py's AlreadyResourceAdminError (Phase 19,
+│   │   │                   # 409 on POST /resources/{id}/admins — NOT a RecordableConflictError,
+│   │   │                   # that endpoint carries no Idempotency-Key), views.py's request_id()
+│   │   │                   # helper (Phase 19 — extracted once kairos.identity.views became a
+│   │   │                   # FOURTH module duplicating the identical local function
+│   │   │                   # bookings/waitlist/resources views.py each already had, this
+│   │   │                   # project's own "worth extracting once real duplication exists"
+│   │   │                   # threshold), management/commands/cleanup_idempotency_keys.py
 │   │   ├── identity/       # app_user, resource_admin (UUID surrogate PK since Phase 8),
 │   │   │                   # user_group/user_group_membership (Phase 9 — PRD FR46, not in
 │   │   │                   # Spec v1.0 §3 at all, see Key Technical Decisions),
 │   │   │                   # authentication.py (OIDCSessionAuthentication — real; Stub
-│   │   │                   # UserIdAuthentication — gated to test only, Phase 9),
+│   │   │                   # UserIdAuthentication — gated to test only, Phase 9;
+│   │   │                   # _reject_if_deactivated — Phase 19, OFF-02, checked in BOTH
+│   │   │                   # authenticators so a deactivated user's still-unexpired session
+│   │   │                   # token is rejected on every subsequent request, not merely at
+│   │   │                   # three specific write endpoints),
 │   │   │                   # authorization.py (AuthorizationService, Phase 9 — the ONE
 │   │   │                   # place every permission decision is resolved),
 │   │   │                   # oidc.py (JWT mint/verify + local mock issuer, Phase 9),
-│   │   │                   # views.py/urls.py (POST /auth/token, /auth/dev-mock-login)
+│   │   │                   # services.py (deactivate_user — Phase 19, PRD FR49-51, orchestrates
+│   │   │                   # the offboarding cascade by REUSING transfer_booking_ownership/
+│   │   │                   # cancel_booking (kairos.bookings.services), decline_offer/
+│   │   │                   # cancel_waitlist_entry (kairos.waitlist.services, both gained an
+│   │   │                   # actor_type param this phase), one shared run_idempotent_write
+│   │   │                   # transaction, matching cancel_recurring_series's Phase 12
+│   │   │                   # precedent), views.py/urls.py (POST /auth/token,
+│   │   │                   # /auth/dev-mock-login, POST /admin/users/{id}/deactivate — Phase 19)
 │   │   ├── resources/      # resource (+ restricted_group FK, Phase 9; timezone validated as
-│   │   │                   # IANA in Resource.save() — Phase 10), serializers.py,
-│   │   │                   # views.py, urls.py (list/detail/availability — Phase 6; writes
-│   │   │                   # are Phase 19)
+│   │   │                   # IANA in Resource.save() — Phase 10; offboarding_policy/status
+│   │   │                   # fields present since Phase 9's own migration, given a real write
+│   │   │                   # path by Phase 19), serializers.py (+ ResourceCreateSerializer/
+│   │   │                   # ResourceUpdateSerializer/ResourceAdminGrantSerializer — Phase 19),
+│   │   │                   # services.py (create_resource/update_resource/
+│   │   │                   # grant_resource_admin/revoke_resource_admin — Phase 19, no
+│   │   │                   # Idempotency-Key involved, Spec v1.0 §7 never names these
+│   │   │                   # endpoints, but session settings still applied — resource/
+│   │   │                   # resource_admin are two of the five audited tables), views.py,
+│   │   │                   # urls.py (list/detail/availability — Phase 6; create/update/admin
+│   │   │                   # grants/utilization — Phase 19; no DELETE endpoint anywhere —
+│   │   │                   # referential integrity and audit history, Spec v1.0 §5.14)
 │   │   ├── bookings/       # booking (+ series FK, populated since Phase 12), recurring_series
 │   │   │                   # (Phase 11 schema, real write path since Phase 12),
 │   │   │                   # recurrence.py (expand_occurrences — pure, DST-safe, still no
@@ -133,7 +161,15 @@ kairos-booking-engine/
 │   │   │                   # notify_rematerialization_conflict to the series owner AND every
 │   │   │                   # resource admin on a conflict (Phase 18, PRD FR54/FR13b — closes
 │   │   │                   # the "resource_administrators: pending Phase 18 delivery"
-│   │   │                   # placeholder Phase 13 left)
+│   │   │                   # placeholder Phase 13 left). transfer_booking_ownership — Phase 19,
+│   │   │                   # PRD FR49's 'transfer' offboarding policy, only user_id changes so
+│   │   │                   # no exclusion-constraint risk. ⚠️ Real gap fixed this phase:
+│   │   │                   # cancel_booking's actor_id was ALWAYS req.actor.id regardless of
+│   │   │                   # actor_type, unlike create_booking/edit_booking's established
+│   │   │                   # NULLIF(...,'')-for-SYSTEM convention — never observable until
+│   │   │                   # Phase 19 became the first caller to pass actor_type=SYSTEM here
+│   │   │                   # (the offboarding cascade's cancel_and_notify path); fixed to match
+│   │   │                   # create_booking/edit_booking exactly
 │   │   ├── waitlist/       # waitlist_entry (Phase 14), waitlist_offer (Phase 16) — its own
 │   │   │                   # app, not part of bookings/, since Spec's own ER diagram reaches
 │   │   │                   # both directly from app_user/resource, never through booking (see
@@ -161,7 +197,12 @@ kairos-booking-engine/
 │   │   │                   # notify_offer_created right after the offer row commits (Phase 18,
 │   │   │                   # PRD FR52 — expiry stated explicitly), called directly rather than
 │   │   │                   # via on_commit since this function is never itself inside an open
-│   │   │                   # transaction,
+│   │   │                   # transaction. cancel_waitlist_entry/decline_offer both gained an
+│   │   │                   # actor_type param (default USER, unchanged) — Phase 19's
+│   │   │                   # offboarding cascade is the first caller to pass SYSTEM, the same
+│   │   │                   # "extend the existing function" choice already made for
+│   │   │                   # create_booking/edit_booking (Phase 13) and cancel_booking (Phase 19,
+│   │   │                   # see kairos.bookings — Key Technical Decisions),
 │   │   │                   # serializers.py (slot_already_available check before
 │   │   │                   # the idempotency key is claimed; WaitlistOfferResponseSerializer —
 │   │   │                   # Phase 16), views.py (join/list/cancel; WaitlistOfferConfirmView/
@@ -223,11 +264,16 @@ write path): `POST`/`GET /api/v1/bookings`, `GET`/`PATCH /api/v1/bookings/{id}`,
 `POST /api/v1/waitlist-entries`, `GET /api/v1/waitlist-entries`,
 `POST /api/v1/waitlist-entries/{id}/cancel` (Phase 14),
 `POST /api/v1/waitlist-offers/{id}/confirm`, `POST /api/v1/waitlist-offers/{id}/decline`
-(Phase 16). Every mutation (create, edit, cancel, recurring confirm, recurring-series cancel,
-waitlist join, waitlist cancel, offer confirm, offer decline) is idempotent (Phase 5/7/12/14/16
-— `Idempotency-Key` is required; missing it is 400). Edit is owner-only, no
-admin override; cancel is owner-or-scoped-admin, with a reason required for the admin-override
-case (400 otherwise). Cancelling an already-cancelled booking is a 200 no-op, independent of
+(Phase 16), `POST /api/v1/resources` (`system_admin`-only), `PATCH /api/v1/resources/{id}`
+(resource admin or `system_admin`), `POST /api/v1/resources/{id}/admins`,
+`DELETE /api/v1/resources/{id}/admins/{user_id}`,
+`GET /api/v1/admin/resources/{id}/utilization`, `POST /api/v1/admin/users/{id}/deactivate`
+(Phase 19). Every mutation (create, edit, cancel, recurring confirm, recurring-series cancel,
+waitlist join, waitlist cancel, offer confirm, offer decline, user deactivate) is idempotent
+(Phase 5/7/12/14/16/19 — `Idempotency-Key` is required; missing it is 400) — EXCEPT resource
+CRUD and admin-scope grants (Phase 19), which Spec v1.0 §7's coverage list never names. Edit is
+owner-only, no admin override; cancel is owner-or-scoped-admin, with a reason required for the
+admin-override case (400 otherwise). Cancelling an already-cancelled booking is a 200 no-op, independent of
 idempotency key. Recurring series confirm attempts each occurrence in its OWN independent
 transaction (RFC v1.0 §5d) — reusing `create_booking` (Phase 4) unchanged, which is what gives
 every occurrence a fresh, correctly-timed session-settings application for free; a recurring
@@ -343,6 +389,54 @@ manual operational runbook (SQL an operator runs during an incident), not applic
 phase has built, and inventing a fake trigger path just to have one would have been scope
 beyond this phase's actual job (see NOT Yet Built and Open Questions).
 
+Resource administration & offboarding (Phase 19, PRD v1.0 FR46/FR49-51; Spec v1.0 §5.14/§5.15) —
+resources now have a real write path: `POST /api/v1/resources` (`system_admin`-only, 403
+otherwise — capability-gated, not existence-gated), `PATCH /api/v1/resources/{id}` (resource
+admin or `system_admin`; updatable: name, bookable window, max duration, `offboarding_policy`,
+`status` — Spec's own literal list, `restricted_group` deliberately excluded since it names
+nowhere in that list), `POST`/`DELETE /resources/{id}/admins` (grant/revoke a `resource_admin`
+scope, 409 `already_resource_admin` on a duplicate grant), and
+`GET /admin/resources/{id}/utilization` (resource admin/operations/`system_admin`; aggregates
+bookings/booked-minutes/waitlist-joins/cancellations/offer-outcomes over a date range). No
+`DELETE /resources/{id}` endpoint exists anywhere — Spec's own reasoning (referential integrity
+and audit history for bookings that reference it) — `status:'inactive'` is the only way a
+resource goes offline. None of these five endpoints carry `Idempotency-Key` (Spec v1.0 §7 never
+names them), unlike every other mutating endpoint in this API.
+
+`POST /admin/users/{id}/deactivate` (`system_admin`-only, `Idempotency-Key` required — Spec's
+own coverage list DOES name this one) is the real PRD FR49-51 offboarding cascade:
+`kairos.identity.services.deactivate_user` walks the target's future one-off (non-series)
+confirmed bookings and applies each one's OWN resource's `offboarding_policy` —
+`transfer` moves ownership to that resource's (FCFS-earliest-granted) admin via the new
+`transfer_booking_ownership`, `cancel_and_notify` cancels via the existing `cancel_booking`
+(actor_type=SYSTEM) and dispatches the existing Phase 18 `notify_admin_cancellation` to the
+deactivated user, `retain` leaves the booking untouched — every one of the three is a
+"defined post-offboarding state," never a silent orphan. Any outstanding hold/active offer the
+target held is released via the EXISTING `decline_offer` (which already releases the hold and
+cascades to the next eligible entry, PRD FR50 — reused unchanged, only `actor_type=SYSTEM`
+differs) and every `WAITING` waitlist entry is cancelled via the existing
+`cancel_waitlist_entry`. Active recurring series the target created are FLAGGED (PRD FR51) —
+reported in the response body's `series_flagged_for_admin` and, when a resource admin exists,
+notified via the new `notify_series_owner_deactivated` — there is still no endpoint anywhere in
+this codebase to actually transfer/terminate a series (see NOT Yet Built). The whole cascade
+runs inside ONE shared `run_idempotent_write` transaction — the identical choice
+`cancel_recurring_series` (Phase 12) already made, for the identical reason: every write here
+moves rows OUT of or sideways from the exclusion domain, never into a newly-contested range, so
+there's no "one contested item" isolation problem the way booking CREATE has. Verified live
+against the real dev server and `kairos_dev`, not just pytest: a real booking genuinely
+transferred `user_id` to the resource admin, the audit row showed `actor_type='system'`/
+`actor_id=NULL`, and — separately — a deactivated user's freshly-minted session token was
+rejected with a real 401 against a real subsequent request (OFF-02).
+
+OFF-02 ("a deactivated user cannot book, waitlist, or confirm") is enforced at the
+AUTHENTICATION layer, not as a permission check on three specific views: both
+`OIDCSessionAuthentication` and `StubUserIdAuthentication` now reject a resolved `AppUser` whose
+`status='deactivated'` with `AuthenticationFailed` (401) — a still-unexpired session token is
+the only thing that could otherwise let a deactivated principal keep acting, and checking once,
+centrally, means a future endpoint can't forget to apply it. `POST /auth/token` itself is
+unaffected (minting a session token isn't "using the API" yet) — the check fires on the very
+next real request.
+
 Real authentication (Phase 9, RFC v1.0 §4): `Authorization: Bearer <session-token>`, validated
 by `OIDCSessionAuthentication`. A client obtains that session token via `POST /auth/token`
 with a verified OIDC ID token — in dev/test, `POST /auth/dev-mock-login` mints one against a
@@ -395,11 +489,12 @@ DSN (`kairos_app` deliberately has no DDL rights) — see "Running Locally" belo
 | 16 | Offers: Creation, Acceptance, Cascade 🏁 MILESTONE 3 | Completes the waitlist: `waitlist_offer` (Spec v1.0 §3 — `hold_booking` a `OneToOneField` per the `UNIQUE hold_booking_id` column, `uniq_active_offer_per_entry` partial unique index, no EXCLUDE constraint with Spec's own forbidding comment reproduced verbatim in the migration per this phase's explicit Scope IN), `kairos_app` grants + audit trigger (`core/migrations/0009`). `create_offer_for_freed_range` (`kairos/waitlist/services.py`) is the RFC v1.0 §10.2/Spec v1.0 §4.2 worker — walks `find_eligible_entries`' (Phase 14) FCFS-ordered candidates, attempts a hold via `create_booking(status=HELD, actor_type=SYSTEM)` (Phase 15) for each in turn, advancing to the next on `SlotUnavailableError` (Spec's own "re-query and try the next candidate"), and only constructs the `WaitlistOffer` row once a hold has actually committed (PRD FR23: hold before offer, structurally, not by caller discipline). `cancel_booking`'s Phase 7 `on_commit()` log stub now really dispatches `create_offer_for_freed_range_task.delay(...)` (RFC v1.0 §5c step 4) via a NEW `kairos/waitlist/tasks.py` (Celery's `autodiscover_tasks()` module-naming lesson, Phase 13, applied a second time) — a genuine circular-import risk between `kairos.bookings.services` (needs the task) and `kairos.waitlist.services` (needs `create_booking`) is broken with a deferred, call-time-only import inside the task function, verified via `manage.py check` actually succeeding. `POST /waitlist-offers/{id}/confirm` executes `accept_offer` — the literal RFC v1.0 §10.3/Spec v1.0 §4.3 conditional `UPDATE` (status, owner, AND `expires_at > now()` in one statement) — structurally incapable of `slot_unavailable` (no INSERT on this path); 0 rows → 409 `offer_expired`. `POST /waitlist-offers/{id}/decline` releases the hold (`status`→`cancelled`, `expires_at`→`NULL` — the `hold_has_expiry` CHECK requires the latter, a real bug caught building WL-02 and traced back into `decline_offer` itself, fixed in both places) and dispatches the SAME cascade worker for the freed range; unlike every other cancel-shaped endpoint here, an already-resolved offer is a 409 `offer_already_resolved`, not a 200 no-op — Spec's own explicit, deliberate choice. The declining entry's status becomes `EXPIRED` (present in the schema since Phase 14, unused until now) rather than back to `WAITING`, which is what stops it from immediately re-winning the very cascade its own decline triggers. `RecordableConflictError` (new base class in `core/exceptions.py`) consolidates `SlotUnavailableError`/`AlreadyOnWaitlistError`/`OfferExpiredError`/`OfferAlreadyResolvedError` — `kairos_exception_handler` and `run_idempotent_write` each collapsed four near-identical branches into one, justified once the pattern reached its fourth instance, not before. HOLD-01 through Phase 15's tests are joined by: WL-01 (two threads, real `cancel_booking` calls under `transaction=True`, ground truth via `count_overlapping_pairs` — B1/B2 built as adjacent rather than Test Plan's literal overlapping example times, since two overlapping bookings cannot both be `confirmed` simultaneously in the first place, the exact guarantee this project enforces; see Key Technical Decisions), WL-02 (100 barrier-released runs — reaper-expiry simulated as `UPDATE ... SET status='cancelled', expires_at=NULL ...`, split 50/50 between expires-in-the-future and expires-in-the-past to deterministically exercise both orderings rather than gambling on timing jitter; `ClientOutcome` gained an additive `rowcount` field since a conditional UPDATE matching zero rows isn't an error), and WL-03 (cascade reaches entry 2 not 3 after decline; skips a withdrawn entry 2 to reach entry 3). Full suite: 223 tests (207 + 16 new), no regressions | Pending (on branch `phase-16-offers-cascade`) |
 | 17 | Dual Reclamation: Reaper & Cleanup-on-Write ⚠️ CRITICAL | Both RFC v1.0 §10.4 mechanisms, because a constraint predicate cannot express expiry and neither alone suffices. Mechanism 1 — cleanup-on-write: a `DELETE FROM booking WHERE resource_id=... AND status='held' AND expires_at<=now() AND time_range && tstzrange(...)`, added inside `create_booking`'s (`kairos/bookings/services.py`) own transaction, immediately before the INSERT, unconditionally for EVERY caller (ordinary booking, recurring occurrence, rolling materialization, the cascade worker's own hold creation) — with the RFC v1.0 §10.1-style load-bearing comment (Implementation Plan §1.3 item 5) at the DELETE's own call site. Mechanism 2 — the reaper: `reap_expired_holds` (`kairos/waitlist/services.py`), scheduled via `CELERY_BEAT_SCHEDULE` at the new `HOLD_REAPER_INTERVAL_SECONDS` (default 30s, `core/constants.py`) — one independent transaction per expired hold (mirroring `confirm_recurring_series`/`rolling_materialize_series`'s per-occurrence isolation), reclaiming each via the IDENTICAL conditional-UPDATE-to-`cancelled` shape `accept_offer` races against, cascading via the SAME `create_offer_for_freed_range` cancellation/decline already use, and writing a `system_check_run` heartbeat (`check_name='hold_reaper'`) every run regardless of findings. `hold_reaper_heartbeat_is_stale` reads that heartbeat back — WL-05 Part B's actual mechanism, scoped honestly to the DATA a future alert would consume (full alert routing and `GET /admin/checks/latest` are Phase 21, not built here). `dispatch_cascade` (new, `kairos/waitlist/tasks.py`) is now the ONE place `create_offer_for_freed_range_task.delay(...)` is called from (`cancel_booking` and `decline_offer` both go through it) — wraps the call in `try/except` so a broker outage degrades (logs `cascade_dispatch_failed_broker_unavailable`) rather than raising out of a `transaction.on_commit()` callback and turning an already-committed, successful cancel/decline into an apparent request failure. RECLAIM-01 (booking succeeds over a stale hold with no reaper running, hold genuinely gone via DELETE — not superseded), RECLAIM-02 (reaper cascades to the next eligible entry with zero booking traffic, proven by calling `reap_expired_holds` directly — Test Plan's own "controllable time" requirement, not a real 30s wait), and RECLAIM-03 (100 barrier-released runs, cleanup-on-write's DELETE+INSERT racing the literal RFC v1.0 §10.3 acceptance UPDATE, correctness inferred by correlating outcomes since a party's own DELETE rowcount isn't directly observable through the harness) all pass. RECLAIM-04 (200 writers × 50 runs, N=200-identical-slot-style contention plus 4 pre-seeded expired holds cleanup-on-write must clear every attempt) was ACTUALLY RUN at full DoD-specified scale, not merely written: **269 real SQLSTATE 40P01 deadlocks occurred, in roughly half of the 50 runs** (some runs: zero; others: 9–16) — not the "zero deadlocks" the DoD's literal text names. Per this phase's own explicit instruction, this is the SECOND of the two anticipated honest outcomes, not a phase failure: safety held on every single one of the 10,000 attempts (never more than one success per round, 50/50), zero unexplained SQLSTATEs, zero rounds even needed the zero-success retry budget, and 40P01 was ALREADY a documented, retryable SQLSTATE `BookingService` treats as 503 (Phase 4) before this phase ever ran — cleanup-on-write's extra DELETE measurably raises deadlock frequency versus CONC-01's own N=200 baseline (empirically ~2/10 runs there), a real, honestly-reported finding, not a design failure requiring cleanup-on-write's removal. RECLAIM-04 is deliberately EXCLUDED from the default `pytest tests/concurrency` CI sweep (`.github/workflows/ci.yml` now `--ignore`s it) — Test Plan v1.0 §13 places it in the staging/pre-release tier, not CI tier, the identical tiering CONC-01's own full-scale escalation already has. WL-05 Part A and WL-06 were verified LIVE against the real `docker compose` stack — genuinely stopping `beat`/`redis` containers (`docker compose stop beat` / `stop redis`), not mocked — per this phase's own explicit instruction that a mocked simulation would not prove what RFC v1.0 §4.3's real degradation behavior requires: Part A seeded a hold expiring in 3s with `beat` stopped, confirmed it sat `status='held'` 12+ seconds past expiry with zero error anywhere in the worker/server logs; WL-06 stopped `redis` and confirmed, over real HTTP against `manage.py runserver` under `kairos.settings.dev` (real, non-eager Celery — `CELERY_TASK_ALWAYS_EAGER` is test-settings-only): booking creation (201) and cancellation (200) both succeeded, cancellation's cascade dispatch failed with a genuine `kombu.exceptions.OperationalError` caught and logged by `dispatch_cascade` rather than crashing the response, a booking over an expired hold succeeded via cleanup-on-write (the stale hold row was gone afterward) with zero `waitlist_offer` rows ever created, and the worker reconnected cleanly once `redis` restarted. WL-05 Part B is covered by ordinary pytest (`hold_reaper_heartbeat_is_stale`); `test_dispatch_cascade.py` is a lightweight automated regression guard for the try/except itself (`CELERY_TASK_ALWAYS_EAGER` means pytest can never reproduce a genuine broker outage — this only protects against someone removing the try/except later). Full suite: 236 tests (223 + 13 new — RECLAIM-04 counted but excluded from the routine sweep), no regressions | Pending (on branch `phase-17-dual-reclamation`) |
 | 18 | Notifications | `NotificationService` (`kairos/core/notifications.py`) is a thin wrapper over Django's own `EMAIL_BACKEND` abstraction (console in dev, real SMTP in prod, `locmem` — Django's own capturing backend, `django.core.mail.outbox` — in test) rather than a bespoke backend hierarchy — reusing a framework guarantee instead of reinventing one, the same choice this project already made for `CompositePrimaryKey`/`set_config`/Postgres triggers. Every `notify_*` builder function only constructs a subject/body and calls `kairos/core/tasks.py`'s new `dispatch_notification`, which enqueues `send_notification_task.delay(...)` and returns immediately — the actual `send_mail()` call happens inside that Celery task, in a worker process, NEVER inline in an HTTP request thread or inside a request-path transaction (RFC v1.0 §15a). `dispatch_notification` mirrors `kairos.waitlist.tasks.dispatch_cascade` (Phase 17) exactly: wraps `.delay()` in `try/except` so a broker outage degrades (logged `notification_dispatch_failed_broker_unavailable`) rather than propagating out of `cancel_booking`'s `transaction.on_commit()` callback. `send_notification_task` is `autoretry_for=(Exception,)`, `retry_backoff=True`, `max_retries=NOTIFICATION_MAX_RETRIES` (PRD FR55's "recorded and retried") — the delivery logic itself lives in a plain function, `_execute_notification_delivery`, callable directly so a test can drive a failure-then-success sequence without depending on Celery's own retry scheduling/timing, the same "test the mechanism directly" precedent `expand_occurrences`/`reap_expired_holds` already established. New schema, `NotificationLog` (`kairos/core/models.py`, migrations 0010-0011) — Spec v1.0 §3 has zero notification concept at all, the identical kind of gap Phase 9's `user_group` table filled — one row per logical notification, `attempts` accumulating and `status` (`pending`/`sent`/`failed`) reflecting the latest outcome across every retry; `kairos_app` granted SELECT/INSERT/UPDATE (no DELETE, no audit trigger — this table is itself a delivery-outcome log, the same category as `system_check_run`, not one of the five audited business-state entities). Four of the five notification points wired to real callers: `notify_offer_created` (PRD FR52, expiry stated explicitly in the subject line) from `create_offer_for_freed_range` right after the offer row commits; `notify_admin_cancellation` (PRD FR53, includes the recorded reason) from `cancel_booking`'s SECOND `on_commit` hook, gated on `actor_type=ADMIN` so a self-cancel never triggers it; `notify_rematerialization` (PRD FR54) from `rematerialize_stale_series` on each successfully-recomputed occurrence; and `notify_rematerialization_conflict` (PRD FR13b, a genuine completion of Phase 13's own "resource_administrators: pending Phase 18 delivery" placeholder, not new scope) to both the series owner and every resource administrator scoped to that specific resource on a conflict. The fifth, `notify_rollback_hold_released` (Rollout v1.0 §4.5), was built per this phase's own explicit clarification: the template/message content and send mechanism exist and are fully tested standalone (distinct, non-generic wording from an ordinary offer-expiry notification — explicitly names the rollback, explicitly states queue position was preserved, deliberately avoids any "expire" framing), but NO real production trigger was invented for it — Rollout §4.5's hold release is a manual operational runbook (SQL an operator runs during an incident), not application code any phase has built, and manufacturing a fake caller just to wire one up would have been scope beyond this phase's actual job (see Open Questions). Definition of Done verified: all four wired notification points fire, proven via the capturing (`locmem`) backend; offer-created states the expiry explicitly; a simulated provider outage (patching `send_notification_task.delay` to raise) does NOT fail the underlying admin-cancellation — the booking still commits `CANCELLED`, proven directly; every dispatch call site is either inside a `transaction.on_commit()` callback or a worker context with no open transaction — verified by reading the code, no synchronous dispatch from a request-path transaction anywhere; rollback-hold-released messaging asserted distinct from ordinary offer-created messaging by direct content comparison. Full suite: 238 tests (225 + 13 new), no regressions, plus all 10 CI-tier concurrency tests re-run clean (this phase's changes touch `cancel_booking`, a CONC/WL/RECLAIM-exercised function). ⚠️ **Real bug caught by rebuilding the worker's Docker image and re-reading its startup banner** — `send_notification_task` was silently absent from the running worker's task list after a plain `docker compose restart` (which reuses the existing, stale image rather than rebuilding); fixed with `--build`, then re-verified live: the rebuilt worker's banner lists all six tasks, a deliberately malformed dispatch demonstrated genuine exponential retry-with-backoff (1s/0s/4s/2s/6s, jittered) against the real Redis broker before failing cleanly once `NOTIFICATION_MAX_RETRIES` was exhausted, and a valid dispatch printed the full email to the worker's console `EMAIL_BACKEND` and left exactly one `notification_log` row (`status='sent'`, `attempts=1`), confirmed via `psql` against `kairos_dev` — see Key Technical Decisions | Pending (on branch `phase-18-notifications`) |
+| 19 | Resource Administration & Offboarding | Resource CRUD (Spec v1.0 §5.14) is real: `POST /api/v1/resources` (`system_admin`-only, 403 not 404 — capability-gated), `PATCH /api/v1/resources/{id}` (resource admin or `system_admin`, Spec's own literal updatable-field list — `restricted_group` deliberately excluded, it names nowhere in that list), `POST`/`DELETE /resources/{id}/admins` (409 `already_resource_admin` — new domain exception, NOT a `RecordableConflictError`, since neither endpoint carries `Idempotency-Key`), and `GET /admin/resources/{id}/utilization` (resource admin/operations/`system_admin`; `total_bookings`/`total_booked_minutes`/`waitlist_joins`/`cancellation_count`/`offers_confirmed`/`offers_expired` over a `starts_at`-delimited date range — the same filter shape every other date-range list endpoint in this codebase already uses). No `DELETE /resources/{id}` exists anywhere, confirmed by a real 405 test — Spec's own reasoning (referential integrity/audit history). New `kairos/resources/services.py` applies write-path session settings on every write (resource/`resource_admin` are two of the five audited tables) despite carrying no idempotency wrapper at all — Spec v1.0 §7 never names these five endpoints in its coverage list. `POST /admin/users/{id}/deactivate` (Spec v1.0 §5.15; PRD FR49-51; `system_admin`-only, `Idempotency-Key` required — Spec DOES name this one) is the real offboarding cascade, `kairos.identity.services.deactivate_user`: each one-off future confirmed booking is transferred (to the resource's FCFS-earliest-granted admin, via new `transfer_booking_ownership`), cancelled-and-notified (reusing `cancel_booking` + Phase 18's `notify_admin_cancellation`), or retained, per that booking's OWN resource's `offboarding_policy` (a column Spec's DDL already defined, default `'transfer'` — PRD open question 8, "which policy is the default," was answered by the schema itself, not invented this phase). Outstanding holds/offers are released via the EXISTING `decline_offer` (hold release + cascade, PRD FR50, reused unchanged) and `WAITING` waitlist entries via the EXISTING `cancel_waitlist_entry` — both gained a new `actor_type` parameter (default `USER`, Phase 19 passes `SYSTEM`), the same "extend the existing function" pattern `create_booking`/`edit_booking` already established for `actor_type` in Phase 13. Active recurring series are flagged (PRD FR51) — reported in the response body and, when a resource admin exists, notified via new `notify_series_owner_deactivated` — no endpoint to actually transfer/terminate one exists anywhere (same FR16 gap Phase 12 already flagged). The whole cascade runs inside ONE shared `run_idempotent_write` transaction, matching `cancel_recurring_series`'s (Phase 12) identical reasoning: nothing here contends with the exclusion constraint the way CREATE does. ⚠️ **Real, if narrow, bug found and fixed**: `cancel_booking`'s session-settings call always used `req.actor.id` as `actor_id` regardless of `actor_type`, unlike `create_booking`/`edit_booking`'s established NULLIF-for-SYSTEM convention — invisible until Phase 19 became the first caller to pass `actor_type=SYSTEM` into it (the `cancel_and_notify` offboarding path); fixed to match, verified via OFF-01's own `audit_log.actor_id IS NULL` assertion. OFF-02 ("a deactivated user cannot book, waitlist, or confirm") is enforced at the AUTHENTICATION layer — both `OIDCSessionAuthentication` and `StubUserIdAuthentication` now reject a `status='deactivated'` `AppUser` with a real 401, checked once centrally rather than per-endpoint, so a still-unexpired session token can't keep acting and a future endpoint can't forget the check. `request_id()` (`kairos/core/views.py`) is extracted from four near-identical local copies (bookings/waitlist/resources/identity views.py) — this project's own "worth extracting once real duplication exists" threshold (`RecordableConflictError`, Phase 16), reached again. OFF-01 ★ passes as the full documented scenario (2 transferred, 1 cancelled-and-notified, 1 retained, 3 waitlist entries cancelled, 1 outstanding hold released AND proven to cascade to a genuinely next-eligible entry, 1 series flagged, every cascade action audited `actor_type='system'` with the offboarding reason, zero bookings left in an undefined state) plus a repeat-deactivation idempotent-no-op test; OFF-02 covers create/join/confirm, each asserting a real 401. Verified LIVE against the real dev server and `kairos_dev`, not just pytest: a full create-resource→grant-admin→PATCH→utilization round trip over real HTTP, then a real booking genuinely transferred `user_id` on deactivation (confirmed via `psql`, `audit_log.actor_type='system'`/`actor_id IS NULL`), then a deactivated user's freshly-minted session token rejected with a real 401 on the very next request. Full suite: 259 tests (238 + 21 new), no regressions, plus all 10 CI-tier concurrency tests re-run clean (405s) — this phase's `cancel_booking`/authentication.py changes sit directly in CONC-03/04/05, HOLD-01/02, WL-01–03, RECLAIM-01–03's own code paths | Pending (on branch `phase-19-admin-offboarding`) |
 
 ## Current Phase In Progress
 
-None. Phase 18 is complete pending review and merge. Phase 19 (Resource Administration &
-Offboarding) is next.
+None. Phase 19 is complete pending review and merge. Phase 20 (Reconciliation & Schema
+Assertion) is next.
 
 ## NOT Yet Built
 
@@ -455,10 +550,10 @@ last one) — `actor_type='unknown'` alerting (as opposed to just recording the 
 session variable directly — AND Phase 16's hold creation via `create_offer_for_freed_range`,
 proven against the PERSISTED `audit_log` row instead, since `create_booking` already reuses
 the identical session-settings mechanism Phase 13's spy test verified once). Resource CRUD
-(create/update/admin
-grants) is Phase 19 — the Phase 6 resource endpoints are read-only, and no live code path
-writes `resource_admin` yet (`ResourceAdmin` rows in tests are created directly via the ORM,
-not through any endpoint). IDEM-07/08
+(create/update/admin grants/utilization) and user offboarding are real now (Phase 19) —
+`POST`/`PATCH /resources`, `POST`/`DELETE /resources/{id}/admins`,
+`GET /admin/resources/{id}/utilization`, and `POST /admin/users/{id}/deactivate` all have live
+write paths and real HTTP tests. IDEM-07/08
 (fault injection — process kill mid-transaction, proxy-level response drop) need tooling that
 arrives in Phase 28; idempotency coverage on waitlist join/offer confirm arrives with those
 endpoints (Phases 14, 16); `run_idempotent_recurring_confirm`'s own crash-mid-series gap
@@ -469,7 +564,11 @@ series definition (PRD FR16) has no endpoint — Phase 12's Scope IN only ever i
 confirm/cancel, never edit, despite FR16 appearing on the phase's "Documents satisfied" line;
 the CANCEL endpoint honors FR16's underlying "past occurrences are historical and immutable"
 principle for the one operation Phase 12 actually built, but series editing itself remains
-unbuilt — see Key Technical Decisions/Open Questions. Recurring-series preview/confirm also
+unbuilt — see Key Technical Decisions/Open Questions. The SAME gap is why Phase 19's
+deactivation cascade can only FLAG a deactivated user's active series to its resource admin
+(PRD FR51) rather than actually transferring or terminating it — there is still no endpoint
+anywhere in this codebase that performs either action on a `recurring_series`, only ones that
+report the need for one. Recurring-series preview/confirm also
 validates NEITHER the resource's `bookable_start_time`/`bookable_end_time`/
 `max_booking_duration_minutes` NOR series-start-date past-dating — Spec v1.0 §5.8's own
 failure table never lists either as a 400 cause (unlike Spec v1.0 §5.1's single-booking
@@ -655,6 +754,12 @@ and `git log` first.
 | `notify_rematerialization_conflict` (Phase 18) was built even though Phase 18's own Scope IN names only ONE tzdata re-materialization notification point | Not new scope: `rematerialize_stale_series` (Phase 13) has recorded `"resource_administrators": "pending Phase 18 delivery"` in its own conflict findings since it was written — PRD FR13b requires a conflict be surfaced for human decision, and leaving that specific, already-committed placeholder unfulfilled after building the entire notification infrastructure this phase exists to build would be a loose end this project's own discipline (see the Phase 12→13 REC-06/horizon precedent) argues against leaving | `kairos/bookings/tasks.py` (`rematerialize_stale_series`), `kairos/core/notifications.py` (`notify_rematerialization_conflict`) |
 | `notify_rollback_hold_released` (Phase 18) was built standalone, with NO real trigger wired to it, per this phase's own explicit clarification | Rollout v1.0 §4.5's hold release is a manual operational runbook (SQL an operator runs during an incident) — no phase in the Implementation Plan has built application code that performs it. Inventing a fake "rollback release" code path just to give this notification a caller would be scope beyond this phase's actual job (this phase's job is notification DELIVERY, not automating an incident-response runbook); the template/message content and the `NotificationService.send` mechanism exist and are independently tested with a manually-constructed event instead, the same "mechanism proven ahead of its real caller" pattern already used repeatedly (`actor_type='system'`, containment eligibility, hold acceptance) | `kairos/core/notifications.py` (`notify_rollback_hold_released`); see Open Questions |
 | ⚠️ **Real bug caught only by rebuilding the worker's Docker image and re-reading its startup banner**: `send_notification_task` was silently ABSENT from the running worker's registered task list after `docker compose restart worker` — even though it lives in `kairos/core/tasks.py`, the exact file `autodiscover_tasks()` scans (Phase 13's own hard-learned convention, followed correctly this time) | `docker compose restart` restarts a container from its EXISTING image; it does not rebuild from changed source. The worker came back up cleanly with zero errors anywhere and simply didn't list the new task — the identical "no errors, just absence" failure mode RFC v1.0 §14 warns about, this time one layer down the stack from Phase 13's cause (a wrong file, then; a stale image, now). Fixed with `docker compose up -d --build worker beat`; re-verified by reading the rebuilt banner (six tasks) and dispatching two real tasks against it — one deliberately malformed, which demonstrated genuine exponential retry-with-backoff (1s/0s/4s/2s/6s, jittered) against the real Redis broker before failing cleanly at `NOTIFICATION_MAX_RETRIES`; one valid, which printed to the worker's console `EMAIL_BACKEND` and left one `notification_log` row (`status='sent'`), confirmed via `psql` | this session's live verification (see the Phase 18 Completed Phases row) |
+| Resource CRUD/admin-grants (Phase 19) apply write-path session settings directly in a new `kairos/resources/services.py`, with NO `run_idempotent_write`/idempotency-key wrapper at all | Spec v1.0 §7's coverage list is explicit about which endpoints require `Idempotency-Key`, and these five aren't on it — unlike every prior write path in this codebase (all idempotency-covered), this is the first set of mutating endpoints that genuinely ISN'T. Session settings are still required regardless: `resource`/`resource_admin` are two of the five audit-triggered tables (Phase 8), so skipping `apply_write_path_session_settings` here would silently produce `actor_type='unknown'` audit rows even though no idempotency mechanism is involved at all | `kairos/resources/services.py` |
+| `_resource_admin_for` (Phase 19) picks the EARLIEST-granted resource admin (FCFS by `granted_at`, `id`) when a resource has more than one, and falls back to `retain`-shaped behavior (logged, counted as `bookings_retained`) when a `transfer`-policy resource has NONE | Neither PRD FR49 nor Spec v1.0 §5.15 says which admin wins when several exist, or what happens when none do — OFF-01's own setup guarantees exactly one admin for its transfer-policy resource, so this is a genuine, un-Spec'd edge case, not something the Test Plan exercises. FCFS mirrors this project's own established waitlist tie-break convention (`joined_at`, `id`) rather than inventing a new ordering rule; falling back to retain (not raising, not silently dropping the booking) is the only option consistent with "no booking silently orphaned" when transfer has no valid target | `kairos/identity/services.py` (`_resource_admin_for`, `deactivate_user`) |
+| `cancel_waitlist_entry`/`decline_offer` (Phase 19) both gained an `actor_type` parameter (default `USER`, unchanged for every prior caller) rather than bespoke `SYSTEM`-only variants | The identical choice already made twice before for the identical reason — `create_booking`/`edit_booking` gained `actor_type` in Phase 13 rather than `create_system_booking`/`edit_system_booking`. The offboarding cascade needs the EXACT same INSERT/UPDATE machinery (session settings, audit attribution) these functions already have; only who the action is attributed to differs | `kairos/waitlist/services.py` |
+| The entire offboarding cascade (`deactivate_user`) runs inside ONE shared `run_idempotent_write` transaction, not `run_idempotent_recurring_confirm`'s claim-then-N-independent-transactions-then-record shape | `kairos.core.idempotency`'s OWN module docstring named "admin deactivate: Phase 19" as a future `run_idempotent_write` caller back in Phase 5 — honored here, and for the same underlying reason `cancel_recurring_series` (Phase 12) already chose the single-transaction shape over confirm's split one: every write this cascade performs (transfer, cancel, hold release, entry cancel) moves rows OUT of or SIDEWAYS from the exclusion domain, never into a newly-contested one, so there is no "one contested item" isolation problem CREATE-shaped writes have. Each individual cascade step still opens its own nested `atomic()` (a savepoint) via the write function it reuses, matching every other write function in this codebase regardless of whether it's always called through `run_idempotent_write` | `kairos/identity/services.py` (`deactivate_user`) |
+| OFF-02 is enforced inside `OIDCSessionAuthentication`/`StubUserIdAuthentication.authenticate()` (both), not as a DRF permission class layered on `IsAuthenticated` | A permission class only runs for views that declare it — a future endpoint could simply forget to add the check, the exact "selectively restricted rather than genuinely locked out" gap a real offboarded-employee scenario cannot tolerate. Checking once, at authentication time, in the ONE place `request.user` gets resolved for every request through either authenticator, means there is no view-by-view decision to get wrong | `kairos/identity/authentication.py` (`_reject_if_deactivated`) |
+| ⚠️ **Real gap fixed this phase, exposed only by being the first caller to pass `actor_type=SYSTEM` into `cancel_booking`**: its session-settings call always used `req.actor.id` as `actor_id`, unlike `create_booking`/`edit_booking`'s established NULLIF(...,'')-for-SYSTEM convention (Phase 13) | Never observable before Phase 19: every prior caller of `cancel_booking` passed `actor_type=USER` or `ADMIN`, both with a real human actor, so the unconditional `actor_id=str(req.actor.id)` always happened to be correct by coincidence. The offboarding cascade's `cancel_and_notify` path is the first call with `actor_type=SYSTEM` — fixed to match `create_booking`/`edit_booking` exactly (empty string for SYSTEM), verified directly by OFF-01's own `audit_log.actor_id IS NULL` assertion on the affected row, not merely by code inspection | `kairos/bookings/services.py` (`cancel_booking`) |
 
 ## Running Locally
 
@@ -730,6 +835,19 @@ pytest. The second (valid) dispatch printed the full email (subject, body, heade
 worker's own stdout via the console `EMAIL_BACKEND`, logged `notification_delivered`, and left
 exactly one `notification_log` row with `status='sent'`, `attempts=1` — confirmed directly via
 `psql` against `kairos_dev`, not just the log line.
+
+Resource administration & offboarding (Phase 19) — verified live over real HTTP against
+`manage.py runserver` (`kairos.settings.dev`) connected as `kairos_app`, with `kairos_dev`
+freshly migrated first (migration 0012). A real login → `POST /resources` →
+`POST /resources/{id}/admins` (self-grant) → `PATCH /resources/{id}` →
+`GET /admin/resources/{id}/utilization` round trip succeeded end to end. Separately: a second
+user booked a future slot on that resource, was deactivated via
+`POST /admin/users/{id}/deactivate`, and `psql` confirmed the booking's `user_id` genuinely
+changed to the resource admin (`offboarding_policy='transfer'`, the schema default) and the
+corresponding `audit_log` row showed `actor_type='system'`/`actor_id` NULL — not inferred from
+the response body alone. Then, with a FRESH session token minted for that same now-deactivated
+user (proving token minting itself is unaffected — only USING the API is blocked), a real
+`GET /resources` request returned a genuine 401, confirming OFF-02 live.
 
 The frontend starts Phase 23.
 
@@ -979,8 +1097,23 @@ each notification point fires from its REAL caller (`cancel_booking`, `create_of
 freed_range`, `rematerialize_stale_series`) and that admin-cancellation does NOT fire on an
 ordinary self-cancel.
 
+`tests/resources/test_admin.py` (Phase 19) — resource create (`system_admin` 201, non-admin
+403, fixed-offset timezone 400), PATCH (resource-admin 200, non-admin 403 not 404, partial
+update leaves other fields untouched, invalid bookable window 400), no DELETE endpoint (real
+405), admin grants (`system_admin` 201, duplicate grant 409 `already_resource_admin`, revoke
+204, revoke-nonexistent 404, non-admin 403), and utilization (correct aggregates against a
+constructed booking/waitlist/cancellation set, non-admin 403, resource-admin 200).
+`tests/identity/test_offboarding.py` (Phase 19) — OFF-01 ★, the full documented scenario (2
+transfer/1 cancel-and-notify/1 retain bookings, 3 waitlist entries, 1 outstanding hold with a
+genuinely-next-eligible waitlist entry proving cascade fires not just release, 1 active
+series), asserted against the response body, real DB state, `mail.outbox`, and `audit_log`
+together — not any one of those alone; a companion test for the idempotent-no-op repeat-
+deactivation case. OFF-02 — create/join/confirm each asserted as a real 401 against a
+deactivated principal, including the confirm case's "deactivated AFTER receiving the offer,"
+not a principal who could never have reached it.
+
 Also runnable: `cd backend && ruff check . && ruff format --check . && mypy kairos` (all pass
-with zero findings as of Phase 18). CI (`.github/workflows/ci.yml`) runs the CI tier as three
+with zero findings as of Phase 19). CI (`.github/workflows/ci.yml`) runs the CI tier as three
 jobs — `lint`, `test`, `concurrency` (RECLAIM-04 excluded, see above) — on every PR. The spike
 scripts under `scripts/spike/` are runnable but are diagnostic, not a test suite — see
 `docs/spikes/S1-postgres-verification.md` for what each one does and its recorded output.
@@ -1014,6 +1147,12 @@ From Phase 9:
   "Resource Administration & Offboarding") should treat this schema as already decided** —
   extend it, don't redesign it, and don't let a differently-shaped group model creep in
   without updating this entry and the Key Technical Decisions row that explains the choice.
+  **Partially addressed by Phase 19, not closed**: `POST /resources` now accepts an optional
+  `restricted_group_id`, so a resource CAN be created already-restricted through a real
+  endpoint — but there is still no endpoint to CREATE a `UserGroup` or add/remove members;
+  those remain ORM-only in tests. `restricted_group` is also deliberately absent from `PATCH
+  /resources/{id}`'s updatable fields (Spec v1.0 §5.14 never lists it there), so an OPEN
+  resource can't be retroactively restricted (or vice versa) through this API yet either.
 
 From Phase 10:
 
@@ -1110,6 +1249,32 @@ From Phase 18:
   yet. Not a gap in THIS phase's own scope (Phase 18's own Scope IN names only "admin
   cancellation with reason," not modification) — flagged here so a future phase that DOES add
   an admin-edit path doesn't miss that FR53 already expects a notification alongside it.
+
+From Phase 19:
+
+- **A deactivated user's OWN `resource_admin` grants are not revoked, and their being an admin
+  elsewhere plays no role in the offboarding cascade.** Neither PRD FR49-51 nor Spec v1.0 §5.15
+  mentions this — the cascade is scoped entirely to what the deactivated user OWNS (bookings,
+  waitlist entries, series) or HOLDS (an outstanding hold), never to scopes they ADMINISTER for
+  OTHER people. A deactivated resource admin silently keeps their grant, and any future
+  transfer/cancel decision on THEIR administered resources would still route through them
+  (`_resource_admin_for` doesn't check the target admin's own `status`). Not built because
+  nothing asked for it — flagged so a future phase doesn't assume it's already handled.
+- **Recurring-series transfer/terminate has no endpoint anywhere in this codebase** — PRD
+  FR51's "with the option to transfer ownership or terminate the series" describes what a
+  resource admin should be ABLE to do once notified; Phase 19 only builds the notification and
+  the reporting (`series_flagged_for_admin`), matching FR16's own pre-existing, still-unowned
+  gap (Phase 12's Open Questions entry, above) — this is the SAME missing capability, not a
+  second one. Whichever future phase finally builds series editing should treat "transfer a
+  flagged series" and "edit a series definition" as one piece of work, not two.
+- **`bookings_retained`'s response count is overloaded**: it means both "this booking's
+  resource genuinely uses `offboarding_policy='retain'`" AND "this booking's resource uses
+  `'transfer'` but had no resource admin to transfer to" (a `_resource_admin_for` fallback —
+  see Key Technical Decisions). Spec v1.0 §5.15's response shape has no field to distinguish
+  the two, and OFF-01's own setup never exercises the fallback case, so this was a genuine,
+  un-Spec'd choice, not a oversight — flagged in case a future consumer of this response needs
+  to tell them apart (the `offboarding_transfer_no_resource_admin` warning log is currently the
+  only place that distinction survives).
 
 Genuine open questions from the source documents (offer window duration, nonexistent-time
 policy default, series bounds, etc.) are tracked in PRD v1.0 §11 and RFC v1.0 §18; they get

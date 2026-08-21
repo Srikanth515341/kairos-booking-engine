@@ -303,6 +303,40 @@ def notify_rematerialization_conflict(
     )
 
 
+def notify_series_owner_deactivated(
+    *,
+    recipient: AppUser,
+    resource_name: str,
+    series_id: str,
+    occurrences_remaining: int,
+    request_id: str,
+) -> None:
+    """PRD FR51 / Implementation Plan Phase 19: a recurring series' owner
+    was deactivated — sent to the resource administrator(s) (kairos.
+    identity.services.deactivate_user), never to the deactivated owner
+    themselves (they no longer have an active account to act on it).
+    """
+    subject = f"Action needed: a recurring series for {resource_name} needs a new owner"
+    body = (
+        f"The owner of a recurring booking series for {resource_name} ({occurrences_remaining} "
+        "occurrence(s) remaining) has been deactivated.\n\n"
+        "Please transfer ownership of this series to another user or terminate it — it will "
+        "otherwise keep materializing new occurrences for a principal who is no longer active."
+    )
+    _notify(
+        recipient=recipient,
+        notification_type=NotificationType.SERIES_OWNER_DEACTIVATED,
+        subject=subject,
+        body=body,
+        context={
+            "resource_name": resource_name,
+            "series_id": series_id,
+            "occurrences_remaining": occurrences_remaining,
+        },
+        request_id=request_id,
+    )
+
+
 def notify_rollback_hold_released(
     *,
     recipient: AppUser,

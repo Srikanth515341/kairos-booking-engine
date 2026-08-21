@@ -142,7 +142,13 @@ change tells you exactly how your recurring time moved — all dispatched from a
 worker, never from inside the request that triggered them, so a slow or failing email provider
 can never turn a successful cancellation into an apparent request failure. A delivery failure
 is retried with exponential backoff and recorded, not silently dropped or silently retried
-forever.
+forever. Resources now have a real admin surface too (Phase 19): create, update, and delegate
+admin scope over HTTP, with no delete endpoint at all — a resource goes offline by
+`status: "inactive"`, never by disappearing, so bookings that reference it keep their history
+intact. Offboarding a user applies a real, per-resource policy to every booking they hold —
+transferred, cancelled with notice, or retained for manual review — releases any slot they were
+sitting on so it reaches the next person waiting rather than expiring uselessly, and locks their
+session out immediately, not just their ability to create new bookings.
 See
 [`CLAUDE.md`](CLAUDE.md) for exactly what is and isn't built, and
 [`docs/06-implementation-plan.md`](docs/06-implementation-plan.md) for the full 31-phase
@@ -311,6 +317,22 @@ curl -i -X POST http://127.0.0.1:8000/api/v1/waitlist-entries/<entry-id-from-abo
   -H "Idempotency-Key: $(python -c 'import uuid; print(uuid.uuid4())')"
 ```
 
+Create a resource and delegate admin scope over it (Phase 19 — `system_admin` only; every prior
+resource in this walkthrough was created directly via `manage.py shell`, this is the first real
+endpoint for it):
+
+```bash
+curl -i -X POST http://127.0.0.1:8000/api/v1/resources \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $ACCESS_TOKEN" \
+  -d '{"name": "Room 2", "timezone": "UTC", "bookable_start_time": "09:00:00", "bookable_end_time": "17:00:00"}'
+
+curl -i -X POST http://127.0.0.1:8000/api/v1/resources/<resource-id-from-above>/admins \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $ACCESS_TOKEN" \
+  -d '{"user_id": "<some-user-id>"}'
+```
+
 No frontend yet — see Status above and [`CLAUDE.md`](CLAUDE.md).
 
 ## Running the test suite
@@ -362,7 +384,7 @@ pytest
 | Waitlist offers — creation, cascade, accept, decline | **Live** — hold-before-offer (PRD FR23), atomic accept, decline-and-cascade (WL-01/02/03) 🏁 Milestone 3 (Phase 16) |
 | Hold reclamation (reaper + cleanup-on-write) | **Live** — both RFC §10.4 mechanisms, verified against a real Redis outage (RECLAIM-01–04, WL-05/06) (Phase 17) |
 | Notifications | **Live** — offer/admin-cancellation/re-materialization dispatch, async-only, retried with backoff and recorded (PRD FR52–55) (Phase 18) |
-| Admin & offboarding | Not started (Phase 19) |
+| Resource admin & offboarding | **Live** — resource CRUD, admin-scope grants, utilization, per-resource-policy user deactivation (OFF-01/02) (Phase 19) |
 | Production correctness monitoring | Not started (Phase 20–21) |
 | Frontend | Not started (Phase 23–27) |
 | Deployed / live | Not started (Phase 30) |
