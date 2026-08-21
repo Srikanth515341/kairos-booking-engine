@@ -9,13 +9,14 @@ from __future__ import annotations
 import logging
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import NoReturn
 
 from django.db import DatabaseError, connection, transaction
 from django.utils import timezone
 
 from kairos.bookings.models import Booking, BookingStatus, RecurringSeries
+from kairos.core.constants import OFFER_WINDOW_MINUTES
 from kairos.core.db import apply_write_path_session_settings
 from kairos.core.exceptions import ServiceUnavailableError, SlotUnavailableError
 from kairos.core.models import AuditActorType
@@ -83,6 +84,16 @@ class BookingCreateRequest:
     # `created_by`), but the ACTOR that performed the write is the
     # background job, not that user, so the audit trail must say so.
     actor_type: str = AuditActorType.USER
+    # CONFIRMED for every caller through Phase 14 (default, unchanged).
+    # Phase 15 (RFC v1.0 §10.1) sets this to HELD for a hold — a waitlist
+    # offer's reservation — created by a future cascade worker (Phase 16):
+    # `req.user` is then the WAITLISTED user the slot is held FOR, not a
+    # self-service booker. Reusing this same function/request, rather than
+    # a bespoke create_hold(), is what makes the hold's INSERT go through
+    # the identical session-settings/SQLSTATE-translation/refresh_from_db
+    # machinery a confirmed booking's does — the same "one write path, one
+    # correctness proof" reasoning Phase 13 already applied to actor_type.
+    status: str = BookingStatus.CONFIRMED
 
 
 def create_booking(req: BookingCreateRequest) -> Booking:
@@ -124,12 +135,34 @@ def create_booking(req: BookingCreateRequest) -> Booking:
                     actor_type=req.actor_type,
                     request_id=req.request_id,
                 )
+            # ============================================================
+            # RFC v1.0 §10.1: a hold (status='held') occupies the SAME
+            # exclusion domain as a confirmed booking, because the
+            # `no_overlapping_bookings` predicate is `status IN
+            # ('confirmed', 'held')` (bookings/0002_exclusion_constraint.py).
+            # This INSERT is what makes that true in practice, not just in
+            # the schema — a hold is a real row in THIS table, enforced by
+            # THIS SAME constraint, with no second coordination mechanism.
+            # If a future change ever narrows that predicate back to
+            # 'confirmed' alone, this INSERT keeps succeeding and every
+            # waitlist guarantee (PRD FR17, S1) silently stops meaning
+            # anything — an ordinary booking could then take a slot out
+            # from under an outstanding offer, while every test outside
+            # RECON-05/HOLD-01 still passes. STOP and re-read RFC v1.0
+            # §10.1 before ever changing what this writes.
+            # ============================================================
+            expires_at = (
+                timezone.now() + timedelta(minutes=OFFER_WINDOW_MINUTES)
+                if req.status == BookingStatus.HELD
+                else None
+            )
             booking = Booking.objects.create(
                 resource=req.resource,
                 user=req.user,
                 series=req.series,
                 time_range=(req.start, req.end),
-                status=BookingStatus.CONFIRMED,
+                status=req.status,
+                expires_at=expires_at,
             )
             # .create() leaves fields exactly as assigned in Python — here,
             # `time_range` as the plain tuple passed in, not the Range
@@ -142,7 +175,7 @@ def create_booking(req: BookingCreateRequest) -> Booking:
         _handle_write_database_error(exc, log_context)
 
     logger.info(
-        "booking_created",
+        "hold_created" if req.status == BookingStatus.HELD else "booking_created",
         extra={**log_context, "booking_id": str(booking.id), "outcome": "success"},
     )
     return booking

@@ -55,3 +55,11 @@ TZDATA_REMATERIALIZATION_INTERVAL_SECONDS = int(
 TZDATA_DRIFT_CHECK_INTERVAL_SECONDS = int(
     os.environ.get("TZDATA_DRIFT_CHECK_INTERVAL_SECONDS", str(24 * 60 * 60))  # daily
 )
+
+# Waitlist offer window (Implementation Plan Phase 15; RFC v1.0 §10.5) — also
+# the hold DURATION, since a hold's expires_at is `now() + this`. Not merely
+# a UX parameter: it directly determines how long a resource is unbookable
+# by everyone else while an offer is outstanding. 15 minutes is the PRD's
+# working proposal pending product sign-off (PRD v1.0 §11 open question 1) —
+# tunable here, not a magic number at the hold-creation call site.
+OFFER_WINDOW_MINUTES = int(os.environ.get("OFFER_WINDOW_MINUTES", "15"))

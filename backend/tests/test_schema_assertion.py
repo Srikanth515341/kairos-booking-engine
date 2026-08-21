@@ -2,9 +2,11 @@
 
 Rollout RUNBOOK-01 cause #1's primary CI-time defense: narrowing the
 predicate to 'confirmed' only would disable every waitlist guarantee while
-every other test still passes, since 'held' rows don't exist until Phase 15.
-This test fails the moment that predicate is narrowed, not months later when
-a waitlist offer silently reserves nothing.
+every other test still passes — this test existed BEFORE Phase 15 gave
+'held' rows a real writer specifically so the predicate itself was already
+guarded the moment it was defined (Phase 2), not left unverified until
+something used it. This test fails the moment that predicate is narrowed,
+not months later when a waitlist offer silently reserves nothing.
 """
 
 from __future__ import annotations

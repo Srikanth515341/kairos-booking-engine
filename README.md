@@ -111,7 +111,15 @@ pre-check — the same philosophy as booking creation — with 409 when you're a
 already fully bookable and you should just book it. Eligibility is defined as *containment*,
 not overlap: a freed 10:00–11:00 makes a 10:00–11:00 waitlister eligible, a freed 10:00–10:30
 does not, since their full requested range wasn't actually freed. `GET /waitlist-entries`
-reports your live queue position; `POST /waitlist-entries/{id}/cancel` withdraws. See
+reports your live queue position; `POST /waitlist-entries/{id}/cancel` withdraws. And a
+waitlist offer now genuinely reserves something (Phase 15): a hold is an ordinary row in the
+SAME `booking` table, in the SAME `status IN ('confirmed','held')` exclusion domain a
+confirmed booking occupies — so an outstanding offer cannot be taken out from under the
+person it was made to, not by another user's booking, not under concurrent load. 50
+independently-connected clients released simultaneously against an actively held range: zero
+succeed, every time. There's no HTTP endpoint for this yet (offer dispatch is Phase 16) — the
+hold mechanism itself is proven directly, the same way the recurrence engine was proven ahead
+of its own API surface back in Phase 11. See
 [`CLAUDE.md`](CLAUDE.md) for exactly what is and isn't built, and
 [`docs/06-implementation-plan.md`](docs/06-implementation-plan.md) for the full 31-phase
 build plan.
@@ -326,7 +334,8 @@ pytest
 | Rolling / tzdata re-materialization | **Live** — mechanism proven directly; no real caller yet, see CLAUDE.md (Phase 13) |
 | system_check_run / correctness-monitor records | **Live** — `series_materialization`/`tzdata_rematerialization` only; full six-check alerting is Phase 21 |
 | Waitlist join / list / cancel | **Live** — containment eligibility query (PRD FR21), no offer cascade caller yet (Phase 14) |
-| Enforceable waitlist (holds, offers, cascade) | Not started (Phase 15–17) |
+| Holds occupy the exclusion domain | **Live** — proven under concurrency (HOLD-01/02/03), no reclamation or offer cascade caller yet (Phase 15) |
+| Hold reclamation, offer cascade, notification dispatch | Not started (Phase 16–17) |
 | Notifications | Not started (Phase 18) |
 | Admin & offboarding | Not started (Phase 19) |
 | Production correctness monitoring | Not started (Phase 20–21) |
