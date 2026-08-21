@@ -71,6 +71,54 @@ OFFER_WINDOW_MINUTES = int(os.environ.get("OFFER_WINDOW_MINUTES", "15"))
 # 30s is the initial proposal.
 HOLD_REAPER_INTERVAL_SECONDS = int(os.environ.get("HOLD_REAPER_INTERVAL_SECONDS", "30"))
 
+# Correctness monitoring (Implementation Plan Phase 20; PRD M2/M3; RFC v1.0
+# §14). Both run hourly by default — the same interval already used for
+# rolling/tzdata materialization, not a coincidence: RFC v1.0 §14 names
+# "hourly in production" explicitly for schema assertion, and reconciliation
+# is scheduled the same way.
+RECONCILIATION_INTERVAL_SECONDS = int(
+    os.environ.get("RECONCILIATION_INTERVAL_SECONDS", str(60 * 60))
+)
+SCHEMA_ASSERTION_INTERVAL_SECONDS = int(
+    os.environ.get("SCHEMA_ASSERTION_INTERVAL_SECONDS", str(60 * 60))
+)
+
+# Heartbeat staleness thresholds (Rollout v1.0 §6.1's table) — "no
+# successful run in 2x interval" for the interval-driven checks. Named
+# separately from the intervals above (not computed as `interval * 2`
+# inline at every call site) so each is independently tunable, matching
+# CLAUDE.md's own "every threshold is a named constant" rule.
+RECONCILIATION_STALE_THRESHOLD_SECONDS = int(
+    os.environ.get(
+        "RECONCILIATION_STALE_THRESHOLD_SECONDS", str(RECONCILIATION_INTERVAL_SECONDS * 2)
+    )
+)
+SCHEMA_ASSERTION_STALE_THRESHOLD_SECONDS = int(
+    os.environ.get(
+        "SCHEMA_ASSERTION_STALE_THRESHOLD_SECONDS", str(SCHEMA_ASSERTION_INTERVAL_SECONDS * 2)
+    )
+)
+SERIES_MATERIALIZATION_STALE_THRESHOLD_SECONDS = int(
+    os.environ.get(
+        "SERIES_MATERIALIZATION_STALE_THRESHOLD_SECONDS",
+        str(ROLLING_MATERIALIZATION_INTERVAL_SECONDS * 2),
+    )
+)
+TZDATA_REMATERIALIZATION_STALE_THRESHOLD_SECONDS = int(
+    os.environ.get(
+        "TZDATA_REMATERIALIZATION_STALE_THRESHOLD_SECONDS",
+        str(TZDATA_REMATERIALIZATION_INTERVAL_SECONDS * 2),
+    )
+)
+# offer_cascade is event-triggered (a cancellation/decline/reclaim fires
+# it), not interval-driven like the checks above — there is no "its own
+# interval" to multiply. Rollout v1.0 §6.1's table gives it the same
+# fixed 90s hold_reaper already uses (3x hold_reaper's 30s sweep) rather
+# than a multiple of an interval that doesn't exist for this check.
+OFFER_CASCADE_STALE_THRESHOLD_SECONDS = int(
+    os.environ.get("OFFER_CASCADE_STALE_THRESHOLD_SECONDS", "90")
+)
+
 # Notification delivery retry (Implementation Plan Phase 18; PRD FR55 —
 # "delivery failure must not roll back or block the underlying state
 # transition, but must be recorded and retried"). Exponential backoff via

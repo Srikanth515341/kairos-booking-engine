@@ -18,6 +18,8 @@ from typing import Any
 from celery import shared_task
 
 from kairos.core.constants import NOTIFICATION_MAX_RETRIES, NOTIFICATION_RETRY_BACKOFF_MAX_SECONDS
+from kairos.core.reconciliation import check_reconciliation
+from kairos.core.schema_assertion import check_schema_assertion
 from kairos.core.tzdata_check import check_tzdata_drift
 
 logger = logging.getLogger(__name__)
@@ -116,3 +118,13 @@ def dispatch_notification(
             extra={"request_id": request_id, "notification_type": notification_type},
             exc_info=True,
         )
+
+
+@shared_task(name="kairos.core.tasks.run_reconciliation_task")
+def run_reconciliation_task() -> dict[str, Any]:
+    return check_reconciliation()
+
+
+@shared_task(name="kairos.core.tasks.run_schema_assertion_task")
+def run_schema_assertion_task() -> dict[str, Any]:
+    return check_schema_assertion()
