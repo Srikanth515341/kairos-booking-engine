@@ -241,6 +241,12 @@ class NotificationType(models.TextChoices):
     # fake trigger path just to have a caller would be scope beyond this
     # phase's actual job. See CLAUDE.md Open Questions.
     ROLLBACK_HOLD_RELEASED = "rollback_hold_released", "Rollback hold released"
+    # PRD FR51 / Implementation Plan Phase 19 — a recurring series whose
+    # owner was just deactivated is FLAGGED to the resource administrator
+    # ("with the option to transfer ownership or terminate the series"),
+    # never silently left to keep materializing for a principal who no
+    # longer exists as an active user.
+    SERIES_OWNER_DEACTIVATED = "series_owner_deactivated", "Series owner deactivated"
 
 
 class NotificationStatus(models.TextChoices):

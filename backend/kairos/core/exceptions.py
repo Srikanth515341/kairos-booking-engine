@@ -153,6 +153,17 @@ class OfferExpiredError(RecordableConflictError):
     http_status = 409
 
 
+class AlreadyResourceAdminError(Exception):
+    """SQLSTATE 23505 on `resource_admin_unique_grant` — this exact
+    (resource, user) pair already holds a grant. Maps to 409 `already_
+    resource_admin` (Spec v1.0 §5.14: "409 if already granted"). NOT a
+    `RecordableConflictError` — `POST /resources/{id}/admins` carries no
+    `Idempotency-Key` (Spec v1.0 §7's coverage list doesn't name it), so
+    there is no idempotent-replay outcome for `run_idempotent_write` to
+    ever record here.
+    """
+
+
 class OfferAlreadyResolvedError(RecordableConflictError):
     """A decline's conditional UPDATE (`WHERE status='active'`) affected
     zero rows — the offer was already confirmed or declined. Maps to 409

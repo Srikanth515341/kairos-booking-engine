@@ -18,3 +18,14 @@ class DevMockLoginSerializer(serializers.Serializer[None]):
 
     email = serializers.EmailField()
     display_name = serializers.CharField(required=False, allow_blank=False, default=None)
+
+
+class UserDeactivateSerializer(serializers.Serializer[None]):
+    """POST /api/v1/admin/users/{id}/deactivate (Spec v1.0 §5.15) — the
+    reason is REQUIRED, not optional, unlike a self-cancel's `reason`
+    (PRD FR40/FR47's "administrative override requires a recorded
+    reason" applies here at least as strongly as it does to a single
+    booking cancel: deactivation cascades into cancelling/transferring
+    OTHER people's bookings)."""
+
+    reason = serializers.CharField(allow_blank=False)

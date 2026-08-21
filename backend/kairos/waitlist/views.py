@@ -16,6 +16,7 @@ from kairos.core.idempotency import run_idempotent_write
 from kairos.core.models import AuditActorType
 from kairos.core.pagination import decode_cursor, encode_cursor, parse_limit
 from kairos.core.views import KairosAPIView
+from kairos.core.views import request_id as _request_id
 from kairos.identity.models import AppUser
 
 from .models import WaitlistEntry, WaitlistEntryStatus, WaitlistOffer, WaitlistOfferStatus
@@ -54,11 +55,6 @@ def _require_idempotency_key(request: Request) -> uuid.UUID:
         return uuid.UUID(header_value)
     except ValueError as exc:
         raise PolicyValidationError(IDEMPOTENCY_KEY_HEADER, "must be a valid UUID") from exc
-
-
-def _request_id(request: Request) -> str:
-    django_request = getattr(request, "_request", request)
-    return getattr(django_request, "request_id", "") or ""
 
 
 def _queue_positions(entries: list[WaitlistEntry]) -> dict[uuid.UUID, int]:

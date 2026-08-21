@@ -6,6 +6,7 @@ repeated on every view.
 from __future__ import annotations
 
 from rest_framework.permissions import IsAuthenticated
+from rest_framework.request import Request
 from rest_framework.views import APIView
 
 from kairos.identity.authentication import OIDCSessionAuthentication, StubUserIdAuthentication
@@ -20,3 +21,15 @@ class KairosAPIView(APIView):
     # position here — see that class's docstring.
     authentication_classes = [OIDCSessionAuthentication, StubUserIdAuthentication]
     permission_classes = [IsAuthenticated]
+
+
+def request_id(request: Request) -> str:
+    """Extracted here (Implementation Plan Phase 19) once a fourth view
+    module (kairos.identity, for the deactivate endpoint) needed the
+    identical helper `bookings`/`waitlist`/`resources` views.py already
+    each defined locally — this project's own "worth extracting once
+    real duplication exists, not before" threshold (see
+    RecordableConflictError, Phase 16).
+    """
+    django_request = getattr(request, "_request", request)
+    return getattr(django_request, "request_id", "") or ""
