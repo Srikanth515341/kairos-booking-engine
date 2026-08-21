@@ -76,6 +76,18 @@ kairos-booking-engine/
 │   │   │                   # drf.py and idempotency.py each hold ONE generic branch instead
 │   │   │                   # of one per exception (consolidated once a 4th instance of the
 │   │   │                   # pattern appeared, not before — see Key Technical Decisions),
+│   │   │                   # notifications.py (NotificationService + notify_offer_created/
+│   │   │                   # notify_admin_cancellation/notify_rematerialization/
+│   │   │                   # notify_rematerialization_conflict/notify_rollback_hold_released
+│   │   │                   # — Phase 18, PRD FR52-55; delivery reuses Django's own console/
+│   │   │                   # smtp/locmem EMAIL_BACKEND rather than a bespoke backend
+│   │   │                   # abstraction), models.py (+ NotificationLog — Phase 18, the
+│   │   │                   # PRD FR55 "recorded and retried" mechanism), migrations/0010-0011
+│   │   │                   # (notification_log table + kairos_app grants — SELECT/INSERT/
+│   │   │                   # UPDATE, no audit trigger, Phase 18), tasks.py's
+│   │   │                   # send_notification_task/dispatch_notification (Phase 18, the
+│   │   │                   # SAME dispatch-wrapper-swallows-broker-failures shape
+│   │   │                   # kairos.waitlist.tasks.dispatch_cascade established in Phase 17),
 │   │   │                   # management/commands/cleanup_idempotency_keys.py
 │   │   ├── identity/       # app_user, resource_admin (UUID surrogate PK since Phase 8),
 │   │   │                   # user_group/user_group_membership (Phase 9 — PRD FR46, not in
@@ -112,7 +124,16 @@ kairos-booking-engine/
 │   │   │                   # dispatches kairos.waitlist.tasks.dispatch_cascade (Phase 16, RFC
 │   │   │                   # §5c step 4). create_booking also runs the cleanup-on-write DELETE
 │   │   │                   # (Phase 17, RFC §10.4 mechanism 1) inside its own transaction,
-│   │   │                   # before every INSERT, unconditionally, for every caller
+│   │   │                   # before every INSERT, unconditionally, for every caller.
+│   │   │                   # cancel_booking ALSO registers a second on_commit hook — PRD FR53,
+│   │   │                   # Phase 18 — dispatching notify_admin_cancellation, but ONLY when
+│   │   │                   # actor_type=ADMIN (a real resource-admin override; a self-cancel
+│   │   │                   # never reaches it). tasks.py's rematerialize_stale_series now
+│   │   │                   # dispatches notify_rematerialization on a successful recompute and
+│   │   │                   # notify_rematerialization_conflict to the series owner AND every
+│   │   │                   # resource admin on a conflict (Phase 18, PRD FR54/FR13b — closes
+│   │   │                   # the "resource_administrators: pending Phase 18 delivery"
+│   │   │                   # placeholder Phase 13 left)
 │   │   ├── waitlist/       # waitlist_entry (Phase 14), waitlist_offer (Phase 16) — its own
 │   │   │                   # app, not part of bookings/, since Spec's own ER diagram reaches
 │   │   │                   # both directly from app_user/resource, never through booking (see
@@ -136,6 +157,11 @@ kairos-booking-engine/
 │   │   │                   # broker outage degrades rather than raises out of an on_commit
 │   │   │                   # callback, WL-06; reap_expired_holds_task — Phase 17, on
 │   │   │                   # CELERY_BEAT_SCHEDULE at HOLD_REAPER_INTERVAL_SECONDS),
+│   │   │                   # services.py's create_offer_for_freed_range now dispatches
+│   │   │                   # notify_offer_created right after the offer row commits (Phase 18,
+│   │   │                   # PRD FR52 — expiry stated explicitly), called directly rather than
+│   │   │                   # via on_commit since this function is never itself inside an open
+│   │   │                   # transaction,
 │   │   │                   # serializers.py (slot_already_available check before
 │   │   │                   # the idempotency key is claimed; WaitlistOfferResponseSerializer —
 │   │   │                   # Phase 16), views.py (join/list/cancel; WaitlistOfferConfirmView/
@@ -283,6 +309,40 @@ unavailable` on failure rather than letting a broker outage propagate out of a
 into an apparent request failure — verified LIVE against a real Redis outage, not simulated
 (see Key Technical Decisions and the Phase 17 Completed Phases row for the full transcript).
 
+Notifications (Phase 18, PRD v1.0 FR52-55; RFC v1.0 §15a) — every notification point RFC
+§15a/PRD FR52-54 name now actually sends, asynchronously, never from a request-path
+transaction: `kairos/core/notifications.py`'s `notify_offer_created`/`notify_admin_
+cancellation`/`notify_rematerialization`/`notify_rematerialization_conflict` each build a
+subject/body and hand off to `kairos/core/tasks.py`'s `dispatch_notification`, which enqueues
+`send_notification_task.delay(...)` and returns immediately — the actual `send_mail()` call
+happens inside that Celery task, in a worker process. Delivery reuses Django's own
+`EMAIL_BACKEND` abstraction rather than a bespoke one: console in dev, `locmem` (Django's own
+capturing backend, `django.core.mail.outbox`) in test, real SMTP in prod (`SMTP_HOST`/`PORT`/
+`USER`/`PASSWORD` — prod refuses to start without `SMTP_HOST` set, the same "refuse a
+dev-shaped default" discipline `SECRET_KEY`/`KAIROS_SESSION_SIGNING_KEY` already have).
+`send_notification_task` is `autoretry_for=(Exception,)` with `retry_backoff=True` (PRD
+FR55's "recorded and retried") — every attempt, success or failure, updates ONE
+`NotificationLog` row (`kairos/core/models.py`, new schema — Spec v1.0 §3 has no notification
+concept at all, the same kind of gap Phase 9's `user_group` table filled) via `attempts`
+accumulating and `status` reflecting the latest outcome. `dispatch_notification` wraps
+`.delay()` in the identical try/except shape `kairos.waitlist.tasks.dispatch_cascade` (Phase
+17) already established, so a broker outage degrades (logged) rather than propagating out of
+`cancel_booking`'s `transaction.on_commit()` callback and turning an already-committed
+cancellation into an apparent failure. Offer-created states the expiry EXPLICITLY, in the
+subject line itself (PRD FR52); admin-cancellation only fires for a genuine resource-admin
+override (`actor_type=ADMIN`), never a self-cancel, and includes the recorded reason (PRD
+FR53); the tzdata re-materialization pair closes a promise Phase 13's own conflict-recording
+code carried since it was written ("resource_administrators: pending Phase 18 delivery") —
+`notify_rematerialization` fires per successfully-recomputed occurrence, `notify_
+rematerialization_conflict` fires to BOTH the series owner and every resource administrator
+scoped to that specific resource on a conflict (PRD FR13b). A fifth type,
+`notify_rollback_hold_released` (Rollout v1.0 §4.5), exists and is fully tested standalone —
+distinct, non-generic wording from an ordinary offer-expiry notification, explicitly stating
+queue position was preserved — but has NO real production caller: §4.5's hold release is a
+manual operational runbook (SQL an operator runs during an incident), not application code any
+phase has built, and inventing a fake trigger path just to have one would have been scope
+beyond this phase's actual job (see NOT Yet Built and Open Questions).
+
 Real authentication (Phase 9, RFC v1.0 §4): `Authorization: Bearer <session-token>`, validated
 by `OIDCSessionAuthentication`. A client obtains that session token via `POST /auth/token`
 with a verified OIDC ID token — in dev/test, `POST /auth/dev-mock-login` mints one against a
@@ -334,10 +394,12 @@ DSN (`kairos_app` deliberately has no DDL rights) — see "Running Locally" belo
 | 15 | Holds: The Shared Exclusion Domain ⚠️ CRITICAL | Makes a hold a REAL reservation by putting it in the SAME `booking` table, inside the SAME exclusion domain a confirmed booking occupies (RFC v1.0 §10.1) — the whole point of the v0.1→v1.0 redesign this phase implements: a separate `waitlist_offer`-table constraint (v0.1's design) cannot exclude against `booking`, so an ordinary user could take a slot out from under an outstanding offer. `BookingCreateRequest`/`create_booking` (`kairos/bookings/services.py`) gained a `status` field (default `CONFIRMED`, unchanged for every prior caller) rather than a bespoke `create_hold()` — a hold's INSERT needs the IDENTICAL session-settings/SQLSTATE-translation/`refresh_from_db` machinery a confirmed booking's does, the same "one write path, one correctness proof" reasoning Phase 13 already used for `actor_type`. `expires_at` is computed INSIDE `create_booking` from the new `OFFER_WINDOW_MINUTES` constant (`kairos/core/constants.py`, RFC v1.0 §10.5 / PRD open question 1, default 15) whenever `status=HELD`, keeping the `hold_has_expiry` DB CHECK invariant enforced in one place rather than trusting every future caller to set it consistently. The RFC v1.0 §10.1 load-bearing comment (Implementation Plan §1.3 item 3) lives at the `Booking.objects.create(...)` call site itself, in ADDITION to Phase 2's existing comment at the constraint's own definition — two different developers, editing two different files, each need the warning where THEY are looking. HOLD-01 ★ (the Test Plan's own "most important test in the document") passes as a real, end-to-end proof: a hold created directly (no offer worker exists until Phase 16 — the identical "mechanism before its real caller" pattern already used for `actor_type='system'` and containment eligibility), an unrelated user's REAL `POST /bookings` for the exact same range returns 409 `slot_unavailable` over real HTTP, and W's acceptance — the literal RFC v1.0 §10.3/Spec v1.0 §4.3 conditional `UPDATE ... WHERE status='held' AND user_id=$2 AND expires_at > now()`, executed directly since Phase 16 hasn't built its endpoint yet, per this phase's own explicit instruction — flips the SAME row (same `id`, `status` transitioned, `expires_at` now NULL, no second row). Two companion tests prove the predicate's other two guard clauses matter: an expired hold's acceptance affects 0 rows, and the wrong `user_id` affects 0 rows too (Spec's `user_id` clause — RFC v1.0 §10.3's own SQL snippet calls this column `held_for_principal`, which doesn't exist in Spec v1.0 §3's actual DDL; `booking.user_id` already serves this role, established at the model layer since Phase 2/3, this phase is just the first to literally exercise it here). HOLD-02 (50 barrier-released raw-SQL `booking` INSERTs against an actively held range, 50 runs) asserts ZERO successes UNCONDITIONALLY every run — a safety invariant, not CONC-01's zero-is-a-liveness-characteristic-so-retry pattern — via the same `tests/concurrency/harness.py` used by CONC-01–05, mirroring CLAUDE.md's own documented CONC-03/04 precedent of proving the database constraint directly rather than through real HTTP concurrency. HOLD-03 (opaque in availability) and "`GET /bookings` never returns held rows" both turned out to already be true and already covered by Phase 6 tests using an ORM-constructed held row; this phase added COMPLEMENTARY tests proving the SAME properties hold for a hold created through the REAL mechanism this phase built, rather than either claiming Phase 6's coverage as its own or duplicating it without reason. RECON-05's predicate-covers-`'held'` schema-assertion test (`tests/test_schema_assertion.py`) turned out to already exist too — written in Phase 3, ahead of `'held'` having a real writer — verified still passing and its stale "since 'held' rows don't exist until Phase 15" docstring corrected, not silently left inaccurate. Full suite: 207 tests (201 + 6 new), no regressions | Pending (on branch `phase-15-holds-exclusion-domain`) |
 | 16 | Offers: Creation, Acceptance, Cascade 🏁 MILESTONE 3 | Completes the waitlist: `waitlist_offer` (Spec v1.0 §3 — `hold_booking` a `OneToOneField` per the `UNIQUE hold_booking_id` column, `uniq_active_offer_per_entry` partial unique index, no EXCLUDE constraint with Spec's own forbidding comment reproduced verbatim in the migration per this phase's explicit Scope IN), `kairos_app` grants + audit trigger (`core/migrations/0009`). `create_offer_for_freed_range` (`kairos/waitlist/services.py`) is the RFC v1.0 §10.2/Spec v1.0 §4.2 worker — walks `find_eligible_entries`' (Phase 14) FCFS-ordered candidates, attempts a hold via `create_booking(status=HELD, actor_type=SYSTEM)` (Phase 15) for each in turn, advancing to the next on `SlotUnavailableError` (Spec's own "re-query and try the next candidate"), and only constructs the `WaitlistOffer` row once a hold has actually committed (PRD FR23: hold before offer, structurally, not by caller discipline). `cancel_booking`'s Phase 7 `on_commit()` log stub now really dispatches `create_offer_for_freed_range_task.delay(...)` (RFC v1.0 §5c step 4) via a NEW `kairos/waitlist/tasks.py` (Celery's `autodiscover_tasks()` module-naming lesson, Phase 13, applied a second time) — a genuine circular-import risk between `kairos.bookings.services` (needs the task) and `kairos.waitlist.services` (needs `create_booking`) is broken with a deferred, call-time-only import inside the task function, verified via `manage.py check` actually succeeding. `POST /waitlist-offers/{id}/confirm` executes `accept_offer` — the literal RFC v1.0 §10.3/Spec v1.0 §4.3 conditional `UPDATE` (status, owner, AND `expires_at > now()` in one statement) — structurally incapable of `slot_unavailable` (no INSERT on this path); 0 rows → 409 `offer_expired`. `POST /waitlist-offers/{id}/decline` releases the hold (`status`→`cancelled`, `expires_at`→`NULL` — the `hold_has_expiry` CHECK requires the latter, a real bug caught building WL-02 and traced back into `decline_offer` itself, fixed in both places) and dispatches the SAME cascade worker for the freed range; unlike every other cancel-shaped endpoint here, an already-resolved offer is a 409 `offer_already_resolved`, not a 200 no-op — Spec's own explicit, deliberate choice. The declining entry's status becomes `EXPIRED` (present in the schema since Phase 14, unused until now) rather than back to `WAITING`, which is what stops it from immediately re-winning the very cascade its own decline triggers. `RecordableConflictError` (new base class in `core/exceptions.py`) consolidates `SlotUnavailableError`/`AlreadyOnWaitlistError`/`OfferExpiredError`/`OfferAlreadyResolvedError` — `kairos_exception_handler` and `run_idempotent_write` each collapsed four near-identical branches into one, justified once the pattern reached its fourth instance, not before. HOLD-01 through Phase 15's tests are joined by: WL-01 (two threads, real `cancel_booking` calls under `transaction=True`, ground truth via `count_overlapping_pairs` — B1/B2 built as adjacent rather than Test Plan's literal overlapping example times, since two overlapping bookings cannot both be `confirmed` simultaneously in the first place, the exact guarantee this project enforces; see Key Technical Decisions), WL-02 (100 barrier-released runs — reaper-expiry simulated as `UPDATE ... SET status='cancelled', expires_at=NULL ...`, split 50/50 between expires-in-the-future and expires-in-the-past to deterministically exercise both orderings rather than gambling on timing jitter; `ClientOutcome` gained an additive `rowcount` field since a conditional UPDATE matching zero rows isn't an error), and WL-03 (cascade reaches entry 2 not 3 after decline; skips a withdrawn entry 2 to reach entry 3). Full suite: 223 tests (207 + 16 new), no regressions | Pending (on branch `phase-16-offers-cascade`) |
 | 17 | Dual Reclamation: Reaper & Cleanup-on-Write ⚠️ CRITICAL | Both RFC v1.0 §10.4 mechanisms, because a constraint predicate cannot express expiry and neither alone suffices. Mechanism 1 — cleanup-on-write: a `DELETE FROM booking WHERE resource_id=... AND status='held' AND expires_at<=now() AND time_range && tstzrange(...)`, added inside `create_booking`'s (`kairos/bookings/services.py`) own transaction, immediately before the INSERT, unconditionally for EVERY caller (ordinary booking, recurring occurrence, rolling materialization, the cascade worker's own hold creation) — with the RFC v1.0 §10.1-style load-bearing comment (Implementation Plan §1.3 item 5) at the DELETE's own call site. Mechanism 2 — the reaper: `reap_expired_holds` (`kairos/waitlist/services.py`), scheduled via `CELERY_BEAT_SCHEDULE` at the new `HOLD_REAPER_INTERVAL_SECONDS` (default 30s, `core/constants.py`) — one independent transaction per expired hold (mirroring `confirm_recurring_series`/`rolling_materialize_series`'s per-occurrence isolation), reclaiming each via the IDENTICAL conditional-UPDATE-to-`cancelled` shape `accept_offer` races against, cascading via the SAME `create_offer_for_freed_range` cancellation/decline already use, and writing a `system_check_run` heartbeat (`check_name='hold_reaper'`) every run regardless of findings. `hold_reaper_heartbeat_is_stale` reads that heartbeat back — WL-05 Part B's actual mechanism, scoped honestly to the DATA a future alert would consume (full alert routing and `GET /admin/checks/latest` are Phase 21, not built here). `dispatch_cascade` (new, `kairos/waitlist/tasks.py`) is now the ONE place `create_offer_for_freed_range_task.delay(...)` is called from (`cancel_booking` and `decline_offer` both go through it) — wraps the call in `try/except` so a broker outage degrades (logs `cascade_dispatch_failed_broker_unavailable`) rather than raising out of a `transaction.on_commit()` callback and turning an already-committed, successful cancel/decline into an apparent request failure. RECLAIM-01 (booking succeeds over a stale hold with no reaper running, hold genuinely gone via DELETE — not superseded), RECLAIM-02 (reaper cascades to the next eligible entry with zero booking traffic, proven by calling `reap_expired_holds` directly — Test Plan's own "controllable time" requirement, not a real 30s wait), and RECLAIM-03 (100 barrier-released runs, cleanup-on-write's DELETE+INSERT racing the literal RFC v1.0 §10.3 acceptance UPDATE, correctness inferred by correlating outcomes since a party's own DELETE rowcount isn't directly observable through the harness) all pass. RECLAIM-04 (200 writers × 50 runs, N=200-identical-slot-style contention plus 4 pre-seeded expired holds cleanup-on-write must clear every attempt) was ACTUALLY RUN at full DoD-specified scale, not merely written: **269 real SQLSTATE 40P01 deadlocks occurred, in roughly half of the 50 runs** (some runs: zero; others: 9–16) — not the "zero deadlocks" the DoD's literal text names. Per this phase's own explicit instruction, this is the SECOND of the two anticipated honest outcomes, not a phase failure: safety held on every single one of the 10,000 attempts (never more than one success per round, 50/50), zero unexplained SQLSTATEs, zero rounds even needed the zero-success retry budget, and 40P01 was ALREADY a documented, retryable SQLSTATE `BookingService` treats as 503 (Phase 4) before this phase ever ran — cleanup-on-write's extra DELETE measurably raises deadlock frequency versus CONC-01's own N=200 baseline (empirically ~2/10 runs there), a real, honestly-reported finding, not a design failure requiring cleanup-on-write's removal. RECLAIM-04 is deliberately EXCLUDED from the default `pytest tests/concurrency` CI sweep (`.github/workflows/ci.yml` now `--ignore`s it) — Test Plan v1.0 §13 places it in the staging/pre-release tier, not CI tier, the identical tiering CONC-01's own full-scale escalation already has. WL-05 Part A and WL-06 were verified LIVE against the real `docker compose` stack — genuinely stopping `beat`/`redis` containers (`docker compose stop beat` / `stop redis`), not mocked — per this phase's own explicit instruction that a mocked simulation would not prove what RFC v1.0 §4.3's real degradation behavior requires: Part A seeded a hold expiring in 3s with `beat` stopped, confirmed it sat `status='held'` 12+ seconds past expiry with zero error anywhere in the worker/server logs; WL-06 stopped `redis` and confirmed, over real HTTP against `manage.py runserver` under `kairos.settings.dev` (real, non-eager Celery — `CELERY_TASK_ALWAYS_EAGER` is test-settings-only): booking creation (201) and cancellation (200) both succeeded, cancellation's cascade dispatch failed with a genuine `kombu.exceptions.OperationalError` caught and logged by `dispatch_cascade` rather than crashing the response, a booking over an expired hold succeeded via cleanup-on-write (the stale hold row was gone afterward) with zero `waitlist_offer` rows ever created, and the worker reconnected cleanly once `redis` restarted. WL-05 Part B is covered by ordinary pytest (`hold_reaper_heartbeat_is_stale`); `test_dispatch_cascade.py` is a lightweight automated regression guard for the try/except itself (`CELERY_TASK_ALWAYS_EAGER` means pytest can never reproduce a genuine broker outage — this only protects against someone removing the try/except later). Full suite: 236 tests (223 + 13 new — RECLAIM-04 counted but excluded from the routine sweep), no regressions | Pending (on branch `phase-17-dual-reclamation`) |
+| 18 | Notifications | `NotificationService` (`kairos/core/notifications.py`) is a thin wrapper over Django's own `EMAIL_BACKEND` abstraction (console in dev, real SMTP in prod, `locmem` — Django's own capturing backend, `django.core.mail.outbox` — in test) rather than a bespoke backend hierarchy — reusing a framework guarantee instead of reinventing one, the same choice this project already made for `CompositePrimaryKey`/`set_config`/Postgres triggers. Every `notify_*` builder function only constructs a subject/body and calls `kairos/core/tasks.py`'s new `dispatch_notification`, which enqueues `send_notification_task.delay(...)` and returns immediately — the actual `send_mail()` call happens inside that Celery task, in a worker process, NEVER inline in an HTTP request thread or inside a request-path transaction (RFC v1.0 §15a). `dispatch_notification` mirrors `kairos.waitlist.tasks.dispatch_cascade` (Phase 17) exactly: wraps `.delay()` in `try/except` so a broker outage degrades (logged `notification_dispatch_failed_broker_unavailable`) rather than propagating out of `cancel_booking`'s `transaction.on_commit()` callback. `send_notification_task` is `autoretry_for=(Exception,)`, `retry_backoff=True`, `max_retries=NOTIFICATION_MAX_RETRIES` (PRD FR55's "recorded and retried") — the delivery logic itself lives in a plain function, `_execute_notification_delivery`, callable directly so a test can drive a failure-then-success sequence without depending on Celery's own retry scheduling/timing, the same "test the mechanism directly" precedent `expand_occurrences`/`reap_expired_holds` already established. New schema, `NotificationLog` (`kairos/core/models.py`, migrations 0010-0011) — Spec v1.0 §3 has zero notification concept at all, the identical kind of gap Phase 9's `user_group` table filled — one row per logical notification, `attempts` accumulating and `status` (`pending`/`sent`/`failed`) reflecting the latest outcome across every retry; `kairos_app` granted SELECT/INSERT/UPDATE (no DELETE, no audit trigger — this table is itself a delivery-outcome log, the same category as `system_check_run`, not one of the five audited business-state entities). Four of the five notification points wired to real callers: `notify_offer_created` (PRD FR52, expiry stated explicitly in the subject line) from `create_offer_for_freed_range` right after the offer row commits; `notify_admin_cancellation` (PRD FR53, includes the recorded reason) from `cancel_booking`'s SECOND `on_commit` hook, gated on `actor_type=ADMIN` so a self-cancel never triggers it; `notify_rematerialization` (PRD FR54) from `rematerialize_stale_series` on each successfully-recomputed occurrence; and `notify_rematerialization_conflict` (PRD FR13b, a genuine completion of Phase 13's own "resource_administrators: pending Phase 18 delivery" placeholder, not new scope) to both the series owner and every resource administrator scoped to that specific resource on a conflict. The fifth, `notify_rollback_hold_released` (Rollout v1.0 §4.5), was built per this phase's own explicit clarification: the template/message content and send mechanism exist and are fully tested standalone (distinct, non-generic wording from an ordinary offer-expiry notification — explicitly names the rollback, explicitly states queue position was preserved, deliberately avoids any "expire" framing), but NO real production trigger was invented for it — Rollout §4.5's hold release is a manual operational runbook (SQL an operator runs during an incident), not application code any phase has built, and manufacturing a fake caller just to wire one up would have been scope beyond this phase's actual job (see Open Questions). Definition of Done verified: all four wired notification points fire, proven via the capturing (`locmem`) backend; offer-created states the expiry explicitly; a simulated provider outage (patching `send_notification_task.delay` to raise) does NOT fail the underlying admin-cancellation — the booking still commits `CANCELLED`, proven directly; every dispatch call site is either inside a `transaction.on_commit()` callback or a worker context with no open transaction — verified by reading the code, no synchronous dispatch from a request-path transaction anywhere; rollback-hold-released messaging asserted distinct from ordinary offer-created messaging by direct content comparison. Full suite: 238 tests (225 + 13 new), no regressions, plus all 10 CI-tier concurrency tests re-run clean (this phase's changes touch `cancel_booking`, a CONC/WL/RECLAIM-exercised function). ⚠️ **Real bug caught by rebuilding the worker's Docker image and re-reading its startup banner** — `send_notification_task` was silently absent from the running worker's task list after a plain `docker compose restart` (which reuses the existing, stale image rather than rebuilding); fixed with `--build`, then re-verified live: the rebuilt worker's banner lists all six tasks, a deliberately malformed dispatch demonstrated genuine exponential retry-with-backoff (1s/0s/4s/2s/6s, jittered) against the real Redis broker before failing cleanly once `NOTIFICATION_MAX_RETRIES` was exhausted, and a valid dispatch printed the full email to the worker's console `EMAIL_BACKEND` and left exactly one `notification_log` row (`status='sent'`, `attempts=1`), confirmed via `psql` against `kairos_dev` — see Key Technical Decisions | Pending (on branch `phase-18-notifications`) |
 
 ## Current Phase In Progress
 
-None. Phase 17 is complete pending review and merge. Phase 18 (Notifications) is next.
+None. Phase 18 is complete pending review and merge. Phase 19 (Resource Administration &
+Offboarding) is next.
 
 ## NOT Yet Built
 
@@ -350,17 +412,16 @@ every `HOLD_REAPER_INTERVAL_SECONDS`). `waitlist_entry` (Phase 14) and `waitlist
 (Phase 16) both exist and are both real: `create_offer_for_freed_range` (Phase 16) is
 `find_eligible_entries`' (Phase 14) first real caller, dispatched after a cancellation, an
 offer decline, OR now an expired-hold reclamation (Phase 17) — every trigger RFC v1.0 §10.2/
-§10.4 describes now has a real caller. Notification dispatch (Phase 18) is what's still
-missing: an offer is created, a hold reserved, a hold reclaimed and cascaded — but no one is
-actually notified of any of it yet (PRD FR52's explicit expiry notice on offer creation has no
-delivery mechanism at all). Full alert ROUTING (Phase 21) is separately still missing —
+§10.4 describes now has a real caller, AND (Phase 18) each of those events now actually
+notifies someone: offer creation dispatches `notify_offer_created` with the expiry stated
+explicitly (PRD FR52). Full alert ROUTING (Phase 21) is separately still missing —
 `hold_reaper_heartbeat_is_stale` (Phase 17) makes staleness DETECTABLE from the data, and
 `GET /api/v1/admin/checks/latest` (the surface WL-05 Part B's own text names) doesn't exist
 yet to expose it. Celery/Redis exist as of Phase 13 (`kairos/celery.py`, `infra/docker-
 compose.yml`'s `redis`/`worker`/`beat` services); registered tasks are now
 `rolling_materialize_series_task`/`rematerialize_stale_series_task`/`check_tzdata_drift_task`/
-`create_offer_for_freed_range_task` (Phase 16)/`reap_expired_holds_task` (Phase 17) — only
-notification dispatch (Phase 18) still has no task. `recurring_series` rows are created for
+`create_offer_for_freed_range_task` (Phase 16)/`reap_expired_holds_task` (Phase 17)/
+`send_notification_task` (Phase 18). `recurring_series` rows are created for
 real via
 `POST /api/v1/bookings/recurring`
 (Phase 12), and the ROLLING MATERIALIZATION MECHANISM now exists (Phase 13,
@@ -376,10 +437,14 @@ partially-materialized series should treat this job as already built, not build 
 see Open Questions. tzdata re-materialization (RFC §9.4) DOES have a real, if synthetic-in-
 tests, target: any `RecurringSeries` whose `tzdata_version` differs from what's installed.
 Notification DELIVERY for PRD FR54 (re-materialization) and PRD FR52 (a waitlist offer's
-explicit expiry, Phase 16 creates the offer but notifies no one) both remain Phase 18 — Phase
-13 records that a re-materialization notification is due (in `system_check_run.findings` and
-a log line) but sends nothing, and Phase 16's `create_offer_for_freed_range` creates the offer
-and the hold but has no notification call at all yet. Full six-check monitoring/alerting/
+explicit expiry) is real now (Phase 18) — `rematerialize_stale_series` dispatches
+`notify_rematerialization` on each successfully-recomputed occurrence and `notify_
+rematerialization_conflict` to the series owner and every resource administrator on a
+conflict; `create_offer_for_freed_range` dispatches `notify_offer_created` right after the
+offer commits. A fifth notification type, `notify_rollback_hold_released` (Rollout v1.0
+§4.5), is built and independently tested but has NO real production caller — Rollout §4.5's
+hold release is a manual operational runbook, not application code any phase automates; see
+Open Questions. Full six-check monitoring/alerting/
 heartbeats (RFC §14) is Phase 21; Phase 13 only WRITES `system_check_run` rows, it doesn't yet
 alert on staleness or absence of a run. No replica routing (Phase 30 — `data_freshness` is
 hardcoded `"primary"`, always true today since no replica exists). The audit trail covers
@@ -581,6 +646,15 @@ and `git log` first.
 | RECLAIM-04 is excluded from the `concurrency` CI job (`--ignore`d in `.github/workflows/ci.yml`), though the test file exists and was run manually | Test Plan v1.0 §13 places RECLAIM-04 in the STAGING/pre-release tier explicitly (RECLAIM-01–03 are CI tier and run in the job normally) — 200×50 = 10,000 raw attempts taking over 6 minutes is expensive enough that per-commit execution would make CI unusable, Test Plan's own stated reason for the tier's existence, and the identical treatment CONC-01's own full 100-run+N=500 escalation already has (deferred to Phase 28, run manually/scheduled) | `.github/workflows/ci.yml`, `tests/concurrency/test_reclaim_04.py` |
 | WL-05 Part A and WL-06 were verified by ACTUALLY stopping the real `beat`/`redis` Docker containers and driving a real `manage.py runserver` (`kairos.settings.dev`, genuinely non-eager Celery) over real HTTP — not simulated, not mocked, no pytest test claims to cover them | Explicit instruction: a mocked simulation would not prove RFC v1.0 §4.3's real degradation behavior under a real outage; `CELERY_TASK_ALWAYS_EAGER` (test settings) means `.delay()` never touches a broker under pytest AT ALL regardless of Redis's real state, so no pytest test could have proven this even if it tried. `test_dispatch_cascade.py` is explicit about being a regression guard for the try/except's continued EXISTENCE, not a substitute for the live proof | manual verification, this session (see the Phase 17 Completed Phases row for the transcript); `tests/waitlist/test_dispatch_cascade.py` |
 | `kairos_dev` required a fresh `manage.py migrate` (superuser DSN) before the WL-05/WL-06 live verification — Phase 14/15/16/17's migrations had never been applied to it | `kairos_dev` is a separate, long-lived database from the ephemeral `kairos_test` pytest creates and destroys per run; nothing in the ordinary `pytest` workflow ever touches it. Routine to catch (the exact "Migrations need DDL privileges kairos_app doesn't have" step README already documents), not a new gap — flagged here only because it was a genuine precondition for this phase's live verification specifically | `README.md` §"Running Locally" |
+| `NotificationService` (Phase 18) wraps Django's own `EMAIL_BACKEND` abstraction (console/smtp/locmem) rather than a bespoke pluggable-backend hierarchy | `EMAIL_BACKEND` already IS the "console for dev, SMTP for prod, capturing for tests" seam this phase asks for — reusing it means a delivery failure raises the exact exception class Django's backend raises, and `locmem`'s `django.core.mail.outbox` IS the capturing backend, for free. The same "reuse a framework/database guarantee instead of reinventing it" choice already made for `CompositePrimaryKey` (Phase 5), `set_config` over literal `SET` (Phase 4), and Postgres triggers over an application-level audit call (Phase 8) | `kairos/core/notifications.py`, `kairos/settings/{base,dev,test,prod}.py` |
+| Every `notify_*` function only builds a message and calls `dispatch_notification` (enqueue-and-return) — the actual `send_mail()` call happens inside `send_notification_task`, in a worker, never inline | RFC v1.0 §15a: notification dispatch must be asynchronous, "called from workers, never synchronously from the request path." This holds even for notify_* calls that originate FROM a worker already (`notify_offer_created` inside `create_offer_for_freed_range`, itself already running inside a Celery task) — decoupling "decide to notify" from "attempt delivery" means a slow/failing SMTP call never blocks the offer-creation worker's own completion either, not just the HTTP request path | `kairos/core/notifications.py`, `kairos/core/tasks.py` (`dispatch_notification`, `send_notification_task`) |
+| `dispatch_notification` (Phase 18) mirrors `kairos.waitlist.tasks.dispatch_cascade` (Phase 17) exactly — same broad `except Exception`, same "log and swallow" shape, same reasoning | `cancel_booking`'s admin-cancellation notification is registered via the identical `transaction.on_commit()` pattern the cascade dispatch already uses — an exception escaping `dispatch_notification` would propagate into that already-successful commit's caller for the SAME reason WL-06 already proved matters for cascade. One proven shape, reused, not a second one invented for a structurally identical problem | `kairos/core/tasks.py` (`dispatch_notification`) |
+| `NotificationLog` (Phase 18) is new schema — Spec v1.0 §3 has no notification concept at all | The identical situation Phase 9's `user_group`/`user_group_membership` tables were in: PRD FR55 ("must be recorded and retried") concretely requires somewhere to record attempts/status, and no such table exists in the six source documents. Minimal shape only: one row per logical notification, `attempts`/`status`/`last_error` — no delivery-provider-specific fields, no template versioning, nothing beyond what FR55 literally asks for | `kairos/core/models.py` (`NotificationLog`) |
+| `NotificationLog` gets NO audit trigger, unlike `waitlist_entry`/`waitlist_offer` | It isn't one of the five entities Spec v1.0 §3/RFC v1.0 §12 name as audited business state — it's a delivery-outcome LOG, the same category `system_check_run` (Phase 13) already established with no trigger of its own. `kairos_app` is granted UPDATE (unlike `audit_log`/`system_check_run`'s append-only SELECT/INSERT) because a retry genuinely revises the SAME row's `status`/`attempts` in place, matching `waitlist_entry`/`waitlist_offer`'s grant shape instead | `kairos/core/migrations/0011_kairos_app_notification_log_grants.py` |
+| The delivery-attempt logic lives in a plain function, `_execute_notification_delivery`, not inlined into the `@shared_task` body | Lets a test drive a failure-then-success sequence for the SAME notification id directly, proving the `attempts`-accumulates/`status`-reflects-latest-outcome mechanism, without depending on Celery's own retry scheduling or `CELERY_TASK_ALWAYS_EAGER`'s timing behavior under retry_backoff — the identical "test the mechanism directly" precedent `expand_occurrences` (Phase 11) and `reap_expired_holds` (Phase 17) already established for logic awkward to exercise through its real transport | `kairos/core/notifications.py` (`_execute_notification_delivery`), `tests/test_notifications.py` |
+| `notify_rematerialization_conflict` (Phase 18) was built even though Phase 18's own Scope IN names only ONE tzdata re-materialization notification point | Not new scope: `rematerialize_stale_series` (Phase 13) has recorded `"resource_administrators": "pending Phase 18 delivery"` in its own conflict findings since it was written — PRD FR13b requires a conflict be surfaced for human decision, and leaving that specific, already-committed placeholder unfulfilled after building the entire notification infrastructure this phase exists to build would be a loose end this project's own discipline (see the Phase 12→13 REC-06/horizon precedent) argues against leaving | `kairos/bookings/tasks.py` (`rematerialize_stale_series`), `kairos/core/notifications.py` (`notify_rematerialization_conflict`) |
+| `notify_rollback_hold_released` (Phase 18) was built standalone, with NO real trigger wired to it, per this phase's own explicit clarification | Rollout v1.0 §4.5's hold release is a manual operational runbook (SQL an operator runs during an incident) — no phase in the Implementation Plan has built application code that performs it. Inventing a fake "rollback release" code path just to give this notification a caller would be scope beyond this phase's actual job (this phase's job is notification DELIVERY, not automating an incident-response runbook); the template/message content and the `NotificationService.send` mechanism exist and are independently tested with a manually-constructed event instead, the same "mechanism proven ahead of its real caller" pattern already used repeatedly (`actor_type='system'`, containment eligibility, hold acceptance) | `kairos/core/notifications.py` (`notify_rollback_hold_released`); see Open Questions |
+| ⚠️ **Real bug caught only by rebuilding the worker's Docker image and re-reading its startup banner**: `send_notification_task` was silently ABSENT from the running worker's registered task list after `docker compose restart worker` — even though it lives in `kairos/core/tasks.py`, the exact file `autodiscover_tasks()` scans (Phase 13's own hard-learned convention, followed correctly this time) | `docker compose restart` restarts a container from its EXISTING image; it does not rebuild from changed source. The worker came back up cleanly with zero errors anywhere and simply didn't list the new task — the identical "no errors, just absence" failure mode RFC v1.0 §14 warns about, this time one layer down the stack from Phase 13's cause (a wrong file, then; a stale image, now). Fixed with `docker compose up -d --build worker beat`; re-verified by reading the rebuilt banner (six tasks) and dispatching two real tasks against it — one deliberately malformed, which demonstrated genuine exponential retry-with-backoff (1s/0s/4s/2s/6s, jittered) against the real Redis broker before failing cleanly at `NOTIFICATION_MAX_RETRIES`; one valid, which printed to the worker's console `EMAIL_BACKEND` and left one `notification_log` row (`status='sent'`), confirmed via `psql` | this session's live verification (see the Phase 18 Completed Phases row) |
 
 ## Running Locally
 
@@ -610,10 +684,10 @@ token; `POST /api/v1/auth/token` exchanges it for the session token every other 
 Background jobs (Phase 13) — `docker compose up -d` (the same command above) now ALSO starts
 `redis`, `worker`, and `beat`; nothing extra to run. Verified live: both containers connect
 to Redis and Postgres (as `kairos_app`) successfully, the worker's own startup log lists all
-registered tasks (five as of Phase 17 —
+registered tasks (six as of Phase 18 —
 `rolling_materialize_series_task`/`rematerialize_stale_series_task`/`check_tzdata_drift_task`/
-`create_offer_for_freed_range_task`/`reap_expired_holds_task`), and a manually dispatched task
-of each kind completed successfully against the real running worker.
+`create_offer_for_freed_range_task`/`reap_expired_holds_task`/`send_notification_task`), and a
+manually dispatched task of each kind completed successfully against the real running worker.
 `manage.py rematerialize_series` runs both materialization jobs synchronously, once, without
 a worker at all — the "on deploy" trigger RFC v1.0 §9.4 asks for, sharing the exact same
 functions Celery Beat calls on schedule (hourly by default —
@@ -633,6 +707,29 @@ dispatch failed with a genuine `kombu.exceptions.OperationalError` caught and lo
 `kairos_dev` needed a fresh `manage.py migrate` first — Phase 14 through 17's migrations had
 never been applied to it before this session (only `kairos_test`, which `pytest` creates and
 destroys fresh every run, had been current).
+
+Notifications (Phase 18) — verified live against the real Docker stack, not just pytest's
+eager-mode simulation. ⚠️ **The exact "silently absent from the registered task list"
+failure mode Phase 13 already caught once (RFC v1.0 §14's "no errors, just absence") recurred
+here for a different reason**: `send_notification_task` was correctly placed in
+`kairos/core/tasks.py` (the file `autodiscover_tasks()` actually scans), but `docker compose
+restart worker` only restarts the EXISTING container from its already-built image — it does
+not rebuild from the changed source. The worker came back up cleanly, logged no error, and
+simply didn't list the new task, until `docker compose up -d --build worker beat` rebuilt the
+image and the task appeared in the startup banner (six tasks total). Caught by reading the
+banner, not by any automated check — the identical verification discipline Phase 13's own
+entry already established. After the rebuild, two tasks were dispatched manually via
+`send_notification_task.delay(...)` against the real running worker (`kairos.settings.dev`,
+genuinely non-eager Celery, real Redis broker): the first (deliberately malformed
+`recipient_user_id`) demonstrated REAL exponential retry-with-backoff live — five retries at
+1s/0s/4s/2s/6s (jittered, growing), then a clean final failure once `NOTIFICATION_MAX_RETRIES`
+was exhausted, with zero `notification_log` row ever created (the ValidationError fired before
+the INSERT could execute) — genuine proof of `retry_backoff=True` scheduling real delays
+through a real broker, which `CELERY_TASK_ALWAYS_EAGER` structurally cannot exercise under
+pytest. The second (valid) dispatch printed the full email (subject, body, headers) to the
+worker's own stdout via the console `EMAIL_BACKEND`, logged `notification_delivered`, and left
+exactly one `notification_log` row with `status='sent'`, `attempts=1` — confirmed directly via
+`psql` against `kairos_dev`, not just the log line.
 
 The frontend starts Phase 23.
 
@@ -862,8 +959,28 @@ and WL-06 themselves were verified LIVE against a real Docker stack, not by any 
 (`CELERY_TASK_ALWAYS_EAGER` makes a genuine broker outage unreproducible under pytest) — see
 the Phase 17 Completed Phases row for the full transcript.
 
+`tests/test_notifications.py` (Phase 18) — content proofs for all four wired notification
+points via the `locmem` capturing backend (`django.core.mail.outbox`): offer-created states
+the expiry explicitly in the subject; admin-cancellation includes the recorded reason;
+re-materialization states both the old and new instant; rollback-hold-released reads
+distinctly from an ordinary offer-created notification (asserted by direct content
+comparison, not just "contains a different string"). PRD FR55's "recorded and retried" is
+proven by driving `_execute_notification_delivery` directly through a failure-then-success
+sequence for the SAME notification id and asserting `NotificationLog.attempts` accumulates
+while `status` reflects the latest outcome — bypassing Celery's own retry scheduling
+entirely, the same reasoning `test_send_notification_task_is_configured_to_retry_with_backoff`
+documents for why it only asserts the retry decorator's configuration rather than exercising
+real backoff timing. `test_admin_cancellation_commits_even_if_notification_dispatch_fails`
+is the direct DoD proof that a simulated provider outage doesn't fail the underlying
+operation — patches `send_notification_task.delay` to raise and asserts the booking still
+commits `CANCELLED`. `test_dispatch_notification_swallows_a_broker_failure_and_logs_it`
+mirrors `test_dispatch_cascade.py` exactly, for the identical reason. Wiring tests confirm
+each notification point fires from its REAL caller (`cancel_booking`, `create_offer_for_
+freed_range`, `rematerialize_stale_series`) and that admin-cancellation does NOT fire on an
+ordinary self-cancel.
+
 Also runnable: `cd backend && ruff check . && ruff format --check . && mypy kairos` (all pass
-with zero findings as of Phase 17). CI (`.github/workflows/ci.yml`) runs the CI tier as three
+with zero findings as of Phase 18). CI (`.github/workflows/ci.yml`) runs the CI tier as three
 jobs — `lint`, `test`, `concurrency` (RECLAIM-04 excluded, see above) — on every PR. The spike
 scripts under `scripts/spike/` are runnable but are diagnostic, not a test suite — see
 `docs/spikes/S1-postgres-verification.md` for what each one does and its recorded output.
@@ -970,6 +1087,29 @@ From Phase 12:
   recurring-series creation validation together, and fixing one without the other would very
   likely need redoing. No phase in the current plan owns this; flag it, don't silently invent
   a fix under time pressure, the same discipline applied throughout this phase.
+
+From Phase 18:
+
+- **`notify_rollback_hold_released` has no real production caller.** Rollout v1.0 §4.5's hold-
+  release procedure is a manual operational runbook (SQL an operator runs during an incident),
+  not application code any phase in the 31-phase plan has built or is scoped to build. Per this
+  phase's own explicit clarification, the notification TEMPLATE (distinct, non-generic wording
+  — names the rollback explicitly, states queue position was preserved, deliberately avoids any
+  "expire" framing) and the `NotificationService` send mechanism were built and are tested
+  standalone, with a manually-constructed event — but no fake trigger path was invented just to
+  give it a caller. **If a future phase (most plausibly Phase 30's go-live hardening, or a
+  dedicated rollback-automation effort) ever builds real application code that performs a §4.5
+  hold release, it should call `kairos.core.notifications.notify_rollback_hold_released`
+  directly rather than inventing new messaging** — the wording was written specifically to
+  satisfy §4.5's "must not be indistinguishable from an ordinary expiry" requirement, and a
+  second, independently-invented message risks drifting from that.
+- **PRD FR53's "or modified"** ("A user whose booking is cancelled OR MODIFIED by an
+  administrator must be notified") has no corresponding notification, only the cancelled half —
+  `edit_booking` has no admin-override code path at all (edit is owner-only, Spec v1.0 §5.5, no
+  phase has added one), so there is nothing for an admin-modification notification to attach to
+  yet. Not a gap in THIS phase's own scope (Phase 18's own Scope IN names only "admin
+  cancellation with reason," not modification) — flagged here so a future phase that DOES add
+  an admin-edit path doesn't miss that FR53 already expects a notification alongside it.
 
 Genuine open questions from the source documents (offer window duration, nonexistent-time
 policy default, series bounds, etc.) are tracked in PRD v1.0 §11 and RFC v1.0 §18; they get

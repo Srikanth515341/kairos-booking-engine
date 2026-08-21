@@ -178,3 +178,26 @@ CELERY_BEAT_SCHEDULE = {
         "schedule": HOLD_REAPER_INTERVAL_SECONDS,
     },
 }
+
+# ============================================================
+# Notifications (Implementation Plan Phase 18; PRD v1.0 FR52-55;
+# RFC v1.0 §15a)
+# ============================================================
+# EMAIL_BACKEND is left UNSET here deliberately — Django's own console/
+# smtp/locmem backends already ARE the pluggable "console for dev, SMTP
+# for prod, capturing for tests" seam this phase asks for
+# (kairos.core.notifications.NotificationService is a thin wrapper over
+# `django.core.mail.send_mail`, not a parallel backend abstraction
+# reinventing what Django already provides). dev.py/test.py/prod.py each
+# set EMAIL_BACKEND explicitly, the same per-environment-module pattern
+# every other environment-varying setting in this file already follows.
+#
+# SMTP_* (not EMAIL_*) in .env.example to match this project's own naming
+# for the underlying transport, mapped to Django's expected setting names
+# here — used only by prod's smtp backend; dev/test never read these.
+EMAIL_HOST = os.environ.get("SMTP_HOST", "")
+EMAIL_PORT = int(os.environ.get("SMTP_PORT", "587") or "587")
+EMAIL_HOST_USER = os.environ.get("SMTP_USER", "")
+EMAIL_HOST_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
+EMAIL_USE_TLS = True
+DEFAULT_FROM_EMAIL = os.environ.get("NOTIFICATIONS_FROM_EMAIL", "kairos@example.com")

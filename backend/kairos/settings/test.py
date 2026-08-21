@@ -36,3 +36,10 @@ KAIROS_OIDC_MOCK_ENABLED = True
 # this lets WL-01/WL-03 exercise the REAL dispatch path end to end.
 CELERY_TASK_ALWAYS_EAGER = True
 CELERY_TASK_EAGER_PROPAGATES = True
+
+# Django's own "capturing backend for tests" (Implementation Plan Phase
+# 18) — every send_mail() call appends to `django.core.mail.outbox`
+# in-process instead of touching a real transport, the identical
+# capture-and-assert shape this test settings module already gets for
+# free from CELERY_TASK_ALWAYS_EAGER above.
+EMAIL_BACKEND = "django.core.mail.backends.locmem.EmailBackend"

@@ -20,6 +20,7 @@ from kairos.core.constants import OFFER_WINDOW_MINUTES
 from kairos.core.db import apply_write_path_session_settings
 from kairos.core.exceptions import ServiceUnavailableError, SlotUnavailableError
 from kairos.core.models import AuditActorType
+from kairos.core.notifications import notify_admin_cancellation
 from kairos.identity.models import AppUser
 from kairos.resources.models import Resource
 from kairos.waitlist.tasks import dispatch_cascade
@@ -335,6 +336,32 @@ def cancel_booking(req: BookingCancelRequest) -> BookingCancelResult:
                         str(resource_id), range_start, range_end, req.request_id
                     )
                 )
+                if req.actor_type == AuditActorType.ADMIN:
+                    # PRD FR53 / Implementation Plan Phase 18. Same
+                    # on_commit deferral as the cascade dispatch above and
+                    # the identical reason: this only ever fires from a
+                    # resource-admin override (never a self-cancel — the
+                    # view only sets actor_type=ADMIN for is_override,
+                    # never for the booking's own owner), and `req.reason`
+                    # is guaranteed non-empty here because
+                    # BookingCancelSerializer already requires it whenever
+                    # is_owner=False (Spec v1.0 §5.6 / PRD FR47).
+                    # req.booking (not the re-fetched `booking` above)
+                    # carries the view's select_related("resource"), so
+                    # this doesn't cost an extra query.
+                    owner = req.booking.user
+                    resource_name = req.booking.resource.name
+                    reason = req.reason or ""
+                    transaction.on_commit(
+                        lambda: notify_admin_cancellation(
+                            recipient=owner,
+                            resource_name=resource_name,
+                            start=range_start,
+                            end=range_end,
+                            reason=reason,
+                            request_id=req.request_id,
+                        )
+                    )
     except DatabaseError as exc:
         _handle_write_database_error(exc, log_context)
 
