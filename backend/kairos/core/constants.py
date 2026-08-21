@@ -195,3 +195,32 @@ ALERT_EMAIL_RETRY_BACKOFF_MAX_SECONDS = int(
 # is down or mid-election) needs a longer wait before a client hammers a
 # database that may not be back yet.
 FAILOVER_RETRY_AFTER_SECONDS = int(os.environ.get("FAILOVER_RETRY_AFTER_SECONDS", "5"))
+
+# ============================================================
+# Rate limiting (Implementation Plan Phase 22; RFC v1.0 §8.2)
+# ============================================================
+# A FAIRNESS policy, not a correctness guarantee (RFC v1.0 §8.2's own
+# framing) — unlike the exclusion constraint, eventually-consistent
+# enforcement here is acceptable; see kairos.core.rate_limit's module
+# docstring for why that distinction shapes every choice in that module,
+# including failing OPEN when Redis is unavailable.
+#
+# Per-principal token bucket on booking creation — "N requests burst,
+# refilling fully every WINDOW seconds" is more intuitive to tune than a
+# raw tokens-per-second float, so capacity+window are the named knobs;
+# kairos.core.rate_limit computes refill-rate-per-second from them.
+RATE_LIMIT_BOOKING_CREATE_CAPACITY = int(os.environ.get("RATE_LIMIT_BOOKING_CREATE_CAPACITY", "10"))
+RATE_LIMIT_BOOKING_CREATE_WINDOW_SECONDS = int(
+    os.environ.get("RATE_LIMIT_BOOKING_CREATE_WINDOW_SECONDS", "60")
+)
+
+# Per-IP token bucket (RFC v1.0 §8.2 / this phase's Scope IN: "defense-in-
+# depth, acknowledged as not a solution to distributed abuse"). Set well
+# above the per-principal limit — many distinct, legitimate principals can
+# share one IP (NAT, a corporate proxy, a shared office network), so this
+# exists to catch a single source hammering the API, not to be the
+# primary abuse control (that's the per-principal limiter, and — for
+# actually-distributed abuse — a real gateway/CDN this codebase doesn't
+# own).
+RATE_LIMIT_PER_IP_CAPACITY = int(os.environ.get("RATE_LIMIT_PER_IP_CAPACITY", "60"))
+RATE_LIMIT_PER_IP_WINDOW_SECONDS = int(os.environ.get("RATE_LIMIT_PER_IP_WINDOW_SECONDS", "60"))

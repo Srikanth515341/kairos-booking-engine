@@ -43,12 +43,15 @@ _BOOKING_WRITE_PATH_MARKERS = ("/bookings", "/recurring-series", "/waitlist-offe
 
 
 def classify_metric_type(*, path: str, method: str, status_code: int) -> str:
-    """A 401 is classified as `auth_failure` regardless of which endpoint
-    it hit — "auth failure rate by shape" needs to aggregate across every
-    endpoint, not just the ones this function would otherwise call
-    booking-write/availability-read. This is checked FIRST, ahead of the
+    """A 401 or 429 is classified by status code alone, regardless of
+    which endpoint it hit — "auth failure rate by shape" and "rate-limit
+    trigger rate" both need to aggregate across every endpoint that could
+    produce one, not just the ones this function would otherwise call
+    booking-write/availability-read. Both are checked FIRST, ahead of the
     path-based rules below, for exactly that reason.
     """
+    if status_code == 429:
+        return RequestMetric.Type.RATE_LIMITED
     if status_code == 401:
         return RequestMetric.Type.AUTH_FAILURE
     if method == "GET" and "/availability" in path:
@@ -68,6 +71,7 @@ def record_request_metric(
     status_code: int,
     duration_ms: int | None,
     cause: str | None = None,
+    principal_id: str | None = None,
 ) -> None:
     RequestMetric.objects.create(
         metric_type=metric_type,
@@ -76,6 +80,7 @@ def record_request_metric(
         status_code=status_code,
         duration_ms=duration_ms,
         cause=cause,
+        principal_id=principal_id,
     )
 
 
@@ -189,16 +194,40 @@ def audit_actor_unknown_count(*, window_seconds: int = METRICS_WINDOW_SECONDS) -
     ).count()
 
 
-def rate_limit_metric_slot() -> dict[str, Any]:
-    """Implementation Plan Phase 21's own explicit clarification #2: rate
-    limiting itself does not exist yet (Phase 22's job) — this is a
-    genuinely EMPTY slot for that phase to report real numbers into, not
-    a fabricated 0%/placeholder threshold that would read, on the
-    dashboard, as a working metric when nothing behind it exists yet.
+def rate_limit_metric_slot(*, window_seconds: int = METRICS_WINDOW_SECONDS) -> dict[str, Any]:
+    """Implementation Plan Phase 21 left this as an honest `{"available":
+    False, ...}` slot, since rate limiting didn't exist yet. Phase 22
+    built it (`kairos.core.rate_limit`) — this now reports REAL data:
+    total requests that hit a 429 in the window, split by which limiter
+    tripped (`by_cause`: `"per_principal_token_bucket"` /
+    `"per_ip_token_bucket"`), and the top principals by 429 count
+    (Rollout v1.0 §6.2's "per-principal breakdown"). Still reads live from
+    `RequestMetric`, never a separate precomputed store — the same choice
+    every other metric in this module already makes.
     """
+    cutoff = django_timezone.now() - timedelta(seconds=window_seconds)
+    total_requests = RequestMetric.objects.filter(recorded_at__gte=cutoff).count()
+    limited_qs = RequestMetric.objects.filter(recorded_at__gte=cutoff, status_code=429)
+    total_429 = limited_qs.count()
+    by_cause: dict[str, int] = {
+        (row["cause"] or "unknown"): row["count"]
+        for row in limited_qs.values("cause").annotate(count=Count("id"))
+    }
+    top_principals = [
+        {"principal_id": row["principal_id"], "count": row["count"]}
+        for row in limited_qs.exclude(principal_id__isnull=True)
+        .values("principal_id")
+        .annotate(count=Count("id"))
+        .order_by("-count")[:10]
+    ]
     return {
-        "available": False,
-        "note": "rate limiting not yet implemented - Phase 22 dependency",
+        "available": True,
+        "window_seconds": window_seconds,
+        "total_requests": total_requests,
+        "total_429": total_429,
+        "rate": (total_429 / total_requests) if total_requests else 0.0,
+        "by_cause": by_cause,
+        "top_principals": top_principals,
     }
 
 

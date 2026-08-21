@@ -420,6 +420,12 @@ class RequestMetricType(models.TextChoices):
     BOOKING_WRITE = "booking_write", "Booking write"
     AVAILABILITY_READ = "availability_read", "Availability read"
     AUTH_FAILURE = "auth_failure", "Auth failure"
+    # Implementation Plan Phase 22 — a 429 gets its own type (checked
+    # first in classify_metric_type, ahead of the path-based rules) so
+    # kairos.core.metrics.rate_limit_metric_slot can query it directly
+    # rather than inferring "rate limited" from status_code alone mixed
+    # in with every other metric_type.
+    RATE_LIMITED = "rate_limited", "Rate limited"
     OTHER = "other", "Other"
 
 
@@ -435,9 +441,16 @@ class RequestMetric(models.Model):
     `GET /admin/checks/latest` already made for staleness.
 
     `cause` is null for an ordinary request; populated for a 503
-    (`ServiceUnavailableError.cause`: "lock_contention" or "failover") or
-    an `auth_failure`-typed row (the failure shape — see `kairos.core.drf.
-    _auth_failure_shape`). `BigAutoField`, not a UUID: this table is
+    (`ServiceUnavailableError.cause`: "lock_contention" or "failover"), an
+    `auth_failure`-typed row (the failure shape — see `kairos.core.drf.
+    _auth_failure_shape`), or (Implementation Plan Phase 22) a
+    `rate_limited`-typed row (`"per_principal_token_bucket"` or
+    `"per_ip_token_bucket"` — see `kairos.core.rate_limit`).
+    `principal_id` (Phase 22) is the authenticated `AppUser.id` as text
+    when one exists, null for an unauthenticated request — populated on
+    EVERY row (not just 429s) since it costs nothing extra to record and
+    "per-principal breakdown" (Rollout v1.0 §6.2) needs it specifically on
+    rate-limited rows. `BigAutoField`, not a UUID: this table is
     request-volume-scale and gets pruned on
     `REQUEST_METRIC_RETENTION_HOURS` — no downstream reference ever needs
     a row's id to be globally unique or non-guessable, unlike an audit
@@ -453,6 +466,7 @@ class RequestMetric(models.Model):
     status_code = models.IntegerField()
     duration_ms = models.IntegerField(null=True, blank=True)
     cause = models.TextField(null=True, blank=True)  # noqa: DJ001
+    principal_id = models.TextField(null=True, blank=True)  # noqa: DJ001
     recorded_at = models.DateTimeField(db_default=Now())
 
     class Meta:
@@ -466,6 +480,12 @@ class RequestMetric(models.Model):
         indexes = [
             models.Index(fields=["metric_type", "-recorded_at"], name="idx_request_metric_type"),
             models.Index(fields=["status_code", "-recorded_at"], name="idx_request_metric_status"),
+            # Phase 22 — backs rate_limit_metric_slot's "top principals"
+            # breakdown query (filter status_code=429, group by
+            # principal_id).
+            models.Index(
+                fields=["principal_id", "-recorded_at"], name="idx_request_metric_principal"
+            ),
         ]
 
     def __str__(self) -> str:

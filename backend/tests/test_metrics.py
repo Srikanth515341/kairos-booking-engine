@@ -331,14 +331,53 @@ def test_audit_actor_unknown_count_only_counts_within_the_window() -> None:
     assert audit_actor_unknown_count(window_seconds=900) == 1
 
 
-def test_rate_limit_metric_slot_reports_unavailable_not_fabricated_data() -> None:
-    """Implementation Plan Phase 21's own clarification #2: rate limiting
-    isn't built yet (Phase 22) — this slot must say so, not report a
-    fake 0% that would read as a working, healthy metric.
+@pytest.mark.django_db
+def test_rate_limit_metric_slot_reports_real_data_now_that_rate_limiting_exists() -> None:
+    """Implementation Plan Phase 21 left this an honest `{"available":
+    False, ...}` slot; Phase 22 built the real rate limiter
+    (`kairos.core.rate_limit`) and this function now reports genuine
+    counts from `RequestMetric` — never fabricated, but no longer a
+    placeholder either. See tests/test_rate_limit.py for the mechanism
+    that actually produces 429s this function reads back.
     """
+    record_request_metric(
+        metric_type=RequestMetric.Type.RATE_LIMITED,
+        method="POST",
+        path="/api/v1/bookings",
+        status_code=429,
+        duration_ms=1,
+        cause="per_principal_token_bucket",
+        principal_id="11111111-1111-1111-1111-111111111111",
+    )
+    record_request_metric(
+        metric_type=RequestMetric.Type.RATE_LIMITED,
+        method="POST",
+        path="/api/v1/bookings",
+        status_code=429,
+        duration_ms=1,
+        cause="per_ip_token_bucket",
+        principal_id=None,
+    )
+    record_request_metric(
+        metric_type=RequestMetric.Type.BOOKING_WRITE,
+        method="POST",
+        path="/api/v1/bookings",
+        status_code=201,
+        duration_ms=5,
+    )
+
     slot = rate_limit_metric_slot()
-    assert slot["available"] is False
-    assert "Phase 22" in slot["note"]
+    assert slot["available"] is True
+    assert slot["total_requests"] == 3
+    assert slot["total_429"] == 2
+    assert slot["rate"] == pytest.approx(2 / 3)
+    assert slot["by_cause"] == {
+        "per_principal_token_bucket": 1,
+        "per_ip_token_bucket": 1,
+    }
+    assert slot["top_principals"] == [
+        {"principal_id": "11111111-1111-1111-1111-111111111111", "count": 1}
+    ]
 
 
 @pytest.mark.django_db

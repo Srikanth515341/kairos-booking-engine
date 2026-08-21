@@ -20,6 +20,7 @@ from kairos.core.exceptions import (
 from kairos.core.idempotency import run_idempotent_recurring_confirm, run_idempotent_write
 from kairos.core.models import AuditActorType, AuditLog
 from kairos.core.pagination import decode_cursor, encode_cursor, parse_limit
+from kairos.core.rate_limit import BookingCreatePrincipalThrottle, PerIPThrottle
 from kairos.core.views import KairosAPIView
 from kairos.core.views import request_id as _request_id
 from kairos.identity.authorization import AuthorizationService
@@ -99,6 +100,13 @@ def _compute_changes(
 class BookingCollectionView(KairosAPIView):
     """POST /api/v1/bookings (Spec v1.0 §5.1) and GET /api/v1/bookings
     (Spec v1.0 §5.4) — the collection endpoint for both actions."""
+
+    # Implementation Plan Phase 22; RFC v1.0 §8.2 — rate limiting is
+    # scoped to booking CREATION specifically, not this whole collection
+    # endpoint; both throttle classes internally no-op for anything but
+    # POST (see kairos.core.rate_limit) rather than splitting GET/POST
+    # into two view classes just to attach throttling to one verb.
+    throttle_classes = [BookingCreatePrincipalThrottle, PerIPThrottle]
 
     def post(self, request: Request) -> Response:
         idempotency_key = _require_idempotency_key(request)

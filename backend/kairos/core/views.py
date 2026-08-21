@@ -5,7 +5,7 @@ repeated on every view.
 
 from __future__ import annotations
 
-from typing import Any, cast
+from typing import Any, NoReturn, cast
 
 from django.http import HttpRequest, HttpResponse
 from django.views import View
@@ -30,6 +30,27 @@ class KairosAPIView(APIView):
     # position here — see that class's docstring.
     authentication_classes = [OIDCSessionAuthentication, StubUserIdAuthentication]
     permission_classes = [IsAuthenticated]
+
+    def throttled(self, request: Request, wait: float | None) -> NoReturn:
+        """DRF's own `check_throttles` doesn't tell `throttled()` WHICH
+        throttle class failed — only the max `wait` across all of them.
+        Each throttle in `kairos.core.rate_limit` sets `request.
+        _kairos_throttle_cause` itself right before returning False from
+        `allow_request`, so this override can attach that onto the raised
+        exception (Implementation Plan Phase 22) — the same `cause`-
+        carrying convention `ServiceUnavailableError`/`AuthenticationFailed
+        (code=...)` already established in Phase 21, read back by
+        `kairos.core.drf.kairos_exception_handler` and, from there, by
+        `MetricsMiddleware` for "rate-limit trigger rate by cause."
+        """
+        # `request` here is the SAME DRF `Request` instance `allow_request`
+        # received (DRF passes one Request through `initial()` ->
+        # `check_throttles()` -> `throttled()` unchanged) — the throttle
+        # set this attribute directly on it, not on the underlying Django
+        # HttpRequest, so read it back the same way.
+        exc = drf_exceptions.Throttled(wait=wait)
+        exc.cause = getattr(request, "_kairos_throttle_cause", "rate_limited")  # type: ignore[attr-defined]
+        raise exc
 
 
 def request_id(request: Request) -> str:
@@ -220,6 +241,7 @@ _DASHBOARD_PAGE_HTML = """<!doctype html>
   <div class="card"><h2>Latency (P95)</h2><table id="latency"></table></div>
   <div class="card"><h2>503 rate by cause</h2><table id="e503"></table></div>
   <div class="card"><h2>Auth failures by shape</h2><table id="auth"></table></div>
+  <div class="card"><h2>Rate limiting (429s)</h2><table id="ratelimit"></table></div>
   <div class="card"><h2>Other</h2><table id="other"></table></div>
 </div>
 <h2>Raw response</h2>
@@ -267,12 +289,25 @@ async function load() {
         ? Object.entries(m.auth_failures.by_shape).map(([k, v]) => row([k, v])).join('')
         : row(['none', '']);
 
+    const rl = m.rate_limiting;
+    if (rl.available) {
+      const principalsText = rl.top_principals.length
+        ? rl.top_principals.map(p => p.principal_id.slice(0, 8) + ':' + p.count).join(', ')
+        : 'none';
+      document.getElementById('ratelimit').innerHTML =
+        row(['total 429s', rl.total_429]) +
+        row(['rate', (rl.rate * 100).toFixed(2) + '%']) +
+        Object.entries(rl.by_cause).map(([k, v]) => row([k, v])).join('') +
+        row(['top principals', principalsText]);
+    } else {
+      document.getElementById('ratelimit').innerHTML = row(['status', rl.note]);
+    }
+
     document.getElementById('other').innerHTML =
       row(['redis', m.redis_available ? 'up' : 'down']) +
       row(['idempotency keys', m.idempotency.total_keys]) +
       row(['idempotency cleanup last run', m.idempotency.cleanup_last_run_at || 'never']) +
-      row(['audit actor_type=unknown', m.audit_actor_unknown_count]) +
-      row(['rate limiting', m.rate_limiting.note]);
+      row(['audit actor_type=unknown', m.audit_actor_unknown_count]);
   } catch (e) {
     statusEl.textContent = 'error: ' + e;
   }
