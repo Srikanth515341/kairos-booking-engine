@@ -224,4 +224,12 @@ def kairos_exception_handler(exc: Exception, context: dict[str, Any]) -> Respons
         # the same reason: MetricsMiddleware reads this back to populate
         # RequestMetric.cause for "auth failure rate by shape."
         default_response.kairos_error_cause = _auth_failure_shape(exc)  # type: ignore[attr-defined]
+    if isinstance(exc, drf_exceptions.Throttled):
+        # Implementation Plan Phase 22: `.cause` is set by `kairos.core.
+        # views.KairosAPIView.throttled()`, which reads it off whichever
+        # `kairos.core.rate_limit` throttle actually rejected the request
+        # ("per_principal_token_bucket" / "per_ip_token_bucket") — the
+        # SAME cause-stashing mechanism the two branches above already use
+        # for MetricsMiddleware's benefit, not a third one invented here.
+        default_response.kairos_error_cause = getattr(exc, "cause", "rate_limited")  # type: ignore[attr-defined]
     return default_response

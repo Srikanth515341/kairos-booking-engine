@@ -24,6 +24,13 @@ DATABASES = {
 KAIROS_DEV_AUTH_STUB_ENABLED = True
 KAIROS_OIDC_MOCK_ENABLED = True
 
+# Implementation Plan Phase 22: off by default here — most of this suite
+# fires many rapid requests from one principal to prove properties
+# unrelated to rate limiting (IDEM-06, WL-01/WL-02, ...). kairos.core.
+# rate_limit's own tests flip this True via the `settings` fixture for the
+# specific tests that exercise the real limiter (SEC-02).
+RATE_LIMIT_ENABLED = False
+
 # Phase 16: cancellation/decline dispatch `create_offer_for_freed_range_
 # task.delay(...)` from inside a `transaction.on_commit()` hook. Eager mode
 # runs it synchronously in-process instead of publishing to Redis — the

@@ -85,7 +85,23 @@ INSTALLED_APPS = [
 ]
 
 MIDDLEWARE = [
+    # Django's own security headers (Implementation Plan Phase 22) —
+    # reusing a framework guarantee instead of reinventing one, the same
+    # choice this project has made repeatedly (CompositePrimaryKey,
+    # set_config, Postgres triggers). First, per Django's own documented
+    # convention — it can short-circuit with a redirect (SECURE_SSL_
+    # REDIRECT, prod only) before anything else runs.
+    "django.middleware.security.SecurityMiddleware",
+    # X_FRAME_OPTIONS (base.py) is consumed by THIS middleware, not
+    # SecurityMiddleware above — a genuinely separate Django middleware
+    # class, easy to assume is bundled in and silently no-op without it.
+    "django.middleware.clickjacking.XFrameOptionsMiddleware",
     "kairos.core.middleware.RequestIdMiddleware",
+    # Phase 22 — before MetricsMiddleware so a CORS preflight response
+    # (which this middleware can answer directly, short-circuiting
+    # get_response) still gets recorded as a request; after
+    # RequestIdMiddleware so X-Request-Id is still present on it.
+    "kairos.core.middleware.CorsMiddleware",
     # Implementation Plan Phase 21; Rollout v1.0 §6.2 — after
     # RequestIdMiddleware deliberately (request.request_id must already
     # exist, even though this middleware doesn't currently consume it,
@@ -237,3 +253,46 @@ DEFAULT_FROM_EMAIL = os.environ.get("NOTIFICATIONS_FROM_EMAIL", "kairos@example.
 # this phase). A real deployment would point this at a distribution list
 # or an email-to-page bridge; nothing in this codebase assumes which.
 ALERT_RECIPIENT_EMAIL = os.environ.get("ALERT_RECIPIENT_EMAIL", "oncall@example.com")
+
+# ============================================================
+# Security headers & CORS (Implementation Plan Phase 22)
+# ============================================================
+# django.middleware.security.SecurityMiddleware (MIDDLEWARE, above) reads
+# these. Set here, unconditionally, for every environment — dev.py/test.py
+# don't need to override any of them; only prod.py adds the HTTPS-specific
+# ones below (SECURE_SSL_REDIRECT/HSTS make no sense against a local
+# non-TLS dev server).
+SECURE_CONTENT_TYPE_NOSNIFF = True
+X_FRAME_OPTIONS = "DENY"
+SECURE_REFERRER_POLICY = "same-origin"
+# Cross-Origin-Opener-Policy — SecurityMiddleware's own default is already
+# "same-origin", set explicitly so this is a deliberate choice on record,
+# not an unreviewed framework default.
+SECURE_CROSS_ORIGIN_OPENER_POLICY = "same-origin"
+
+# kairos.core.middleware.CorsMiddleware's explicit allowlist — comma-
+# separated, empty by default (no frontend origin exists to allow until
+# Phase 23; a real deployment sets this to its actual frontend's
+# origin(s)). Never treat "*" as "allow everything" anywhere this value is
+# consumed — prod.py additionally refuses to start if "*" appears here at
+# all, the same "refuse a dev-shaped default" discipline SECRET_KEY/
+# KAIROS_SESSION_SIGNING_KEY/EMAIL_HOST already have.
+CORS_ALLOWED_ORIGINS = [
+    origin.strip()
+    for origin in os.environ.get("CORS_ALLOWED_ORIGINS", "").split(",")
+    if origin.strip()
+]
+
+# kairos.core.rate_limit's throttle classes check this FIRST, before
+# touching Redis at all. True everywhere except kairos.settings.test — the
+# same "gated flag, checked at the point of use, off only in test" shape
+# KAIROS_DEV_AUTH_STUB_ENABLED already established (Phase 9), for an
+# analogous reason: most of this test suite deliberately fires many rapid
+# requests from the SAME principal (IDEM-06's 100 concurrent-replay reps,
+# WL-01/WL-02's threaded races, ...) to prove properties that have nothing
+# to do with rate limiting, and a real limiter firing mid-test would be
+# collateral damage, not coverage. The real limiter's own behavior is
+# tested by explicitly flipping this True in kairos.core.rate_limit's own
+# tests (Implementation Plan Phase 22, SEC-02), not by leaving it on
+# everywhere and hoping every other test's timing stays under threshold.
+RATE_LIMIT_ENABLED = True

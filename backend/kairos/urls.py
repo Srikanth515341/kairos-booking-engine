@@ -13,3 +13,10 @@ urlpatterns: list[URLPattern | URLResolver] = [
     # another JSON endpoint (Implementation Plan Phase 21).
     path("admin/dashboard/", AdminDashboardPageView.as_view(), name="admin-dashboard-page"),
 ]
+
+# Implementation Plan Phase 22 — see kairos.core.error_handlers' own
+# docstring: a URL that never resolves to any view previously produced a
+# bare, unenveloped Django error page, the one gap in kairos.core.drf.
+# kairos_exception_handler's "no bare error body" claim.
+handler404 = "kairos.core.error_handlers.handler404"
+handler500 = "kairos.core.error_handlers.handler500"
