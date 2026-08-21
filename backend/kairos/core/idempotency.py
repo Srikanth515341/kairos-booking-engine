@@ -30,6 +30,7 @@ from django.utils import timezone
 from kairos.core.db import apply_write_path_session_settings
 from kairos.core.drf import build_error_envelope
 from kairos.core.exceptions import (
+    AlreadyOnWaitlistError,
     IdempotencyKeyConflictError,
     RequestInProgressError,
     SlotUnavailableError,
@@ -160,7 +161,32 @@ def run_idempotent_write(
             raise RequestInProgressError from exc
         raise
     except SlotUnavailableError:
-        _record_conflict_outcome(user, key, endpoint, fingerprint, request_id)
+        _record_conflict_outcome(
+            user,
+            key,
+            endpoint,
+            fingerprint,
+            request_id,
+            code="slot_unavailable",
+            message="This time slot is no longer available.",
+            http_status=409,
+        )
+        raise
+    except AlreadyOnWaitlistError:
+        # Generalizes the identical Spec v1.0 §7 point 7 rule
+        # (SlotUnavailableError's branch above) to waitlist join (Phase
+        # 14) — this module's own docstring already named Phase 14 as a
+        # future reuser of this exact mechanism, not a new one.
+        _record_conflict_outcome(
+            user,
+            key,
+            endpoint,
+            fingerprint,
+            request_id,
+            code="already_on_waitlist",
+            message="You already have a live waitlist entry for this resource and time range.",
+            http_status=409,
+        )
         raise
 
     return IdempotentWriteResult(response_status, response_body, is_replay=False)
@@ -295,11 +321,25 @@ def _replay_or_conflict_allowing_in_progress(
 
 
 def _record_conflict_outcome(
-    user: AppUser, key: UUID, endpoint: str, fingerprint: str, request_id: str | None
+    user: AppUser,
+    key: UUID,
+    endpoint: str,
+    fingerprint: str,
+    request_id: str | None,
+    *,
+    code: str,
+    message: str,
+    http_status: int,
 ) -> None:
-    envelope = build_error_envelope(
-        "slot_unavailable", "This time slot is no longer available.", None, request_id
-    )
+    """Generic across every write path that can fail with a legitimate,
+    replayable 409/422 (Spec v1.0 §7 point 7: "a 409 is a legitimate final
+    outcome; a retry must receive the same 409, not a fresh attempt") —
+    `code`/`message`/`http_status` are the caller's to supply exactly like
+    `SlotUnavailableError` (booking create/edit) and `AlreadyOnWaitlistError`
+    (waitlist join, Phase 14) already do, rather than this function
+    hardcoding one specific outcome.
+    """
+    envelope = build_error_envelope(code, message, None, request_id)
     with transaction.atomic():
         IdempotencyKey.objects.create(
             user=user,
@@ -307,7 +347,7 @@ def _record_conflict_outcome(
             endpoint=endpoint,
             request_body_hash=fingerprint,
             status=IdempotencyKeyStatus.COMPLETED,
-            response_status=409,
+            response_status=http_status,
             response_body=envelope,
             completed_at=timezone.now(),
         )

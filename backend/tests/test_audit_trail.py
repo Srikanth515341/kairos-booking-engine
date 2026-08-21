@@ -150,14 +150,20 @@ def test_aud_02_raw_sql_write_to_booking_still_produces_audit_row(
 
 
 @pytest.mark.django_db
-def test_aud_02_triggers_exist_on_all_three_phase_8_tables() -> None:
+def test_aud_02_triggers_exist_on_every_audited_table() -> None:
+    """Phase 8's original three (booking/resource/resource_admin) plus
+    waitlist_entry (Phase 14, core/migrations/0008) — 0003's own comment
+    already promised this table and waitlist_offer (Phase 16) would be
+    added "when those tables exist," not left as a permanently-fixed set
+    of three.
+    """
     with connection.cursor() as cur:
         cur.execute(
             "SELECT tgrelid::regclass::text FROM pg_trigger WHERE tgname LIKE 'audit_%' ORDER BY 1"
         )
         audited_tables = {row[0] for row in cur.fetchall()}
 
-    assert audited_tables == {"booking", "resource", "resource_admin"}
+    assert audited_tables == {"booking", "resource", "resource_admin", "waitlist_entry"}
 
 
 # --------------------------------------------------------------------
