@@ -14,12 +14,14 @@ from rest_framework.response import Response
 from rest_framework.views import exception_handler as drf_default_exception_handler
 
 from kairos.core.exceptions import (
+    AlreadyOnWaitlistError,
     IdempotencyKeyConflictError,
     NotFoundError,
     PolicyValidationError,
     PreviewExpiredError,
     RequestInProgressError,
     ServiceUnavailableError,
+    SlotAlreadyAvailableError,
     SlotUnavailableError,
     UnacknowledgedConflictsError,
 )
@@ -144,6 +146,28 @@ def kairos_exception_handler(exc: Exception, context: dict[str, Any]) -> Respons
                 request_id,
             ),
             status=409,
+        )
+
+    if isinstance(exc, AlreadyOnWaitlistError):
+        return Response(
+            build_error_envelope(
+                "already_on_waitlist",
+                "You already have a live waitlist entry for this resource and time range.",
+                None,
+                request_id,
+            ),
+            status=409,
+        )
+
+    if isinstance(exc, SlotAlreadyAvailableError):
+        return Response(
+            build_error_envelope(
+                "slot_already_available",
+                "This time range is currently available — book it directly.",
+                None,
+                request_id,
+            ),
+            status=422,
         )
 
     if isinstance(exc, NotFoundError):

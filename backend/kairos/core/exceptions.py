@@ -84,3 +84,22 @@ class UnacknowledgedConflictsError(Exception):
     `unacknowledged_conflicts`. Raised before any occurrence is attempted —
     a series with unacknowledged items commits nothing at all.
     """
+
+
+class AlreadyOnWaitlistError(Exception):
+    """SQLSTATE 23505 on `uniq_live_waitlist_per_user_slot` — this exact
+    (user, resource, time_range) already has a live entry, 'waiting' or
+    'offered' (RFC v1.0 §8.2: a user must not re-join while already
+    holding an outstanding offer). Maps to 409 `already_on_waitlist`
+    (Spec v1.0 §5.11).
+    """
+
+
+class SlotAlreadyAvailableError(Exception):
+    """The requested range has no conflicting confirmed/held booking right
+    now — joining a waitlist for an already-bookable range is nonsensical;
+    book it directly (Spec v1.0 §5.11). Advisory, not authoritative: this
+    is a check-then-act read and the range may be taken by the time the
+    client acts on it, the same caveat every availability read in this
+    system carries. Maps to 422 `slot_already_available`.
+    """

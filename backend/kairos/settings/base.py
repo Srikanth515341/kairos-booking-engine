@@ -76,6 +76,7 @@ INSTALLED_APPS = [
     "kairos.identity",
     "kairos.resources",
     "kairos.bookings",
+    "kairos.waitlist",
 ]
 
 MIDDLEWARE = [

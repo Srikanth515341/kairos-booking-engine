@@ -104,7 +104,14 @@ instant — the re-materialization job recomputes every affected occurrence stra
 series definition, updates the ones that changed, and never drops one that conflicts with a
 booking made in the interim; it's flagged for the series owner and the resource administrator
 instead, and the rest of the series still succeeds. Every background write carries its own
-audit attribution too — `actor_type: system`, not a fabricated human actor. See
+audit attribution too — `actor_type: system`, not a fabricated human actor. Users can now join
+a waitlist too (Phase 14): `POST /waitlist-entries` inserts directly, no availability
+pre-check — the same philosophy as booking creation — with 409 when you're already on it
+(covering an outstanding offer too, not just another plain entry) and 422 when the range is
+already fully bookable and you should just book it. Eligibility is defined as *containment*,
+not overlap: a freed 10:00–11:00 makes a 10:00–11:00 waitlister eligible, a freed 10:00–10:30
+does not, since their full requested range wasn't actually freed. `GET /waitlist-entries`
+reports your live queue position; `POST /waitlist-entries/{id}/cancel` withdraws. See
 [`CLAUDE.md`](CLAUDE.md) for exactly what is and isn't built, and
 [`docs/06-implementation-plan.md`](docs/06-implementation-plan.md) for the full 31-phase
 build plan.
@@ -254,6 +261,24 @@ curl -s http://127.0.0.1:8000/api/v1/bookings/<booking-id-from-above>/history \
   -H "Authorization: Bearer $ACCESS_TOKEN" | python -m json.tool
 ```
 
+Join a waitlist (Phase 14) for a range that's already booked — joining a range with no
+conflict at all gets 422 `slot_already_available`, since you should just book it directly:
+
+```bash
+curl -i -X POST http://127.0.0.1:8000/api/v1/waitlist-entries \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $ACCESS_TOKEN" \
+  -H "Idempotency-Key: $(python -c 'import uuid; print(uuid.uuid4())')" \
+  -d '{"resource_id": "<resource-id-from-above>", "start": "2026-09-01T13:00:00Z", "end": "2026-09-01T14:00:00Z"}'
+
+curl -s http://127.0.0.1:8000/api/v1/waitlist-entries \
+  -H "Authorization: Bearer $ACCESS_TOKEN" | python -m json.tool
+
+curl -i -X POST http://127.0.0.1:8000/api/v1/waitlist-entries/<entry-id-from-above>/cancel \
+  -H "Authorization: Bearer $ACCESS_TOKEN" \
+  -H "Idempotency-Key: $(python -c 'import uuid; print(uuid.uuid4())')"
+```
+
 No frontend yet — see Status above and [`CLAUDE.md`](CLAUDE.md).
 
 ## Running the test suite
@@ -300,7 +325,8 @@ pytest
 | Background workers (Celery + Redis) | **Live** — `worker`/`beat` under `docker compose up`, verified end to end (Phase 13) |
 | Rolling / tzdata re-materialization | **Live** — mechanism proven directly; no real caller yet, see CLAUDE.md (Phase 13) |
 | system_check_run / correctness-monitor records | **Live** — `series_materialization`/`tzdata_rematerialization` only; full six-check alerting is Phase 21 |
-| Enforceable waitlist | Not started (Phase 14–17) |
+| Waitlist join / list / cancel | **Live** — containment eligibility query (PRD FR21), no offer cascade caller yet (Phase 14) |
+| Enforceable waitlist (holds, offers, cascade) | Not started (Phase 15–17) |
 | Notifications | Not started (Phase 18) |
 | Admin & offboarding | Not started (Phase 19) |
 | Production correctness monitoring | Not started (Phase 20–21) |
