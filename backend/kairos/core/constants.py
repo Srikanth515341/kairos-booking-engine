@@ -40,3 +40,18 @@ MAX_SERIES_OCCURRENCES = int(os.environ.get("MAX_SERIES_OCCURRENCES", "100"))
 # is deciding — so the token that lets confirm reuse the preview's exact
 # computation without re-evaluating it is deliberately short-lived.
 PREVIEW_TOKEN_TTL_SECONDS = int(os.environ.get("PREVIEW_TOKEN_TTL_SECONDS", str(15 * 60)))
+
+# Celery Beat intervals (Implementation Plan Phase 13; RFC v1.0 §9.4,
+# §14). Both jobs fail silently if they simply stop running — RFC §14
+# flags this explicitly ("no errors, just absence") — so how OFTEN they
+# run is itself a tunable worth naming, not a magic number in the beat
+# schedule dict.
+ROLLING_MATERIALIZATION_INTERVAL_SECONDS = int(
+    os.environ.get("ROLLING_MATERIALIZATION_INTERVAL_SECONDS", str(60 * 60))  # hourly
+)
+TZDATA_REMATERIALIZATION_INTERVAL_SECONDS = int(
+    os.environ.get("TZDATA_REMATERIALIZATION_INTERVAL_SECONDS", str(60 * 60))  # hourly
+)
+TZDATA_DRIFT_CHECK_INTERVAL_SECONDS = int(
+    os.environ.get("TZDATA_DRIFT_CHECK_INTERVAL_SECONDS", str(24 * 60 * 60))  # daily
+)

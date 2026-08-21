@@ -5,6 +5,12 @@ from pathlib import Path
 
 import dj_database_url
 
+from kairos.core.constants import (
+    ROLLING_MATERIALIZATION_INTERVAL_SECONDS,
+    TZDATA_DRIFT_CHECK_INTERVAL_SECONDS,
+    TZDATA_REMATERIALIZATION_INTERVAL_SECONDS,
+)
+
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
 
 SECRET_KEY = os.environ.get("DJANGO_SECRET_KEY", "")
@@ -137,3 +143,32 @@ USE_TZ = True
 TIME_ZONE = "UTC"
 
 LANGUAGE_CODE = "en-us"
+
+# ============================================================
+# Celery (Implementation Plan Phase 13; RFC v1.0 §4.1, §4.3)
+# ============================================================
+# Redis is a LIVENESS dependency only (RFC v1.0 §4.3) — the exclusion
+# constraint holds with no worker running at all. Same env var every
+# other Redis-consuming config reads (.env.example), not a Celery-specific
+# duplicate.
+CELERY_BROKER_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+# No result backend: every task here either writes its own result into
+# `system_check_run` or is a plain periodic side-effect (rolling
+# materialization) — nothing calls `.get()` on a task waiting for a return
+# value, so a result backend would only be unused Redis key growth.
+CELERY_TASK_IGNORE_RESULT = True
+CELERY_TIMEZONE = "UTC"
+CELERY_BEAT_SCHEDULE = {
+    "rolling-materialize-series": {
+        "task": "kairos.bookings.tasks.rolling_materialize_series_task",
+        "schedule": ROLLING_MATERIALIZATION_INTERVAL_SECONDS,
+    },
+    "rematerialize-stale-series": {
+        "task": "kairos.bookings.tasks.rematerialize_stale_series_task",
+        "schedule": TZDATA_REMATERIALIZATION_INTERVAL_SECONDS,
+    },
+    "check-tzdata-drift": {
+        "task": "kairos.core.tasks.check_tzdata_drift_task",
+        "schedule": TZDATA_DRIFT_CHECK_INTERVAL_SECONDS,
+    },
+}

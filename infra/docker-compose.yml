@@ -24,5 +24,55 @@ services:
       timeout: 5s
       retries: 10
 
+  # First background-worker infrastructure (Implementation Plan Phase 13;
+  # RFC v1.0 §4.1, §4.3) — a LIVENESS dependency only. If this is down, no
+  # correctness violation occurs: the exclusion constraint needs neither
+  # Celery nor Redis. Only asynchronous liveness (rolling materialization,
+  # tz re-materialization, later phases' waitlist cascade/hold reclamation)
+  # pauses.
+  redis:
+    image: redis:7-alpine
+    container_name: kairos_redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  worker:
+    build:
+      context: ../backend
+    container_name: kairos_celery_worker
+    restart: unless-stopped
+    command: ["celery", "-A", "kairos", "worker", "--loglevel=info"]
+    environment:
+      DJANGO_SETTINGS_MODULE: kairos.settings.dev
+      DATABASE_URL: postgresql://kairos_app:kairos_app@postgres:5432/kairos_dev
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  beat:
+    build:
+      context: ../backend
+    container_name: kairos_celery_beat
+    restart: unless-stopped
+    command: ["celery", "-A", "kairos", "beat", "--loglevel=info"]
+    environment:
+      DJANGO_SETTINGS_MODULE: kairos.settings.dev
+      DATABASE_URL: postgresql://kairos_app:kairos_app@postgres:5432/kairos_dev
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
 volumes:
   kairos_pgdata:

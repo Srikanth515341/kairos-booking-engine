@@ -97,7 +97,14 @@ contested week never blocks the other seven or holds a lock across the whole res
 conflict that arises between preview and confirm is reported distinctly from one the booker
 already knew about. The confirm response is idempotent byte-for-byte, not just once-per-key —
 a replay returns the identical outcome rather than re-evaluating anything. A recurring series
-can be cancelled going forward without touching its history. See
+can be cancelled going forward without touching its history. Background workers exist now too
+(Phase 13): Celery + Redis, running as `worker`/`beat` services alongside Postgres under the
+same `docker compose up`. A tzdata rule change doesn't just silently mis-render a stored
+instant — the re-materialization job recomputes every affected occurrence straight from its
+series definition, updates the ones that changed, and never drops one that conflicts with a
+booking made in the interim; it's flagged for the series owner and the resource administrator
+instead, and the rest of the series still succeeds. Every background write carries its own
+audit attribution too — `actor_type: system`, not a fabricated human actor. See
 [`CLAUDE.md`](CLAUDE.md) for exactly what is and isn't built, and
 [`docs/06-implementation-plan.md`](docs/06-implementation-plan.md) for the full 31-phase
 build plan.
@@ -290,7 +297,9 @@ pytest
 | Timezone foundation | **Live** — UTC-only API, IANA validation, DST-safe conversion + detection utilities (Phase 10) |
 | Recurrence expansion engine | **Live** — DST-safe, per-occurrence (Phase 11) |
 | Recurring bookings API | **Live** — preview/confirm/cancel, 207 Multi-Status, per-occurrence transactions (Phase 12) 🏁 Milestone 2 |
-| Rolling / tzdata re-materialization | Not started (Phase 13) |
+| Background workers (Celery + Redis) | **Live** — `worker`/`beat` under `docker compose up`, verified end to end (Phase 13) |
+| Rolling / tzdata re-materialization | **Live** — mechanism proven directly; no real caller yet, see CLAUDE.md (Phase 13) |
+| system_check_run / correctness-monitor records | **Live** — `series_materialization`/`tzdata_rematerialization` only; full six-check alerting is Phase 21 |
 | Enforceable waitlist | Not started (Phase 14–17) |
 | Notifications | Not started (Phase 18) |
 | Admin & offboarding | Not started (Phase 19) |

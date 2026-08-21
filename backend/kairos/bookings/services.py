@@ -77,6 +77,12 @@ class BookingCreateRequest:
     # (Spec v1.0 §5.10) a filtered update rather than tracking membership
     # some other way.
     series: RecurringSeries | None = None
+    # USER for every caller through Phase 12 (default, unchanged). Phase 13
+    # overrides this to SYSTEM for rolling-materialization/re-materialization
+    # writes — `req.user` still owns the resulting booking (the series'
+    # `created_by`), but the ACTOR that performed the write is the
+    # background job, not that user, so the audit trail must say so.
+    actor_type: str = AuditActorType.USER
 
 
 def create_booking(req: BookingCreateRequest) -> Booking:
@@ -93,7 +99,8 @@ def create_booking(req: BookingCreateRequest) -> Booking:
     deliberate and load-bearing: it's what gives each occurrence its own
     independently-committed transaction (never one shared transaction
     across a series) and its own correctly-timed session settings, without
-    Phase 12 needing to reimplement either.
+    Phase 12 needing to reimplement either. Phase 13's rolling-
+    materialization job reuses it a third time, for the identical reason.
     """
     log_context = {
         "request_id": req.request_id,
@@ -103,12 +110,18 @@ def create_booking(req: BookingCreateRequest) -> Booking:
     try:
         with transaction.atomic():
             with connection.cursor() as cursor:
-                # Always the booker themselves in Phase 8's scope — there
-                # is no admin-create-on-behalf-of-another-user path yet.
+                # actor_id is the empty string — NOT req.user.id — for a
+                # SYSTEM-initiated write (Phase 13): apply_write_path_
+                # session_settings' own established convention is that an
+                # empty string becomes SQL NULL via the trigger's
+                # NULLIF(..., ''), the same convention already used for an
+                # absent `reason` — and a background job genuinely has no
+                # human actor to attribute the row to. `req.user` here only
+                # says who the booking is FOR.
                 apply_write_path_session_settings(
                     cursor,
-                    actor_id=str(req.user.id),
-                    actor_type=AuditActorType.USER,
+                    actor_id=(str(req.user.id) if req.actor_type != AuditActorType.SYSTEM else ""),
+                    actor_type=req.actor_type,
                     request_id=req.request_id,
                 )
             booking = Booking.objects.create(
@@ -141,6 +154,11 @@ class BookingEditRequest:
     start: datetime
     end: datetime
     request_id: str
+    # USER for every caller through Phase 7 (default, unchanged). Phase 13
+    # overrides this to SYSTEM when re-materialization (RFC v1.0 §9.4)
+    # updates an occurrence's stored instant after a tzdata rule change —
+    # the booking's owner didn't act, the tzdata-check job did.
+    actor_type: str = AuditActorType.USER
 
 
 def edit_booking(req: BookingEditRequest) -> Booking:
@@ -149,6 +167,12 @@ def edit_booking(req: BookingEditRequest) -> Booking:
     constraint checked on UPDATE compares the new row against every
     *other* row, so a booking's own current range never self-conflicts
     with its own new one.
+
+    Reused for RFC v1.0 §9.4's re-materialization (Phase 13): recomputing
+    an occurrence's instant from its series definition and writing it here
+    is structurally an edit — the booking's identity and owner don't
+    change, only its `time_range` — so it goes through the SAME
+    conflict-checked UPDATE path a user's own edit does, not a bespoke one.
     """
     log_context = {
         "request_id": req.request_id,
@@ -158,12 +182,14 @@ def edit_booking(req: BookingEditRequest) -> Booking:
     try:
         with transaction.atomic():
             with connection.cursor() as cursor:
-                # Owner-only (Spec v1.0 §5.5) — no admin override for
-                # edit, so the actor is always the booking's own owner.
+                # actor_id empty for a SYSTEM-initiated edit — same
+                # NULLIF(..., '') convention as create_booking above.
                 apply_write_path_session_settings(
                     cursor,
-                    actor_id=str(req.booking.user_id),
-                    actor_type=AuditActorType.USER,
+                    actor_id=(
+                        str(req.booking.user_id) if req.actor_type != AuditActorType.SYSTEM else ""
+                    ),
+                    actor_type=req.actor_type,
                     request_id=req.request_id,
                 )
             Booking.objects.filter(id=req.booking.id).update(time_range=(req.start, req.end))
