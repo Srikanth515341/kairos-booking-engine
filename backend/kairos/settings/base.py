@@ -7,7 +7,9 @@ import dj_database_url
 
 from kairos.core.constants import (
     HOLD_REAPER_INTERVAL_SECONDS,
+    RECONCILIATION_INTERVAL_SECONDS,
     ROLLING_MATERIALIZATION_INTERVAL_SECONDS,
+    SCHEMA_ASSERTION_INTERVAL_SECONDS,
     TZDATA_DRIFT_CHECK_INTERVAL_SECONDS,
     TZDATA_REMATERIALIZATION_INTERVAL_SECONDS,
 )
@@ -176,6 +178,14 @@ CELERY_BEAT_SCHEDULE = {
     "reap-expired-holds": {
         "task": "kairos.waitlist.tasks.reap_expired_holds_task",
         "schedule": HOLD_REAPER_INTERVAL_SECONDS,
+    },
+    "run-reconciliation": {
+        "task": "kairos.core.tasks.run_reconciliation_task",
+        "schedule": RECONCILIATION_INTERVAL_SECONDS,
+    },
+    "run-schema-assertion": {
+        "task": "kairos.core.tasks.run_schema_assertion_task",
+        "schedule": SCHEMA_ASSERTION_INTERVAL_SECONDS,
     },
 }
 

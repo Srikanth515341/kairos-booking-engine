@@ -30,8 +30,13 @@ from kairos.bookings.services import (
     create_booking,
     edit_booking,
 )
-from kairos.core.constants import MAX_ADVANCE_HORIZON_DAYS
+from kairos.core.constants import (
+    MAX_ADVANCE_HORIZON_DAYS,
+    SERIES_MATERIALIZATION_STALE_THRESHOLD_SECONDS,
+    TZDATA_REMATERIALIZATION_STALE_THRESHOLD_SECONDS,
+)
 from kairos.core.exceptions import SlotUnavailableError
+from kairos.core.heartbeat import heartbeat_is_stale
 from kairos.core.models import AuditActorType, SystemCheckRun
 from kairos.core.notifications import notify_rematerialization, notify_rematerialization_conflict
 from kairos.core.timezones import tzdata_version
@@ -298,6 +303,39 @@ def rematerialize_stale_series(*, now: datetime | None = None) -> dict[str, Any]
     )
     logger.info("tzdata_rematerialization_run", extra={"request_id": request_id, **findings})
     return findings
+
+
+def series_materialization_heartbeat_is_stale(
+    *,
+    now: datetime | None = None,
+    threshold_seconds: int = SERIES_MATERIALIZATION_STALE_THRESHOLD_SECONDS,
+) -> bool:
+    """RECON-06 (Implementation Plan Phase 20) — Rollout v1.0 §6.1: "no
+    successful run in 2x interval." Delegates to `kairos.core.heartbeat.
+    heartbeat_is_stale`, the same shared mechanism `hold_reaper`/
+    `offer_cascade`'s equivalent checks use.
+    """
+    return heartbeat_is_stale(
+        SystemCheckRun.CheckName.SERIES_MATERIALIZATION, threshold_seconds, now=now
+    )
+
+
+def tzdata_rematerialization_heartbeat_is_stale(
+    *,
+    now: datetime | None = None,
+    threshold_seconds: int = TZDATA_REMATERIALIZATION_STALE_THRESHOLD_SECONDS,
+) -> bool:
+    """RECON-06 (Implementation Plan Phase 20) — Rollout v1.0 §6.1: "no
+    successful run in 2x interval." Does NOT also check "deployed tzdata
+    version != recorded version with no run since" — that half of
+    Rollout's alert condition needs no NEW mechanism (`kairos.core.
+    timezones.tzdata_version()` and each series' own `tzdata_version`
+    column already exist), but wiring it into an alert is Phase 21's
+    job, not this one's.
+    """
+    return heartbeat_is_stale(
+        SystemCheckRun.CheckName.TZDATA_REMATERIALIZATION, threshold_seconds, now=now
+    )
 
 
 @shared_task(name="kairos.bookings.tasks.rolling_materialize_series_task")

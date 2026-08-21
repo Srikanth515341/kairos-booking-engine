@@ -96,7 +96,28 @@ kairos-booking-engine/
 │   │   │                   # FOURTH module duplicating the identical local function
 │   │   │                   # bookings/waitlist/resources views.py each already had, this
 │   │   │                   # project's own "worth extracting once real duplication exists"
-│   │   │                   # threshold), management/commands/cleanup_idempotency_keys.py
+│   │   │                   # threshold), AdminChecksLatestView (Phase 20, GET /admin/checks/
+│   │   │                   # latest, Spec v1.0 §5.15 — operations/system_admin; reports all
+│   │   │                   # six checks in Spec's own example order, a never-run check as
+│   │   │                   # honest null/null rather than a faked pass), schema_assertion.py
+│   │   │                   # (get_no_overlapping_bookings_definition — the SAME query Phase 3's
+│   │   │                   # CI test now calls directly rather than duplicating, Phase 20;
+│   │   │                   # check_schema_assertion writes the system_check_run heartbeat),
+│   │   │                   # reconciliation.py (find_overlapping_active_bookings — a self-join
+│   │   │                   # using the SAME && operator no_overlapping_bookings itself is
+│   │   │                   # defined with, so [) bound semantics match automatically;
+│   │   │                   # check_reconciliation writes the heartbeat; RECONCILIATION_FAILURE_
+│   │   │                   # MESSAGE is a TESTED property of the alert payload, RECON-04),
+│   │   │                   # heartbeat.py (heartbeat_is_stale — Phase 20, generalized from
+│   │   │                   # Phase 17's hold_reaper-only version once four more checks needed
+│   │   │                   # the identical logic), tasks.py's run_reconciliation_task/
+│   │   │                   # run_schema_assertion_task (Phase 20), urls.py (new this phase —
+│   │   │                   # core previously had no endpoints of its own),
+│   │   │                   # management/commands/run_correctness_checks.py (Phase 20 — the "on
+│   │   │                   # every deploy" trigger RFC v1.0 §14 asks for, exits non-zero on
+│   │   │                   # failure so a deploy pipeline can gate on it; same functions Beat
+│   │   │                   # calls on schedule, the identical pattern Phase 13's
+│   │   │                   # rematerialize_series established), management/commands/cleanup_idempotency_keys.py
 │   │   ├── identity/       # app_user, resource_admin (UUID surrogate PK since Phase 8),
 │   │   │                   # user_group/user_group_membership (Phase 9 — PRD FR46, not in
 │   │   │                   # Spec v1.0 §3 at all, see Key Technical Decisions),
@@ -140,7 +161,10 @@ kairos-booking-engine/
 │   │   │                   # views.py (BookingHistoryView — Phase 8; recurring preview/
 │   │   │                   # confirm/cancel views — Phase 12), urls.py, tasks.py
 │   │   │                   # (rolling_materialize_series/rematerialize_stale_series —
-│   │   │                   # Phase 13, the first writes NOT initiated by an HTTP request),
+│   │   │                   # Phase 13, the first writes NOT initiated by an HTTP request;
+│   │   │                   # series_materialization_heartbeat_is_stale/tzdata_rematerialization_
+│   │   │                   # heartbeat_is_stale — Phase 20, RECON-06, both thin wrappers over
+│   │   │                   # kairos.core.heartbeat.heartbeat_is_stale),
 │   │   │                   # management/commands/rematerialize_series.py (the "on deploy"
 │   │   │                   # trigger RFC §9.4 asks for, alongside the scheduled Beat entry
 │   │   │                   # — same functions, not a second implementation — Phase 13),
@@ -202,7 +226,14 @@ kairos-booking-engine/
 │   │   │                   # offboarding cascade is the first caller to pass SYSTEM, the same
 │   │   │                   # "extend the existing function" choice already made for
 │   │   │                   # create_booking/edit_booking (Phase 13) and cancel_booking (Phase 19,
-│   │   │                   # see kairos.bookings — Key Technical Decisions),
+│   │   │                   # see kairos.bookings — Key Technical Decisions).
+│   │   │                   # create_offer_for_freed_range now also writes an offer_cascade
+│   │   │                   # system_check_run heartbeat on EVERY run (found an eligible entry
+│   │   │                   # or not — Phase 20, RECON-06, closing the one background job of the
+│   │   │                   # four RECON-06 names that had no heartbeat writer at all before this
+│   │   │                   # phase); offer_cascade_heartbeat_is_stale mirrors hold_reaper_
+│   │   │                   # heartbeat_is_stale's shape, both now delegating to kairos.core.
+│   │   │                   # heartbeat.heartbeat_is_stale,
 │   │   │                   # serializers.py (slot_already_available check before
 │   │   │                   # the idempotency key is claimed; WaitlistOfferResponseSerializer —
 │   │   │                   # Phase 16), views.py (join/list/cancel; WaitlistOfferConfirmView/
@@ -268,7 +299,8 @@ write path): `POST`/`GET /api/v1/bookings`, `GET`/`PATCH /api/v1/bookings/{id}`,
 (resource admin or `system_admin`), `POST /api/v1/resources/{id}/admins`,
 `DELETE /api/v1/resources/{id}/admins/{user_id}`,
 `GET /api/v1/admin/resources/{id}/utilization`, `POST /api/v1/admin/users/{id}/deactivate`
-(Phase 19). Every mutation (create, edit, cancel, recurring confirm, recurring-series cancel,
+(Phase 19), `GET /api/v1/admin/checks/latest` (Phase 20, read-only, `operations`/`system_admin`).
+Every mutation (create, edit, cancel, recurring confirm, recurring-series cancel,
 waitlist join, waitlist cancel, offer confirm, offer decline, user deactivate) is idempotent
 (Phase 5/7/12/14/16/19 — `Idempotency-Key` is required; missing it is 400) — EXCEPT resource
 CRUD and admin-scope grants (Phase 19), which Spec v1.0 §7's coverage list never names. Edit is
@@ -437,6 +469,37 @@ centrally, means a future endpoint can't forget to apply it. `POST /auth/token` 
 unaffected (minting a session token isn't "using the API" yet) — the check fires on the very
 next real request.
 
+Correctness monitoring (Phase 20, PRD v1.0 M2/M3; RFC v1.0 §14; Rollout v1.0 RUNBOOK-01) — the
+two checks that prove in production the core guarantee still exists, both scheduled hourly and
+also runnable synchronously via `manage.py run_correctness_checks` (the "on every deploy"
+trigger). `kairos/core/schema_assertion.py`'s `check_schema_assertion` detects the CAUSE — the
+`no_overlapping_bookings` constraint missing, or its predicate narrowed to `'confirmed'` alone
+(Rollout RUNBOOK-01 cause #1) — by reusing the EXACT query `tests/test_schema_assertion.py` has
+run since Phase 3 (`get_no_overlapping_bookings_definition`, now a shared function both call, so
+the CI-tier check and the production job can never independently drift apart on what counts as
+"the predicate looks right"). `kairos/core/reconciliation.py`'s `check_reconciliation` detects
+the CONSEQUENCE — a self-join for overlapping `confirmed`/`held` bookings on the same resource,
+using the identical `&&` range operator `no_overlapping_bookings` itself is defined with, so
+`[)` bound semantics (RUNBOOK-01 cause #4's adjacency false-positive) are respected automatically
+rather than reimplemented by hand. Both write a `system_check_run` heartbeat every run, pass or
+fail, surfaced via the new `GET /api/v1/admin/checks/latest` (`operations`/`system_admin`;
+Spec v1.0 §5.15) — all six checks in Spec's own example order, a check that has never run
+reported as honest `null`/`null`/`{}` rather than a faked pass. The reconciliation failure
+message is a TESTED property of the payload (RECON-04), not documentation: it states the
+guarantee has been REMOVED — a dropped constraint, a restore taken without it, or an
+out-of-band write — and explicitly negates "a race occurred" as the correct reading, since an
+on-call engineer who reads a hit that way investigates the wrong thing under pressure.
+`kairos/core/heartbeat.py`'s `heartbeat_is_stale` generalizes Phase 17's hold_reaper-only
+staleness check once four more background jobs needed the identical logic — `offer_cascade`
+(Phase 16) had NO heartbeat writer at all before this phase; `create_offer_for_freed_range` now
+writes one on every run (found an eligible entry or not), closing the one gap among the four
+RECON-06 names. Both RECON-01 (inject a violation, drop the constraint, confirm the query
+catches it, then restore and confirm the identical insert fails again) and RECON-05's
+predicate-narrowing case were verified against the isolated, disposable `kairos_test` only —
+never staging or production, Test Plan v1.0's own explicit instruction — plus RECON-05's second
+case (narrowed predicate) was ALSO verified live against real `kairos_dev`, inside an explicit
+`BEGIN`/`ROLLBACK` so nothing was ever actually left modified.
+
 Real authentication (Phase 9, RFC v1.0 §4): `Authorization: Bearer <session-token>`, validated
 by `OIDCSessionAuthentication`. A client obtains that session token via `POST /auth/token`
 with a verified OIDC ID token — in dev/test, `POST /auth/dev-mock-login` mints one against a
@@ -490,11 +553,12 @@ DSN (`kairos_app` deliberately has no DDL rights) — see "Running Locally" belo
 | 17 | Dual Reclamation: Reaper & Cleanup-on-Write ⚠️ CRITICAL | Both RFC v1.0 §10.4 mechanisms, because a constraint predicate cannot express expiry and neither alone suffices. Mechanism 1 — cleanup-on-write: a `DELETE FROM booking WHERE resource_id=... AND status='held' AND expires_at<=now() AND time_range && tstzrange(...)`, added inside `create_booking`'s (`kairos/bookings/services.py`) own transaction, immediately before the INSERT, unconditionally for EVERY caller (ordinary booking, recurring occurrence, rolling materialization, the cascade worker's own hold creation) — with the RFC v1.0 §10.1-style load-bearing comment (Implementation Plan §1.3 item 5) at the DELETE's own call site. Mechanism 2 — the reaper: `reap_expired_holds` (`kairos/waitlist/services.py`), scheduled via `CELERY_BEAT_SCHEDULE` at the new `HOLD_REAPER_INTERVAL_SECONDS` (default 30s, `core/constants.py`) — one independent transaction per expired hold (mirroring `confirm_recurring_series`/`rolling_materialize_series`'s per-occurrence isolation), reclaiming each via the IDENTICAL conditional-UPDATE-to-`cancelled` shape `accept_offer` races against, cascading via the SAME `create_offer_for_freed_range` cancellation/decline already use, and writing a `system_check_run` heartbeat (`check_name='hold_reaper'`) every run regardless of findings. `hold_reaper_heartbeat_is_stale` reads that heartbeat back — WL-05 Part B's actual mechanism, scoped honestly to the DATA a future alert would consume (full alert routing and `GET /admin/checks/latest` are Phase 21, not built here). `dispatch_cascade` (new, `kairos/waitlist/tasks.py`) is now the ONE place `create_offer_for_freed_range_task.delay(...)` is called from (`cancel_booking` and `decline_offer` both go through it) — wraps the call in `try/except` so a broker outage degrades (logs `cascade_dispatch_failed_broker_unavailable`) rather than raising out of a `transaction.on_commit()` callback and turning an already-committed, successful cancel/decline into an apparent request failure. RECLAIM-01 (booking succeeds over a stale hold with no reaper running, hold genuinely gone via DELETE — not superseded), RECLAIM-02 (reaper cascades to the next eligible entry with zero booking traffic, proven by calling `reap_expired_holds` directly — Test Plan's own "controllable time" requirement, not a real 30s wait), and RECLAIM-03 (100 barrier-released runs, cleanup-on-write's DELETE+INSERT racing the literal RFC v1.0 §10.3 acceptance UPDATE, correctness inferred by correlating outcomes since a party's own DELETE rowcount isn't directly observable through the harness) all pass. RECLAIM-04 (200 writers × 50 runs, N=200-identical-slot-style contention plus 4 pre-seeded expired holds cleanup-on-write must clear every attempt) was ACTUALLY RUN at full DoD-specified scale, not merely written: **269 real SQLSTATE 40P01 deadlocks occurred, in roughly half of the 50 runs** (some runs: zero; others: 9–16) — not the "zero deadlocks" the DoD's literal text names. Per this phase's own explicit instruction, this is the SECOND of the two anticipated honest outcomes, not a phase failure: safety held on every single one of the 10,000 attempts (never more than one success per round, 50/50), zero unexplained SQLSTATEs, zero rounds even needed the zero-success retry budget, and 40P01 was ALREADY a documented, retryable SQLSTATE `BookingService` treats as 503 (Phase 4) before this phase ever ran — cleanup-on-write's extra DELETE measurably raises deadlock frequency versus CONC-01's own N=200 baseline (empirically ~2/10 runs there), a real, honestly-reported finding, not a design failure requiring cleanup-on-write's removal. RECLAIM-04 is deliberately EXCLUDED from the default `pytest tests/concurrency` CI sweep (`.github/workflows/ci.yml` now `--ignore`s it) — Test Plan v1.0 §13 places it in the staging/pre-release tier, not CI tier, the identical tiering CONC-01's own full-scale escalation already has. WL-05 Part A and WL-06 were verified LIVE against the real `docker compose` stack — genuinely stopping `beat`/`redis` containers (`docker compose stop beat` / `stop redis`), not mocked — per this phase's own explicit instruction that a mocked simulation would not prove what RFC v1.0 §4.3's real degradation behavior requires: Part A seeded a hold expiring in 3s with `beat` stopped, confirmed it sat `status='held'` 12+ seconds past expiry with zero error anywhere in the worker/server logs; WL-06 stopped `redis` and confirmed, over real HTTP against `manage.py runserver` under `kairos.settings.dev` (real, non-eager Celery — `CELERY_TASK_ALWAYS_EAGER` is test-settings-only): booking creation (201) and cancellation (200) both succeeded, cancellation's cascade dispatch failed with a genuine `kombu.exceptions.OperationalError` caught and logged by `dispatch_cascade` rather than crashing the response, a booking over an expired hold succeeded via cleanup-on-write (the stale hold row was gone afterward) with zero `waitlist_offer` rows ever created, and the worker reconnected cleanly once `redis` restarted. WL-05 Part B is covered by ordinary pytest (`hold_reaper_heartbeat_is_stale`); `test_dispatch_cascade.py` is a lightweight automated regression guard for the try/except itself (`CELERY_TASK_ALWAYS_EAGER` means pytest can never reproduce a genuine broker outage — this only protects against someone removing the try/except later). Full suite: 236 tests (223 + 13 new — RECLAIM-04 counted but excluded from the routine sweep), no regressions | Pending (on branch `phase-17-dual-reclamation`) |
 | 18 | Notifications | `NotificationService` (`kairos/core/notifications.py`) is a thin wrapper over Django's own `EMAIL_BACKEND` abstraction (console in dev, real SMTP in prod, `locmem` — Django's own capturing backend, `django.core.mail.outbox` — in test) rather than a bespoke backend hierarchy — reusing a framework guarantee instead of reinventing one, the same choice this project already made for `CompositePrimaryKey`/`set_config`/Postgres triggers. Every `notify_*` builder function only constructs a subject/body and calls `kairos/core/tasks.py`'s new `dispatch_notification`, which enqueues `send_notification_task.delay(...)` and returns immediately — the actual `send_mail()` call happens inside that Celery task, in a worker process, NEVER inline in an HTTP request thread or inside a request-path transaction (RFC v1.0 §15a). `dispatch_notification` mirrors `kairos.waitlist.tasks.dispatch_cascade` (Phase 17) exactly: wraps `.delay()` in `try/except` so a broker outage degrades (logged `notification_dispatch_failed_broker_unavailable`) rather than propagating out of `cancel_booking`'s `transaction.on_commit()` callback. `send_notification_task` is `autoretry_for=(Exception,)`, `retry_backoff=True`, `max_retries=NOTIFICATION_MAX_RETRIES` (PRD FR55's "recorded and retried") — the delivery logic itself lives in a plain function, `_execute_notification_delivery`, callable directly so a test can drive a failure-then-success sequence without depending on Celery's own retry scheduling/timing, the same "test the mechanism directly" precedent `expand_occurrences`/`reap_expired_holds` already established. New schema, `NotificationLog` (`kairos/core/models.py`, migrations 0010-0011) — Spec v1.0 §3 has zero notification concept at all, the identical kind of gap Phase 9's `user_group` table filled — one row per logical notification, `attempts` accumulating and `status` (`pending`/`sent`/`failed`) reflecting the latest outcome across every retry; `kairos_app` granted SELECT/INSERT/UPDATE (no DELETE, no audit trigger — this table is itself a delivery-outcome log, the same category as `system_check_run`, not one of the five audited business-state entities). Four of the five notification points wired to real callers: `notify_offer_created` (PRD FR52, expiry stated explicitly in the subject line) from `create_offer_for_freed_range` right after the offer row commits; `notify_admin_cancellation` (PRD FR53, includes the recorded reason) from `cancel_booking`'s SECOND `on_commit` hook, gated on `actor_type=ADMIN` so a self-cancel never triggers it; `notify_rematerialization` (PRD FR54) from `rematerialize_stale_series` on each successfully-recomputed occurrence; and `notify_rematerialization_conflict` (PRD FR13b, a genuine completion of Phase 13's own "resource_administrators: pending Phase 18 delivery" placeholder, not new scope) to both the series owner and every resource administrator scoped to that specific resource on a conflict. The fifth, `notify_rollback_hold_released` (Rollout v1.0 §4.5), was built per this phase's own explicit clarification: the template/message content and send mechanism exist and are fully tested standalone (distinct, non-generic wording from an ordinary offer-expiry notification — explicitly names the rollback, explicitly states queue position was preserved, deliberately avoids any "expire" framing), but NO real production trigger was invented for it — Rollout §4.5's hold release is a manual operational runbook (SQL an operator runs during an incident), not application code any phase has built, and manufacturing a fake caller just to wire one up would have been scope beyond this phase's actual job (see Open Questions). Definition of Done verified: all four wired notification points fire, proven via the capturing (`locmem`) backend; offer-created states the expiry explicitly; a simulated provider outage (patching `send_notification_task.delay` to raise) does NOT fail the underlying admin-cancellation — the booking still commits `CANCELLED`, proven directly; every dispatch call site is either inside a `transaction.on_commit()` callback or a worker context with no open transaction — verified by reading the code, no synchronous dispatch from a request-path transaction anywhere; rollback-hold-released messaging asserted distinct from ordinary offer-created messaging by direct content comparison. Full suite: 238 tests (225 + 13 new), no regressions, plus all 10 CI-tier concurrency tests re-run clean (this phase's changes touch `cancel_booking`, a CONC/WL/RECLAIM-exercised function). ⚠️ **Real bug caught by rebuilding the worker's Docker image and re-reading its startup banner** — `send_notification_task` was silently absent from the running worker's task list after a plain `docker compose restart` (which reuses the existing, stale image rather than rebuilding); fixed with `--build`, then re-verified live: the rebuilt worker's banner lists all six tasks, a deliberately malformed dispatch demonstrated genuine exponential retry-with-backoff (1s/0s/4s/2s/6s, jittered) against the real Redis broker before failing cleanly once `NOTIFICATION_MAX_RETRIES` was exhausted, and a valid dispatch printed the full email to the worker's console `EMAIL_BACKEND` and left exactly one `notification_log` row (`status='sent'`, `attempts=1`), confirmed via `psql` against `kairos_dev` — see Key Technical Decisions | Pending (on branch `phase-18-notifications`) |
 | 19 | Resource Administration & Offboarding | Resource CRUD (Spec v1.0 §5.14) is real: `POST /api/v1/resources` (`system_admin`-only, 403 not 404 — capability-gated), `PATCH /api/v1/resources/{id}` (resource admin or `system_admin`, Spec's own literal updatable-field list — `restricted_group` deliberately excluded, it names nowhere in that list), `POST`/`DELETE /resources/{id}/admins` (409 `already_resource_admin` — new domain exception, NOT a `RecordableConflictError`, since neither endpoint carries `Idempotency-Key`), and `GET /admin/resources/{id}/utilization` (resource admin/operations/`system_admin`; `total_bookings`/`total_booked_minutes`/`waitlist_joins`/`cancellation_count`/`offers_confirmed`/`offers_expired` over a `starts_at`-delimited date range — the same filter shape every other date-range list endpoint in this codebase already uses). No `DELETE /resources/{id}` exists anywhere, confirmed by a real 405 test — Spec's own reasoning (referential integrity/audit history). New `kairos/resources/services.py` applies write-path session settings on every write (resource/`resource_admin` are two of the five audited tables) despite carrying no idempotency wrapper at all — Spec v1.0 §7 never names these five endpoints in its coverage list. `POST /admin/users/{id}/deactivate` (Spec v1.0 §5.15; PRD FR49-51; `system_admin`-only, `Idempotency-Key` required — Spec DOES name this one) is the real offboarding cascade, `kairos.identity.services.deactivate_user`: each one-off future confirmed booking is transferred (to the resource's FCFS-earliest-granted admin, via new `transfer_booking_ownership`), cancelled-and-notified (reusing `cancel_booking` + Phase 18's `notify_admin_cancellation`), or retained, per that booking's OWN resource's `offboarding_policy` (a column Spec's DDL already defined, default `'transfer'` — PRD open question 8, "which policy is the default," was answered by the schema itself, not invented this phase). Outstanding holds/offers are released via the EXISTING `decline_offer` (hold release + cascade, PRD FR50, reused unchanged) and `WAITING` waitlist entries via the EXISTING `cancel_waitlist_entry` — both gained a new `actor_type` parameter (default `USER`, Phase 19 passes `SYSTEM`), the same "extend the existing function" pattern `create_booking`/`edit_booking` already established for `actor_type` in Phase 13. Active recurring series are flagged (PRD FR51) — reported in the response body and, when a resource admin exists, notified via new `notify_series_owner_deactivated` — no endpoint to actually transfer/terminate one exists anywhere (same FR16 gap Phase 12 already flagged). The whole cascade runs inside ONE shared `run_idempotent_write` transaction, matching `cancel_recurring_series`'s (Phase 12) identical reasoning: nothing here contends with the exclusion constraint the way CREATE does. ⚠️ **Real, if narrow, bug found and fixed**: `cancel_booking`'s session-settings call always used `req.actor.id` as `actor_id` regardless of `actor_type`, unlike `create_booking`/`edit_booking`'s established NULLIF-for-SYSTEM convention — invisible until Phase 19 became the first caller to pass `actor_type=SYSTEM` into it (the `cancel_and_notify` offboarding path); fixed to match, verified via OFF-01's own `audit_log.actor_id IS NULL` assertion. OFF-02 ("a deactivated user cannot book, waitlist, or confirm") is enforced at the AUTHENTICATION layer — both `OIDCSessionAuthentication` and `StubUserIdAuthentication` now reject a `status='deactivated'` `AppUser` with a real 401, checked once centrally rather than per-endpoint, so a still-unexpired session token can't keep acting and a future endpoint can't forget the check. `request_id()` (`kairos/core/views.py`) is extracted from four near-identical local copies (bookings/waitlist/resources/identity views.py) — this project's own "worth extracting once real duplication exists" threshold (`RecordableConflictError`, Phase 16), reached again. OFF-01 ★ passes as the full documented scenario (2 transferred, 1 cancelled-and-notified, 1 retained, 3 waitlist entries cancelled, 1 outstanding hold released AND proven to cascade to a genuinely next-eligible entry, 1 series flagged, every cascade action audited `actor_type='system'` with the offboarding reason, zero bookings left in an undefined state) plus a repeat-deactivation idempotent-no-op test; OFF-02 covers create/join/confirm, each asserting a real 401. Verified LIVE against the real dev server and `kairos_dev`, not just pytest: a full create-resource→grant-admin→PATCH→utilization round trip over real HTTP, then a real booking genuinely transferred `user_id` on deactivation (confirmed via `psql`, `audit_log.actor_type='system'`/`actor_id IS NULL`), then a deactivated user's freshly-minted session token rejected with a real 401 on the very next request. Full suite: 259 tests (238 + 21 new), no regressions, plus all 10 CI-tier concurrency tests re-run clean (405s) — this phase's `cancel_booking`/authentication.py changes sit directly in CONC-03/04/05, HOLD-01/02, WL-01–03, RECLAIM-01–03's own code paths | Pending (on branch `phase-19-admin-offboarding`) |
+| 20 | Reconciliation & Schema Assertion ⚠️ CRITICAL | The two checks that prove in production the core guarantee still exists (PRD M2/M3; RFC v1.0 §14). `kairos/core/schema_assertion.py` detects the CAUSE: `get_no_overlapping_bookings_definition()` is Phase 3's OWN `pg_get_constraintdef` query, extracted so `tests/test_schema_assertion.py` and the scheduled production job (`check_schema_assertion`) call the IDENTICAL function — explicit instruction this phase, since two independently-written copies could silently drift apart and disagree about a real predicate narrowing. `kairos/core/reconciliation.py` detects the CONSEQUENCE: a self-join for overlapping `confirmed`/`held` bookings using the SAME `&&` range operator `no_overlapping_bookings` itself is defined with, so `[)` bound semantics (Rollout RUNBOOK-01 cause #4's adjacency false-positive) are respected automatically, never hand-rolled. Both write a `system_check_run` heartbeat every run, scheduled hourly via Celery Beat and also runnable synchronously via new `manage.py run_correctness_checks` (RFC v1.0 §14's "on every deploy" trigger, exits non-zero on failure, the same pattern Phase 13's `rematerialize_series` established). New `GET /api/v1/admin/checks/latest` (Spec v1.0 §5.15; `operations`/`system_admin`) surfaces all six checks in Spec's own example order — a check that has never run reports honest `null`/`null`/`{}`, never a faked pass. `kairos/core/heartbeat.py`'s `heartbeat_is_stale` generalizes Phase 17's hold_reaper-only staleness check once RECON-06 needed the identical logic for `offer_cascade`/`series_materialization`/`tzdata_rematerialization` too — `offer_cascade` (Phase 16) had NO heartbeat writer at all before this phase; `create_offer_for_freed_range` now writes one every run, closing that gap so all four RECON-06-named jobs are genuinely covered, not three of four. The reconciliation failure message is a TESTED property of the payload (RECON-04), not documentation — it states the guarantee has been REMOVED and explicitly negates "a race occurred" as the correct reading. RECON-01 (inject, catch exactly the two flagged rows, restore, confirm the identical insert fails again with 23P01) and RECON-05's SECOND case (RUNBOOK-01 cause #1 itself — the constraint still exists, `pg_constraint` still returns it, but the predicate no longer covers `'held'`, exactly the case a bare existence check would miss) both pass, and RECON-05's narrowed-predicate case was ALSO verified manually, per this phase's own explicit instruction, live against real `kairos_dev` inside an explicit `psql` `BEGIN`/`ROLLBACK` — never staging or production left actually modified. RECON-02+08 share one ~1,000-row dataset (a deliberate CI-tier scale-down from Test Plan's literal "hundreds of resources, thousands of bookings," documented as such) including a CANCELLED booking DELIBERATELY overlapping a CONFIRMED one — the actual false-positive risk RECON-02 exists to catch, not merely a query returning zero against inert data — asserting both zero false positives and query cost within a generous CI budget. RECON-03+04 seed a violation, run the FULL scheduled job (not the bare query), hit the REAL `GET /admin/checks/latest` endpoint, and assert both the `fail` status and the exact alert-text content. RECON-06 is parametrized across all four named background jobs against the one shared `heartbeat_is_stale` function. ⚠️ **Real bug caught by the first test that actually exercised the FAIL branch**: both check functions originally did `logger.error(event, extra=findings)` where `findings` contained a key literally named `"message"` — Python's `logging` module reserves that name on every `LogRecord`, raising `KeyError` at the first real failure, not on the happy path any earlier code exercised. Fixed by excluding that key from `extra=` on both call sites. Verified LIVE against the real Docker stack: the worker rebuilt (`--build`, Phase 18's own "restart doesn't rebuild" lesson applied again) and its banner confirmed both new tasks registered (eight total); both dispatched manually against real `kairos_dev` data (`covers_confirmed`/`covers_held` both `true`, `overlaps_found: 0`); `manage.py run_correctness_checks` run directly, exit 0; the real endpoint queried over HTTP as a real `operations` user showed all six checks correctly, including `offer_cascade` honestly `null` (never triggered this session). Full suite: 273 tests (259 + 14 new), no regressions, plus all 10 CI-tier concurrency tests re-run clean (454s) | Pending (on branch `phase-20-correctness-monitoring`) |
 
 ## Current Phase In Progress
 
-None. Phase 19 is complete pending review and merge. Phase 20 (Reconciliation & Schema
-Assertion) is next.
+None. Phase 20 is complete pending review and merge. Phase 21 (Full Correctness Monitoring —
+alert routing) is next.
 
 ## NOT Yet Built
 
@@ -539,9 +603,13 @@ conflict; `create_offer_for_freed_range` dispatches `notify_offer_created` right
 offer commits. A fifth notification type, `notify_rollback_hold_released` (Rollout v1.0
 §4.5), is built and independently tested but has NO real production caller — Rollout §4.5's
 hold release is a manual operational runbook, not application code any phase automates; see
-Open Questions. Full six-check monitoring/alerting/
-heartbeats (RFC §14) is Phase 21; Phase 13 only WRITES `system_check_run` rows, it doesn't yet
-alert on staleness or absence of a run. No replica routing (Phase 30 — `data_freshness` is
+Open Questions. All six correctness/background-job checks now WRITE a `system_check_run`
+heartbeat (Phase 20 closed the last gap, `offer_cascade`) and staleness is DETECTABLE from that
+data via `kairos.core.heartbeat.heartbeat_is_stale`, surfaced read-only via
+`GET /api/v1/admin/checks/latest` — but full ALERT ROUTING (paging, Slack, PagerDuty — actually
+notifying an on-call human when a check fails or goes stale) remains Phase 21; nothing before it
+alerts on staleness or absence of a run, it only makes staleness queryable. No replica routing
+(Phase 30 — `data_freshness` is
 hardcoded `"primary"`, always true today since no replica exists). The audit trail covers
 `booking`/`resource`/`resource_admin`/`waitlist_entry`/`waitlist_offer` (Phase 16 adds the
 last one) — `actor_type='unknown'` alerting (as opposed to just recording the row) is Phase
@@ -760,6 +828,13 @@ and `git log` first.
 | The entire offboarding cascade (`deactivate_user`) runs inside ONE shared `run_idempotent_write` transaction, not `run_idempotent_recurring_confirm`'s claim-then-N-independent-transactions-then-record shape | `kairos.core.idempotency`'s OWN module docstring named "admin deactivate: Phase 19" as a future `run_idempotent_write` caller back in Phase 5 — honored here, and for the same underlying reason `cancel_recurring_series` (Phase 12) already chose the single-transaction shape over confirm's split one: every write this cascade performs (transfer, cancel, hold release, entry cancel) moves rows OUT of or SIDEWAYS from the exclusion domain, never into a newly-contested one, so there is no "one contested item" isolation problem CREATE-shaped writes have. Each individual cascade step still opens its own nested `atomic()` (a savepoint) via the write function it reuses, matching every other write function in this codebase regardless of whether it's always called through `run_idempotent_write` | `kairos/identity/services.py` (`deactivate_user`) |
 | OFF-02 is enforced inside `OIDCSessionAuthentication`/`StubUserIdAuthentication.authenticate()` (both), not as a DRF permission class layered on `IsAuthenticated` | A permission class only runs for views that declare it — a future endpoint could simply forget to add the check, the exact "selectively restricted rather than genuinely locked out" gap a real offboarded-employee scenario cannot tolerate. Checking once, at authentication time, in the ONE place `request.user` gets resolved for every request through either authenticator, means there is no view-by-view decision to get wrong | `kairos/identity/authentication.py` (`_reject_if_deactivated`) |
 | ⚠️ **Real gap fixed this phase, exposed only by being the first caller to pass `actor_type=SYSTEM` into `cancel_booking`**: its session-settings call always used `req.actor.id` as `actor_id`, unlike `create_booking`/`edit_booking`'s established NULLIF(...,'')-for-SYSTEM convention (Phase 13) | Never observable before Phase 19: every prior caller of `cancel_booking` passed `actor_type=USER` or `ADMIN`, both with a real human actor, so the unconditional `actor_id=str(req.actor.id)` always happened to be correct by coincidence. The offboarding cascade's `cancel_and_notify` path is the first call with `actor_type=SYSTEM` — fixed to match `create_booking`/`edit_booking` exactly (empty string for SYSTEM), verified directly by OFF-01's own `audit_log.actor_id IS NULL` assertion on the affected row, not merely by code inspection | `kairos/bookings/services.py` (`cancel_booking`) |
+| `tests/test_schema_assertion.py`'s original RECON-05 query (Phase 3) was extracted into `kairos.core.schema_assertion.get_no_overlapping_bookings_definition` and the CI test rewritten to call it, rather than the production job writing a SECOND copy of the same SQL | Explicit instruction this phase: "if the existing Phase 3 test and this phase's new job end up checking the predicate two different ways, that's a bug." One function, two callers (CI-tier test, scheduled production job) is the only way to make that structurally impossible rather than merely unlikely — a predicate-narrowing bug could otherwise pass one copy and fail the other if they silently drifted apart over time | `kairos/core/schema_assertion.py`, `tests/test_schema_assertion.py` |
+| Reconciliation's self-join uses the range `&&` operator — the SAME operator `no_overlapping_bookings` itself is defined with (`time_range WITH &&`) — rather than hand-written boundary comparisons (`b1.end > b2.start AND b2.end > b1.start`, etc.) | Rollout v1.0 RUNBOOK-01 names a query whose overlap definition doesn't match `tstzrange`'s own `[)` (inclusive-start, exclusive-end) semantics as cause #4 — a real false-positive risk for hand-rolled boundary logic. Reusing the identical operator the constraint itself uses makes correct-adjacency-handling automatic rather than a second implementation to keep in sync with Postgres's own range semantics | `kairos/core/reconciliation.py` (`find_overlapping_active_bookings`) |
+| ⚠️ **Real bug caught by the first test that actually triggered the FAIL branch**: both `check_schema_assertion` and `check_reconciliation` originally did `logger.error(event, extra=findings)` where `findings` contained a key literally named `"message"` | Python's `logging` module reserves `"message"` as an attribute name on every `LogRecord` — passing it through `extra=` raises `KeyError: "Attempt to overwrite 'message' in LogRecord"` at the FIRST failing run, not at import time or on the happy path, so no earlier test (which only ever exercised the PASS branch) could have caught it. Fixed by excluding that one key from the dict passed to `extra=` on both call sites; the `findings` dict returned to the caller (and persisted to `system_check_run`) keeps `"message"` unchanged | `kairos/core/schema_assertion.py`, `kairos/core/reconciliation.py` |
+| `heartbeat_is_stale` (Phase 20) is ONE generic function in `kairos/core/heartbeat.py`, not five bespoke per-check versions | `hold_reaper_heartbeat_is_stale` (Phase 17) was the only one that existed before this phase; RECON-06 needs the identical staleness logic for `offer_cascade`/`series_materialization`/`tzdata_rematerialization` too. Extracted once a FOURTH near-identical version would otherwise have been written — this project's own "worth extracting once real duplication exists, not before" threshold, applied a third time (`RecordableConflictError`, Phase 16; `request_id()`, Phase 19). Each check keeps its own thin, differently-named wrapper (own default threshold, own docstring) purely for call-site readability — the STALENESS LOGIC itself lives in exactly one place | `kairos/core/heartbeat.py` |
+| `offer_cascade` gained a real `system_check_run` heartbeat writer this phase, even though Phase 20's own Scope IN only explicitly names reconciliation + schema assertion as new checks to BUILD | RECON-06 (explicitly in scope via "Tests RECON-01 through RECON-08") names `offer_cascade` as one of the four background jobs to individually stall and verify — but `create_offer_for_freed_range` (Phase 16) had never written one at all. A small, well-precedented addition (the identical shape `reap_expired_holds`/the materialization jobs already use) to let RECON-06 be genuinely true for all four named checks, not three of four — the same "complete an already-half-built mechanism" reasoning Phase 18 used for `notify_rematerialization_conflict` | `kairos/waitlist/services.py` (`_record_offer_cascade_heartbeat`) |
+| RECON-02/RECON-08's dataset is 50 resources × 20 bookings (≈1,000 rows), not Test Plan v1.0's literal "hundreds of resources, thousands of bookings" | A CI-tier scale-down, the identical reasoning CONC-01's own reduced form already established (100 runs → 10) — documented explicitly in the test's own docstring, not silently substituted. Deliberately includes a CANCELLED booking overlapping a CONFIRMED one on the same resource (legal, since cancelled rows sit outside the constraint's predicate) specifically to exercise the WHERE-clause bug RECON-02 exists to catch, not just prove the query returns zero against inert data. Full PRD A1-scale timing is a staging-tier measurement (Test Plan v1.0 §13), same tier RECLAIM-04's full-scale form already lives in | `tests/test_reconciliation.py` |
+| RECON-01 and RECON-03/04's tests use `@pytest.mark.django_db(transaction=True)`, not the default rollback-wrapped `db` fixture | `DELETE`/further DDL in the SAME transaction as an earlier `ALTER TABLE ... ADD CONSTRAINT` raises a genuine Postgres error ("cannot ALTER TABLE because it has pending trigger events") when the audit trigger's pending AFTER-DELETE event hasn't been processed yet — caught empirically, not anticipated. Real, separately-committed statements (`transaction=True`) sidestep this entirely, the same real-commit requirement WL-01/WL-02 (Phase 16) already established for their own on_commit-triggered behavior | `tests/test_reconciliation.py`, `tests/test_admin_checks.py` |
 
 ## Running Locally
 
@@ -789,9 +864,10 @@ token; `POST /api/v1/auth/token` exchanges it for the session token every other 
 Background jobs (Phase 13) — `docker compose up -d` (the same command above) now ALSO starts
 `redis`, `worker`, and `beat`; nothing extra to run. Verified live: both containers connect
 to Redis and Postgres (as `kairos_app`) successfully, the worker's own startup log lists all
-registered tasks (six as of Phase 18 —
+registered tasks (eight as of Phase 20 —
 `rolling_materialize_series_task`/`rematerialize_stale_series_task`/`check_tzdata_drift_task`/
-`create_offer_for_freed_range_task`/`reap_expired_holds_task`/`send_notification_task`), and a
+`create_offer_for_freed_range_task`/`reap_expired_holds_task`/`send_notification_task`/
+`run_reconciliation_task`/`run_schema_assertion_task`), and a
 manually dispatched task of each kind completed successfully against the real running worker.
 `manage.py rematerialize_series` runs both materialization jobs synchronously, once, without
 a worker at all — the "on deploy" trigger RFC v1.0 §9.4 asks for, sharing the exact same
@@ -848,6 +924,24 @@ corresponding `audit_log` row showed `actor_type='system'`/`actor_id` NULL — n
 the response body alone. Then, with a FRESH session token minted for that same now-deactivated
 user (proving token minting itself is unaffected — only USING the API is blocked), a real
 `GET /resources` request returned a genuine 401, confirming OFF-02 live.
+
+Correctness monitoring (Phase 20) — verified live against the real Docker stack. The worker was
+rebuilt (`docker compose up -d --build worker beat`, the exact "restart doesn't rebuild"
+precedent from Phase 18) and its startup banner confirmed both `run_reconciliation_task`/
+`run_schema_assertion_task` registered (eight tasks total). Both dispatched manually against
+`kairos_dev`'s real data: `schema_assertion` returned the real constraint definition
+(`covers_confirmed`/`covers_held` both `true`), `reconciliation` returned `overlaps_found: 0` —
+`kairos_dev` is genuinely healthy. `manage.py run_correctness_checks` run directly against
+`kairos_dev`, exit code 0. `GET /admin/checks/latest` queried over real HTTP as a real
+`operations`-role user showed all six checks in Spec's own order — `hold_reaper`/
+`series_materialization`/`tzdata_rematerialization` with real historical timestamps from Beat's
+own scheduled runs, `offer_cascade` honestly `null` (never triggered this session, not faked as
+healthy). RECON-05's predicate-narrowing case (RUNBOOK-01 cause #1) was separately verified live
+against `kairos_dev` itself, not just `kairos_test`: inside an explicit `psql` `BEGIN`/`ROLLBACK`,
+the constraint was narrowed to `'confirmed'` alone, `pg_get_constraintdef` confirmed `'held'`
+genuinely gone from the text, the exact substring check `check_schema_assertion` uses correctly
+flagged `covers_held=false`, and the `ROLLBACK` left `kairos_dev`'s real schema completely
+untouched — confirmed by a final `SELECT` showing the healthy definition restored.
 
 The frontend starts Phase 23.
 
@@ -1112,8 +1206,42 @@ deactivation case. OFF-02 — create/join/confirm each asserted as a real 401 ag
 deactivated principal, including the confirm case's "deactivated AFTER receiving the offer,"
 not a principal who could never have reached it.
 
+`tests/test_schema_assertion.py` (Phase 20) — RECON-05 both ways: the original CI-tier
+existence/predicate test (Phase 3, now calling `get_no_overlapping_bookings_definition`
+directly rather than its own copy of the SQL) plus two NEW tests exercising the shared
+`check_schema_assertion` job: a dropped constraint, and — RUNBOOK-01 cause #1, the case a bare
+existence check would miss — a predicate narrowed to `'confirmed'` alone, asserting the FULL
+definition text is what's checked, not merely whether a row exists in `pg_constraint`.
+`tests/test_reconciliation.py` — RECON-01 (inject, catch, restore, confirm the identical insert
+fails again — `transaction=True`, see Key Technical Decisions), RECON-02 + RECON-08 together (one
+~1,000-row dataset: multiple resources, a recurring series, a held row, and a cancelled row
+DELIBERATELY overlapping a confirmed one — the actual false-positive risk RECON-02 exists to
+catch — asserting zero rows AND timing the same query under a generous CI-tier budget).
+`tests/test_admin_checks.py` — permission (`operations`/`system_admin` only), response shape
+(all six checks in Spec's own order, a never-run check reported as honest `null`), RECON-03 +
+RECON-04 together (seed a violation, run the FULL scheduled job — not the bare query — query the
+REAL `GET /admin/checks/latest` endpoint, assert both the `fail` status AND the exact alert-text
+content), and RECON-06 (parametrized across all four named background jobs — `hold_reaper`,
+`offer_cascade`, `series_materialization`, `tzdata_rematerialization` — each individually seeded
+with a stale/fresh heartbeat and asserted against the SAME shared `heartbeat_is_stale` function).
+RECON-07 ("every alert fired at least once by deliberate injection") is satisfied for the
+CI/automated tier by RECON-01/03/05's own genuine constraint-dropping injections (real failures,
+really caught); full alert-ROUTING (paging) verification has no infrastructure to test against
+yet (Phase 21). Verified LIVE against the real dev server, `kairos_dev`, and the real Celery
+worker (rebuilt via `docker compose up -d --build worker beat` — both new tasks registered in the
+worker's own startup banner), not just pytest: `run_reconciliation_task`/`run_schema_assertion_
+task` dispatched against real data and real `kairos_dev` state; the real
+`GET /admin/checks/latest` endpoint queried over HTTP showed all six checks, three with genuine
+historical data from Beat's own scheduled runs and `offer_cascade` honestly `null` (never
+triggered in this session); `manage.py run_correctness_checks` run directly, exit code 0 against
+a healthy `kairos_dev`. RECON-05's predicate-narrowing case was ALSO verified live against real
+`kairos_dev` specifically (not just `kairos_test`) — inside an explicit `BEGIN`/`ROLLBACK` via
+`psql`, confirming the exact substring check `check_schema_assertion` uses correctly detects
+`covers_confirmed=true`/`covers_held=false` on a genuinely narrowed constraint, then confirming
+the `ROLLBACK` left the real schema completely unchanged.
+
 Also runnable: `cd backend && ruff check . && ruff format --check . && mypy kairos` (all pass
-with zero findings as of Phase 19). CI (`.github/workflows/ci.yml`) runs the CI tier as three
+with zero findings as of Phase 20). CI (`.github/workflows/ci.yml`) runs the CI tier as three
 jobs — `lint`, `test`, `concurrency` (RECLAIM-04 excluded, see above) — on every PR. The spike
 scripts under `scripts/spike/` are runnable but are diagnostic, not a test suite — see
 `docs/spikes/S1-postgres-verification.md` for what each one does and its recorded output.
@@ -1275,6 +1403,37 @@ From Phase 19:
   un-Spec'd choice, not a oversight — flagged in case a future consumer of this response needs
   to tell them apart (the `offboarding_transfer_no_resource_admin` warning log is currently the
   only place that distinction survives).
+
+From Phase 20:
+
+- **RECON-01–04 and 06–08 run in the default CI `test` job, even though Test Plan v1.0 §13's
+  own environment tiers place them in STAGING, not CI** (only RECON-05 is explicitly named as
+  CI tier). This was a deliberate choice, not an oversight: the tiering exists because the
+  Test Plan's own literal scale ("hundreds of resources, thousands of bookings," full PRD A1
+  volume) would be too expensive for per-commit execution — but this phase's own tests use a
+  deliberately reduced CI-appropriate scale instead (documented in each test's docstring, the
+  same "CI-tier reduced form" precedent CONC-01 already established). If a future phase adds a
+  genuinely full-scale RECON-02/08 run (matching Test Plan's literal numbers), THAT version
+  belongs in the staging tier, alongside RECLAIM-04 and CONC-01's own full-scale escalation —
+  not this one, and not by expanding this one in place.
+- **`offer_cascade`'s heartbeat semantics are genuinely different from the other five checks,
+  and Rollout v1.0 §6.1's own "no successful run in 90s" alert condition is awkward for it.**
+  The other five are interval-driven (a scheduled sweep that should run roughly every N
+  seconds, so silence past 2-3x N is a real signal); `offer_cascade` only runs when a
+  cancellation/decline/reclaim actually frees a range — long quiet periods with zero
+  cancellations are a NORMAL, healthy state, not staleness. This phase built the heartbeat
+  WRITE mechanism (matching Rollout's literal text) but did not resolve the underlying
+  question of whether "no run in 90s" is even the right alert condition for an event-triggered
+  job — flagged for whichever future phase (most likely 21, when real alert routing is built)
+  actually has to decide what "stale" means operationally for this one check.
+- **Full alert ROUTING (paging a human) is still entirely unbuilt** — `GET /admin/checks/latest`
+  makes every check's current state and history queryable, and `heartbeat_is_stale` makes
+  staleness computable, but nothing in this codebase yet turns a `fail` status or a stale
+  heartbeat into an actual page/Slack message/PagerDuty incident. RECON-07 ("every alert fired
+  at least once by deliberate injection") is satisfied here only for the underlying SIGNAL
+  (RECON-01/03/05's genuine constraint-dropping injections really do produce a real `fail`
+  status, really caught) — there is no alert-routing pipeline yet for a deliberate injection to
+  exercise end-to-end. Phase 21's explicit job.
 
 Genuine open questions from the source documents (offer window duration, nonexistent-time
 policy default, series bounds, etc.) are tracked in PRD v1.0 §11 and RFC v1.0 §18; they get

@@ -17,7 +17,10 @@ from django.utils import timezone as django_timezone
 
 from kairos.bookings.models import Booking, BookingStatus
 from kairos.bookings.services import BookingCreateRequest, create_booking
-from kairos.core.constants import HOLD_REAPER_INTERVAL_SECONDS
+from kairos.core.constants import (
+    HOLD_REAPER_INTERVAL_SECONDS,
+    OFFER_CASCADE_STALE_THRESHOLD_SECONDS,
+)
 from kairos.core.db import apply_write_path_session_settings
 from kairos.core.exceptions import (
     AlreadyOnWaitlistError,
@@ -26,6 +29,7 @@ from kairos.core.exceptions import (
     ServiceUnavailableError,
     SlotUnavailableError,
 )
+from kairos.core.heartbeat import heartbeat_is_stale
 from kairos.core.models import AuditActorType, SystemCheckRun
 from kairos.core.notifications import notify_offer_created
 from kairos.identity.models import AppUser
@@ -221,6 +225,23 @@ def cancel_waitlist_entry(req: WaitlistCancelRequest) -> WaitlistCancelResult:
     return WaitlistCancelResult(entry=entry, already_cancelled=not updated)
 
 
+def _record_offer_cascade_heartbeat(*, offer_created: bool, candidates_tried: int) -> None:
+    """RECON-06 / Rollout v1.0 §6.1: `offer_cascade` is the one heartbeat
+    of the six that's EVENT-triggered (a cancellation/decline/reclaim),
+    not interval-driven — but it shares the same "fails silently, so
+    absence is the only signal" property as the other five, so it needs
+    the identical heartbeat mechanism. Always PASS: "ran and found no
+    eligible entry" is a normal outcome, not a failure — mirrors
+    `reap_expired_holds`'s own "writes a heartbeat every run regardless
+    of findings" precedent (Phase 17).
+    """
+    SystemCheckRun.objects.create(
+        check_name=SystemCheckRun.CheckName.OFFER_CASCADE,
+        status=SystemCheckRun.Status.PASS,
+        findings={"offer_created": offer_created, "candidates_tried": candidates_tried},
+    )
+
+
 def create_offer_for_freed_range(
     resource: Resource,
     freed_start: datetime.datetime,
@@ -302,9 +323,13 @@ def create_offer_for_freed_range(
             expires_at=hold.expires_at,
             request_id=request_id,
         )
+        _record_offer_cascade_heartbeat(
+            offer_created=True, candidates_tried=candidates.index(entry) + 1
+        )
         return offer
 
     logger.info("no_eligible_waitlist_entry", extra=log_context)
+    _record_offer_cascade_heartbeat(offer_created=False, candidates_tried=len(candidates))
     return None
 
 
@@ -550,13 +575,26 @@ def hold_reaper_heartbeat_is_stale(
     alert threshold needs against ordinary jitter; not tuned against real
     data, the same honestly-a-placeholder status HOLD_REAPER_INTERVAL_
     SECONDS itself has (RFC v1.0 §18).
+
+    Delegates to `kairos.core.heartbeat.heartbeat_is_stale` (Phase 20) —
+    this function's own signature/default kept unchanged for every
+    existing caller, but the actual staleness LOGIC now lives in exactly
+    one place, shared with `offer_cascade`/`series_materialization`/
+    `tzdata_rematerialization`'s equivalent checks.
     """
-    now = now or django_timezone.now()
-    latest = (
-        SystemCheckRun.objects.filter(check_name=SystemCheckRun.CheckName.HOLD_REAPER)
-        .order_by("-run_at")
-        .first()
-    )
-    if latest is None:
-        return True
-    return (now - latest.run_at).total_seconds() > threshold_seconds
+    return heartbeat_is_stale(SystemCheckRun.CheckName.HOLD_REAPER, threshold_seconds, now=now)
+
+
+def offer_cascade_heartbeat_is_stale(
+    *,
+    now: datetime.datetime | None = None,
+    threshold_seconds: int = OFFER_CASCADE_STALE_THRESHOLD_SECONDS,
+) -> bool:
+    """RECON-06 (Implementation Plan Phase 20). `offer_cascade` is
+    event-triggered, so "stale" here means "no cancellation/decline/
+    reclaim has freed a range recently enough to exercise this worker"
+    — a genuinely different signal than the interval-driven checks, but
+    checked with the identical mechanism (see `heartbeat_is_stale`'s own
+    docstring for why one shared function, not five bespoke ones).
+    """
+    return heartbeat_is_stale(SystemCheckRun.CheckName.OFFER_CASCADE, threshold_seconds, now=now)

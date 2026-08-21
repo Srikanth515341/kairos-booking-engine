@@ -148,7 +148,15 @@ admin scope over HTTP, with no delete endpoint at all — a resource goes offlin
 intact. Offboarding a user applies a real, per-resource policy to every booking they hold —
 transferred, cancelled with notice, or retained for manual review — releases any slot they were
 sitting on so it reaches the next person waiting rather than expiring uselessly, and locks their
-session out immediately, not just their ability to create new bookings.
+session out immediately, not just their ability to create new bookings. And now the central
+guarantee is provably still true in production, not just in a one-time spike (Phase 20): a
+scheduled schema check re-derives the exclusion constraint's exact definition — not merely
+whether it exists — hourly and on every deploy, so a predicate quietly narrowed during an
+unrelated migration is caught before anyone is ever double-booked; a second, independent check
+looks for the double-booking directly and is structurally incapable of finding one as long as
+the constraint holds. Both are readable through one endpoint, and neither check invented its own
+notion of "overlap" — the reconciliation query reuses the exact range operator the constraint
+itself is built on.
 See
 [`CLAUDE.md`](CLAUDE.md) for exactly what is and isn't built, and
 [`docs/06-implementation-plan.md`](docs/06-implementation-plan.md) for the full 31-phase
@@ -385,7 +393,8 @@ pytest
 | Hold reclamation (reaper + cleanup-on-write) | **Live** — both RFC §10.4 mechanisms, verified against a real Redis outage (RECLAIM-01–04, WL-05/06) (Phase 17) |
 | Notifications | **Live** — offer/admin-cancellation/re-materialization dispatch, async-only, retried with backoff and recorded (PRD FR52–55) (Phase 18) |
 | Resource admin & offboarding | **Live** — resource CRUD, admin-scope grants, utilization, per-resource-policy user deactivation (OFF-01/02) (Phase 19) |
-| Production correctness monitoring | Not started (Phase 20–21) |
+| Reconciliation & schema assertion | **Live** — both checks scheduled + on-deploy, `GET /admin/checks/latest`, RECON-01–08 (Phase 20) |
+| Alert routing (paging) | Not started (Phase 21) |
 | Frontend | Not started (Phase 23–27) |
 | Deployed / live | Not started (Phase 30) |
 
