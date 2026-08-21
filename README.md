@@ -127,7 +127,16 @@ never a moment where an offer is live but nothing is actually holding the range 
 `POST /waitlist-offers/{id}/confirm` accepts an offer atomically (the hold becomes the
 confirmed booking, in place — no second row); `POST /waitlist-offers/{id}/decline` releases it
 immediately and cascades to the next person in line, sooner than the offer would otherwise
-expire. See
+expire. And an unanswered hold can no longer block anything forever (Phase 17): two
+independent mechanisms reclaim it, because a database constraint can't express "now" and
+neither mechanism alone is enough. Every booking write clears any expired hold in its own way
+first, so a stalled background worker — or Redis being completely down — can never make a
+resource permanently unbookable; a periodic sweep separately expires holds and moves the
+waitlist along even when nobody happens to be booking anything at that moment. Verified against
+a real outage, not a simulated one: with Redis actually stopped, booking creation and
+cancellation still succeed, a booking over an expired hold still succeeds, and the only thing
+that degrades is exactly the one thing that should — no new offer goes out until Redis is back.
+See
 [`CLAUDE.md`](CLAUDE.md) for exactly what is and isn't built, and
 [`docs/06-implementation-plan.md`](docs/06-implementation-plan.md) for the full 31-phase
 build plan.
@@ -344,7 +353,7 @@ pytest
 | Waitlist join / list / cancel | **Live** — containment eligibility query (PRD FR21), no offer cascade caller yet (Phase 14) |
 | Holds occupy the exclusion domain | **Live** — proven under concurrency (HOLD-01/02/03) (Phase 15) |
 | Waitlist offers — creation, cascade, accept, decline | **Live** — hold-before-offer (PRD FR23), atomic accept, decline-and-cascade (WL-01/02/03) 🏁 Milestone 3 (Phase 16) |
-| Hold reclamation (reaper + cleanup-on-write) | Not started (Phase 17) |
+| Hold reclamation (reaper + cleanup-on-write) | **Live** — both RFC §10.4 mechanisms, verified against a real Redis outage (RECLAIM-01–04, WL-05/06) (Phase 17) |
 | Notification dispatch | Not started (Phase 18) |
 | Notifications | Not started (Phase 18) |
 | Admin & offboarding | Not started (Phase 19) |

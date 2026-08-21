@@ -6,6 +6,7 @@ from pathlib import Path
 import dj_database_url
 
 from kairos.core.constants import (
+    HOLD_REAPER_INTERVAL_SECONDS,
     ROLLING_MATERIALIZATION_INTERVAL_SECONDS,
     TZDATA_DRIFT_CHECK_INTERVAL_SECONDS,
     TZDATA_REMATERIALIZATION_INTERVAL_SECONDS,
@@ -171,5 +172,9 @@ CELERY_BEAT_SCHEDULE = {
     "check-tzdata-drift": {
         "task": "kairos.core.tasks.check_tzdata_drift_task",
         "schedule": TZDATA_DRIFT_CHECK_INTERVAL_SECONDS,
+    },
+    "reap-expired-holds": {
+        "task": "kairos.waitlist.tasks.reap_expired_holds_task",
+        "schedule": HOLD_REAPER_INTERVAL_SECONDS,
     },
 }

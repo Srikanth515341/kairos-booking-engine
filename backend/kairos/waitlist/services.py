@@ -10,12 +10,14 @@ import datetime
 import logging
 import uuid
 from dataclasses import dataclass
+from typing import Any
 
 from django.db import DatabaseError, connection, transaction
 from django.utils import timezone as django_timezone
 
 from kairos.bookings.models import Booking, BookingStatus
 from kairos.bookings.services import BookingCreateRequest, create_booking
+from kairos.core.constants import HOLD_REAPER_INTERVAL_SECONDS
 from kairos.core.db import apply_write_path_session_settings
 from kairos.core.exceptions import (
     AlreadyOnWaitlistError,
@@ -24,12 +26,12 @@ from kairos.core.exceptions import (
     ServiceUnavailableError,
     SlotUnavailableError,
 )
-from kairos.core.models import AuditActorType
+from kairos.core.models import AuditActorType, SystemCheckRun
 from kairos.identity.models import AppUser
 from kairos.resources.models import Resource
 
 from .models import WaitlistEntry, WaitlistEntryStatus, WaitlistOffer, WaitlistOfferStatus
-from .tasks import create_offer_for_freed_range_task
+from .tasks import dispatch_cascade
 
 logger = logging.getLogger(__name__)
 
@@ -408,11 +410,126 @@ def decline_offer(req: DeclineOfferRequest) -> WaitlistOffer:
         # could leave a worker acting on a range that was never really
         # freed.
         transaction.on_commit(
-            lambda: create_offer_for_freed_range_task.delay(
-                str(resource_id), range_start.isoformat(), range_end.isoformat(), req.request_id
-            )
+            lambda: dispatch_cascade(str(resource_id), range_start, range_end, req.request_id)
         )
 
     offer = WaitlistOffer.objects.get(id=req.offer.id)
     logger.info("offer_declined", extra={**log_context, "outcome": "success"})
     return offer
+
+
+def reap_expired_holds(*, now: datetime.datetime | None = None) -> dict[str, Any]:
+    """RFC v1.0 §10.4 mechanism 2 — the periodic sweep. Cleanup-on-write
+    (`create_booking`, above) only fires when there IS booking traffic;
+    this is what guarantees cascade fires even when nobody is trying to
+    book at all (RECLAIM-02's whole point).
+
+    Each expired hold is reclaimed via the IDENTICAL conditional UPDATE
+    shape `accept_offer` races against (`WHERE id=... AND status='held'
+    AND expires_at<=now()`, guarded — never a blind unconditional update)
+    — this is the race-safety RECLAIM-03 proves: whichever of this
+    UPDATE or acceptance's own conditional UPDATE commits first wins the
+    row outright; the loser's WHERE clause simply matches zero rows on
+    re-evaluation, no application-level lock required (RFC v1.0 §10.4's
+    own "the race... is safe in both orderings" claim).
+
+    One independent transaction per hold, mirroring `confirm_recurring_
+    series`'s per-occurrence isolation (Phase 12) and `rolling_
+    materialize_series`'s per-occurrence isolation (Phase 13) — one
+    contested hold losing its race to acceptance must never roll back
+    the reclamation of every OTHER expired hold in the same sweep.
+    """
+    now = now or django_timezone.now()
+    request_id = str(uuid.uuid4())
+
+    holds_reclaimed = 0
+    cascades_triggered = 0
+    entries_returned_to_waiting = 0
+
+    expired_holds = list(
+        Booking.objects.filter(status=BookingStatus.HELD, expires_at__lte=now).select_related(
+            "resource"
+        )
+    )
+
+    for hold in expired_holds:
+        freed_range: tuple[datetime.datetime, datetime.datetime] | None = None
+        with transaction.atomic():
+            with connection.cursor() as cursor:
+                apply_write_path_session_settings(
+                    cursor, actor_id="", actor_type=AuditActorType.SYSTEM, request_id=request_id
+                )
+            updated = Booking.objects.filter(
+                id=hold.id, status=BookingStatus.HELD, expires_at__lte=now
+            ).update(status=BookingStatus.CANCELLED, cancelled_at=now, expires_at=None)
+            if not updated:
+                # Lost the race — acceptance already claimed this exact
+                # row (RECLAIM-03). Nothing left to reclaim here.
+                continue
+
+            offer = WaitlistOffer.objects.filter(
+                hold_booking_id=hold.id, status=WaitlistOfferStatus.ACTIVE
+            ).first()
+            if offer is not None:
+                WaitlistOffer.objects.filter(id=offer.id).update(status=WaitlistOfferStatus.EXPIRED)
+                WaitlistEntry.objects.filter(id=offer.waitlist_entry_id).update(
+                    status=WaitlistEntryStatus.EXPIRED
+                )
+                entries_returned_to_waiting += 1
+                freed_range = (offer.time_range.lower, offer.time_range.upper)
+
+        holds_reclaimed += 1
+        if freed_range is not None:
+            # Outside the reclaim transaction, same reasoning as every
+            # on_commit-dispatched cascade elsewhere: never attempt a new
+            # hold for a range while the transaction that freed it might
+            # still roll back. Called directly here (not via the Celery
+            # task) — the reaper task itself IS the background worker;
+            # there is no further "after commit" boundary to defer past.
+            new_offer = create_offer_for_freed_range(hold.resource, *freed_range, request_id)
+            if new_offer is not None:
+                cascades_triggered += 1
+
+    findings: dict[str, Any] = {
+        "holds_reclaimed": holds_reclaimed,
+        "cascades_triggered": cascades_triggered,
+        "entries_returned_to_waiting": entries_returned_to_waiting,
+    }
+    SystemCheckRun.objects.create(
+        check_name=SystemCheckRun.CheckName.HOLD_REAPER,
+        status=SystemCheckRun.Status.PASS,
+        findings=findings,
+    )
+    logger.info("hold_reaper_run", extra={"request_id": request_id, **findings})
+    return findings
+
+
+def hold_reaper_heartbeat_is_stale(
+    *,
+    now: datetime.datetime | None = None,
+    threshold_seconds: int = HOLD_REAPER_INTERVAL_SECONDS * 3,
+) -> bool:
+    """WL-05 Part B's actual mechanism: the DATA a future alert would
+    consume, not the alert itself — full alert-routing/the `GET /admin/
+    checks/latest` surface is Phase 21 (Scope — DEFERRED, this phase's own
+    instructions: "Heartbeat alerting → Phase 21, the heartbeat is written
+    here"). A missing heartbeat (the reaper has never run at all) counts
+    as stale too — "no evidence of health" is not health, the same
+    "absence of a heartbeat is the only signal" principle this phase's
+    own Scope IN states explicitly.
+
+    Threshold defaults to 3x the sweep interval — one or two slow/skipped
+    cycles isn't yet an incident, matching the kind of tolerance a real
+    alert threshold needs against ordinary jitter; not tuned against real
+    data, the same honestly-a-placeholder status HOLD_REAPER_INTERVAL_
+    SECONDS itself has (RFC v1.0 §18).
+    """
+    now = now or django_timezone.now()
+    latest = (
+        SystemCheckRun.objects.filter(check_name=SystemCheckRun.CheckName.HOLD_REAPER)
+        .order_by("-run_at")
+        .first()
+    )
+    if latest is None:
+        return True
+    return (now - latest.run_at).total_seconds() > threshold_seconds
