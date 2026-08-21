@@ -7,6 +7,8 @@ cancel, waitlist join, offer confirm, admin deactivate — Phases 7, 14, 16,
 
 from __future__ import annotations
 
+import uuid
+
 from django.core.serializers.json import DjangoJSONEncoder
 from django.db import models
 from django.db.models.functions import Now
@@ -151,3 +153,61 @@ class AuditLog(models.Model):
 
     def __str__(self) -> str:
         return f"{self.entity_type}:{self.entity_id} {self.action} @ {self.occurred_at}"
+
+
+class SystemCheckName(models.TextChoices):
+    # The full six-name set Spec v1.0 §3 defines up front, even though
+    # only the last two get a real writer in Phase 13 — RECONCILIATION/
+    # SCHEMA_ASSERTION (Phase 20), HOLD_REAPER (Phase 17), OFFER_CASCADE
+    # (Phase 16) exist here as CHECK-constraint values a future phase's
+    # migration doesn't need to widen, matching how Spec's DDL states the
+    # full CHECK (...) list once rather than growing it per phase.
+    RECONCILIATION = "reconciliation", "Reconciliation"
+    SCHEMA_ASSERTION = "schema_assertion", "Schema assertion"
+    HOLD_REAPER = "hold_reaper", "Hold reaper"
+    OFFER_CASCADE = "offer_cascade", "Offer cascade"
+    SERIES_MATERIALIZATION = "series_materialization", "Series materialization"
+    TZDATA_REMATERIALIZATION = "tzdata_rematerialization", "Tzdata re-materialization"
+
+
+class SystemCheckStatus(models.TextChoices):
+    PASS = "pass", "Pass"
+    FAIL = "fail", "Fail"
+
+
+class SystemCheckRun(models.Model):
+    """Results surface of the correctness monitors (PRD M2/M3; RFC v1.0
+    §14) — Phase 13 is the first WRITER (`series_materialization`,
+    `tzdata_rematerialization`), not the phase that finishes this table.
+    `status='fail'` means THIS run found something (a conflict, a stale
+    version) — it has no relationship to whether a CI build passes; that's
+    `test_schema_assertion.py`'s job (RECON-05), entirely separate.
+    """
+
+    CheckName = SystemCheckName
+    Status = SystemCheckStatus
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    check_name = models.TextField(choices=SystemCheckName.choices)
+    run_at = models.DateTimeField(db_default=Now())
+    status = models.TextField(choices=SystemCheckStatus.choices)
+    findings = models.JSONField(default=dict, encoder=DjangoJSONEncoder)
+
+    class Meta:
+        db_table = "system_check_run"
+        constraints = [
+            models.CheckConstraint(
+                condition=models.Q(check_name__in=list(SystemCheckName.values)),
+                name="system_check_run_check_name_check",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(status__in=list(SystemCheckStatus.values)),
+                name="system_check_run_status_check",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["check_name", "-run_at"], name="idx_check_run_latest"),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.check_name} @ {self.run_at} ({self.status})"

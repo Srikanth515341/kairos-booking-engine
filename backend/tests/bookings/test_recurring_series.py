@@ -221,12 +221,14 @@ def test_rec_05_per_occurrence_transaction_isolation(
 
 
 @pytest.mark.django_db
-def test_confirm_writes_one_audit_row_per_occurrence_with_independent_commit_times(
+def test_confirm_writes_one_audit_row_per_created_occurrence(
     client: APIClient, app_user: AppUser, active_resource: Resource
 ) -> None:
-    """Implementation Plan Phase 12's explicit instruction: prove each
-    occurrence's commit — and its audit row — is independent, not a
-    single batch write sharing one transaction's `now()`.
+    """Implementation Plan Phase 12's explicit instruction: each
+    occurrence gets its own audit row, correctly attributed. This does
+    NOT by itself prove independent COMMITS — see the correction below and
+    REC-05 (test_rec_05_per_occurrence_transaction_isolation) for that
+    proof, which is airtight; this test's job is the attribution half.
     """
     start_date = (timezone.now() + timedelta(days=7)).date()
     preview = client.post(
@@ -251,12 +253,22 @@ def test_confirm_writes_one_audit_row_per_occurrence_with_independent_commit_tim
     assert {str(r.entity_id) for r in audit_rows} == set(booking_ids)
     assert all(r.actor_id == app_user.id for r in audit_rows)
     assert all(r.actor_type == "user" for r in audit_rows)
-    # Postgres's now() is STABLE within one transaction, not per-statement —
-    # if all five occurrences shared one transaction, every occurred_at
-    # would be byte-identical. Distinct values are direct proof of five
-    # independent commits, not an incidental detail.
-    occurred_ats = {r.occurred_at for r in audit_rows}
-    assert len(occurred_ats) > 1, f"expected independent commit times, got {occurred_ats}"
+    # NOT asserted here: that distinct occurred_at values prove independent
+    # transactions. Verified directly against a real connection (see the
+    # investigation this correction is based on): Django's Now() compiles
+    # to Postgres's statement_timestamp(), which advances on every
+    # cur.execute() call regardless of transaction boundaries — five
+    # separate INSERT statements inside ONE shared transaction would ALSO
+    # produce five distinct timestamps. An earlier version of this test's
+    # docstring claimed otherwise; that claim was wrong and has been
+    # removed rather than left uncorrected. REC-05
+    # (test_rec_05_per_occurrence_transaction_isolation) is the test that
+    # actually proves independent commits: occurrence 6 survives
+    # occurrence 7's real, induced conflict, which is impossible if they
+    # shared a transaction — any statement failure aborts the WHOLE
+    # transaction in Postgres unless a savepoint catches it, and none does
+    # here (create_booking's `except DatabaseError` only translates the
+    # error and re-raises).
 
 
 @pytest.mark.django_db
