@@ -162,3 +162,55 @@ export interface RecurringSeriesCancelResponse {
   cancelled_booking_ids: string[]
   occurrences_already_past: number
 }
+
+/**
+ * Waitlist/offer shapes — confirmed against the real backend source
+ * (kairos/waitlist/serializers.py, views.py, models.py), not the API spec
+ * doc alone.
+ */
+export type WaitlistEntryStatus = 'waiting' | 'offered' | 'fulfilled' | 'expired' | 'cancelled'
+export type WaitlistOfferStatus = 'active' | 'confirmed' | 'expired' | 'declined'
+
+/** Present only while the entry's status is `"offered"` — `null`
+ * otherwise. Only these two keys; the offer's own resource/hold-booking
+ * detail lives on the standalone offer response, not here. */
+export interface ActiveOffer {
+  id: string
+  expires_at: string
+}
+
+export interface WaitlistEntry {
+  id: string
+  resource_id: string
+  start: string
+  end: string
+  status: WaitlistEntryStatus
+  joined_at: string
+  /** `null` for any non-`"waiting"` entry — the backend only computes a
+   * position within the FCFS `waiting` queue. */
+  queue_position: number | null
+  active_offer: ActiveOffer | null
+}
+
+/** `POST /waitlist-offers/{id}/confirm`'s 201 body — the BOOKING shape
+ * (`kairos.bookings.serializers.BookingResponseSerializer`) with exactly
+ * one extra key bolted on at the view layer, since `booking` itself has
+ * no `waitlist_offer_id` column (Spec v1.0 §3's DDL doesn't define one). */
+export interface WaitlistOfferConfirmResponse extends Booking {
+  waitlist_offer_id: string
+}
+
+/** `POST /waitlist-offers/{id}/decline`'s 200 body — a genuinely
+ * different, standalone offer shape from both `ActiveOffer` (above) and
+ * confirm's booking-shaped response. */
+export interface WaitlistOfferDeclineResponse {
+  id: string
+  waitlist_entry_id: string
+  hold_booking_id: string
+  resource_id: string
+  start: string
+  end: string
+  status: WaitlistOfferStatus
+  expires_at: string
+  created_at: string
+}

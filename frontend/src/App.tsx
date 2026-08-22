@@ -9,6 +9,7 @@ import { DashboardPage } from './pages/DashboardPage'
 import { MyBookingsPage } from './pages/MyBookingsPage'
 import { NotFoundPage } from './pages/NotFoundPage'
 import { RecurringSeriesPage } from './recurring/RecurringSeriesPage'
+import { MyWaitlistPage } from './waitlist/MyWaitlistPage'
 
 export function App() {
   return (
@@ -24,6 +25,7 @@ export function App() {
               <Route path="/calendar" element={<CalendarPage />} />
               <Route path="/bookings" element={<MyBookingsPage />} />
               <Route path="/recurring" element={<RecurringSeriesPage />} />
+              <Route path="/waitlist" element={<MyWaitlistPage />} />
             </Route>
           </Route>
 

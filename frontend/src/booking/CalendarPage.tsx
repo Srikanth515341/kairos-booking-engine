@@ -2,6 +2,7 @@ import { useMemo, useState } from 'react'
 import { cancelBooking, createBooking, editBooking } from '../api/bookings'
 import { ApiError } from '../api/errors'
 import type { Booking } from '../api/types'
+import { JoinWaitlistPanel } from '../waitlist/JoinWaitlistPanel'
 import { BookingPanel } from './BookingPanel'
 import { findNearestOpenSlots, slotUnavailableMessage } from './conflicts'
 import { daysInView, rangeForView, stepAnchor, type CalendarView } from './dateGrid'
@@ -25,6 +26,9 @@ export function CalendarPage() {
   const [view, setView] = useState<CalendarView>('week')
   const [anchor, setAnchor] = useState(new Date())
   const [selection, setSelection] = useState<Selection>(null)
+  const [waitlistSelection, setWaitlistSelection] = useState<{ start: Date; end: Date } | null>(
+    null,
+  )
   const [pendingBlock, setPendingBlock] = useState<DisplayBlock | null>(null)
   const [justCreated, setJustCreated] = useState<DisplayBlock[]>([])
   const [conflict, setConflict] = useState<ConflictState | null>(null)
@@ -62,6 +66,7 @@ export function CalendarPage() {
   if (viewKey !== lastViewKey) {
     setLastViewKey(viewKey)
     setSelection(null)
+    setWaitlistSelection(null)
     setPendingBlock(null)
     setJustCreated([])
     setConflict(null)
@@ -76,6 +81,7 @@ export function CalendarPage() {
   function handleSlotClick(start: Date, end: Date) {
     setConflict(null)
     setActionError(null)
+    setWaitlistSelection(null)
     setSelection({ kind: 'new', start, end })
   }
 
@@ -83,7 +89,20 @@ export function CalendarPage() {
     if (!block.booking_id) return
     setConflict(null)
     setActionError(null)
+    setWaitlistSelection(null)
     setSelection({ kind: 'manage', bookingId: block.booking_id, block })
+  }
+
+  function handleBusyBlockClick(start: Date, end: Date) {
+    setSelection(null)
+    setWaitlistSelection({ start, end })
+  }
+
+  function handleBookInsteadFromWaitlist(start: Date, end: Date) {
+    setWaitlistSelection(null)
+    setConflict(null)
+    setActionError(null)
+    setSelection({ kind: 'new', start, end })
   }
 
   function currentBusyBlocksForConflictSearch(excludingStartIso: string, excludingEndIso: string) {
@@ -292,9 +311,23 @@ export function CalendarPage() {
               timeZone={timeZone}
               onSlotClick={handleSlotClick}
               onBlockClick={handleBlockClick}
+              onBusyBlockClick={handleBusyBlockClick}
             />
           )}
         </div>
+
+        {waitlistSelection && resourceId && (
+          <JoinWaitlistPanel
+            resourceId={resourceId}
+            start={waitlistSelection.start}
+            end={waitlistSelection.end}
+            timeZone={timeZone}
+            onClose={() => {
+              setWaitlistSelection(null)
+            }}
+            onBookInstead={handleBookInsteadFromWaitlist}
+          />
+        )}
 
         {selection && (
           <BookingPanel
