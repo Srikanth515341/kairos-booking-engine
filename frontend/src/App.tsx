@@ -3,8 +3,10 @@ import { AuthProvider } from './auth/AuthProvider'
 import { LoginPage } from './auth/LoginPage'
 import { OidcCallbackPage } from './auth/OidcCallbackPage'
 import { ProtectedRoute } from './auth/ProtectedRoute'
+import { CalendarPage } from './booking/CalendarPage'
 import { AppLayout } from './layout/AppLayout'
 import { DashboardPage } from './pages/DashboardPage'
+import { MyBookingsPage } from './pages/MyBookingsPage'
 import { NotFoundPage } from './pages/NotFoundPage'
 
 export function App() {
@@ -18,6 +20,8 @@ export function App() {
           <Route element={<ProtectedRoute />}>
             <Route element={<AppLayout />}>
               <Route path="/" element={<DashboardPage />} />
+              <Route path="/calendar" element={<CalendarPage />} />
+              <Route path="/bookings" element={<MyBookingsPage />} />
             </Route>
           </Route>
 

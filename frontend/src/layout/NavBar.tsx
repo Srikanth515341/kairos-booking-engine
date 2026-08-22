@@ -18,6 +18,12 @@ export function NavBar() {
             <NavLink to="/" end className={linkClasses}>
               Dashboard
             </NavLink>
+            <NavLink to="/calendar" className={linkClasses}>
+              Calendar
+            </NavLink>
+            <NavLink to="/bookings" className={linkClasses}>
+              My Bookings
+            </NavLink>
           </nav>
         </div>
         <div className="flex items-center gap-3 text-sm text-gray-600">
