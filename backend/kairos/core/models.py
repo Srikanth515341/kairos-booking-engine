@@ -333,7 +333,11 @@ class AlertKey(models.TextChoices):
     # The six checks Rollout v1.0 §6.1's table names, plus the
     # actor_type='unknown' SEV-3 signal (audit trail, not a background
     # job) — see kairos.core.alerting.evaluate_alerts, the ONE function
-    # that evaluates all seven.
+    # that evaluates all seven... now eight (Implementation Plan Phase 29
+    # adds GIST_WRITE_THROUGHPUT, Rollout v1.0 §6's own "GiST write
+    # throughput on booking" row — left with no real writer in Phase 21
+    # specifically because its threshold was "deliberately unset" pending
+    # CONC-06's real characterization data, which Phase 29 produced).
     SCHEMA_ASSERTION = "schema_assertion", "Schema assertion"
     RECONCILIATION = "reconciliation", "Reconciliation"
     HOLD_REAPER = "hold_reaper", "Hold reaper"
@@ -341,6 +345,7 @@ class AlertKey(models.TextChoices):
     SERIES_MATERIALIZATION = "series_materialization", "Series materialization"
     TZDATA_REMATERIALIZATION = "tzdata_rematerialization", "Tzdata re-materialization"
     AUDIT_ACTOR_UNKNOWN = "audit_actor_unknown", "Audit actor unknown"
+    GIST_WRITE_THROUGHPUT = "gist_write_throughput", "GiST write throughput"
 
 
 class AlertDeliveryStatus(models.TextChoices):

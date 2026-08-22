@@ -1,11 +1,14 @@
 """Alert evaluation and delivery (Implementation Plan Phase 21; Rollout
 v1.0 §6.1, RUNBOOK-02/06/07/09). One periodic function, `evaluate_alerts`
 (scheduled via `kairos.core.tasks.evaluate_alerts_task`), reads the SAME
-data every check already writes (`system_check_run`, `audit_log`) and
-decides whether each of Rollout's six named alert conditions — plus
-`audit_actor_unknown` (SEV-3, RFC v1.0 §12) — is currently active. No new
-monitoring pipeline, no new dependency: this is a read over existing
-tables, not a second copy of any check's own logic.
+data every check already writes (`system_check_run`, `audit_log`,
+`request_metric`) and decides whether each of Rollout's six named alert
+conditions — plus `audit_actor_unknown` (SEV-3, RFC v1.0 §12) and
+`gist_write_throughput` (SEV-3, Implementation Plan Phase 29 — Rollout's
+own "GiST write throughput on booking" row, unset in Phase 21 pending
+CONC-06's real data) — is currently active. No new monitoring pipeline,
+no new dependency: this is a read over existing tables, not a second copy
+of any check's own logic.
 
 Delivery reuses `kairos.core.notifications.NotificationService` (Phase
 18) directly — the SAME `EMAIL_BACKEND`-based send, console in dev,
@@ -38,6 +41,7 @@ from django.utils import timezone as django_timezone
 
 from kairos.core.constants import (
     AUDIT_ACTOR_UNKNOWN_LOOKBACK_SECONDS,
+    BOOKING_WRITE_P95_ALERT_THRESHOLD_MS,
     SCHEMA_ASSERTION_STALE_THRESHOLD_SECONDS,
 )
 from kairos.core.models import (
@@ -66,6 +70,7 @@ ALERT_SEVERITY: dict[str, str] = {
     AlertKey.SERIES_MATERIALIZATION: AlertSeverity.SEV_2,
     AlertKey.TZDATA_REMATERIALIZATION: AlertSeverity.SEV_2,
     AlertKey.AUDIT_ACTOR_UNKNOWN: AlertSeverity.SEV_3,
+    AlertKey.GIST_WRITE_THROUGHPUT: AlertSeverity.SEV_3,
 }
 
 
@@ -164,7 +169,7 @@ def _execute_alert_email_delivery(alert_event_id: str) -> None:
 
 
 def evaluate_alerts(*, now: datetime | None = None) -> list[AlertEvent]:
-    """Reads all seven signals and fires/resolves each independently.
+    """Reads all eight signals and fires/resolves each independently.
     Deferred imports throughout for `kairos.waitlist.services`/`kairos.
     bookings.tasks` functions — those modules don't import this one, so
     there's no genuine cycle, but keeping every cross-app read deferred
@@ -302,6 +307,36 @@ def evaluate_alerts(*, now: datetime | None = None) -> list[AlertEvent]:
         context={
             "count": count,
             "sample_audit_log_ids": [str(i) for i in unknown_qs.values_list("id", flat=True)[:20]],
+        },
+    )
+    if event is not None:
+        fired.append(event)
+
+    # --- gist_write_throughput (SEV-3): live booking-write P95 over its
+    # threshold — Implementation Plan Phase 29, Rollout v1.0 §6's own
+    # "GiST write throughput on booking" row. Unlike the six checks above,
+    # there's no `system_check_run` heartbeat for this one — it reads the
+    # SAME live `p95_duration_ms` the admin dashboard already computes
+    # (kairos.core.metrics, Phase 21), over the identical rolling window,
+    # rather than a second aggregation mechanism.
+    from kairos.core.metrics import p95_duration_ms
+    from kairos.core.models import RequestMetricType
+
+    write_p95 = p95_duration_ms(metric_type=RequestMetricType.BOOKING_WRITE)
+    event = fire_or_resolve(
+        alert_key=AlertKey.GIST_WRITE_THROUGHPUT,
+        active=write_p95 is not None and write_p95 > BOOKING_WRITE_P95_ALERT_THRESHOLD_MS,
+        message=(
+            "Booking-write P95 latency has crossed the GiST write-throughput "
+            f"threshold ({BOOKING_WRITE_P95_ALERT_THRESHOLD_MS}ms) — the hot "
+            "resource this traffic is concentrated on may be approaching the "
+            "index-contention ceiling CONC-06 characterized "
+            "(docs/performance-baseline.md). Not a correctness incident: the "
+            "exclusion constraint and idempotency mechanism are unaffected."
+        ),
+        context={
+            "write_p95_ms": write_p95,
+            "threshold_ms": BOOKING_WRITE_P95_ALERT_THRESHOLD_MS,
         },
     )
     if event is not None:

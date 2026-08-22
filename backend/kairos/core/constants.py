@@ -226,6 +226,31 @@ RATE_LIMIT_PER_IP_CAPACITY = int(os.environ.get("RATE_LIMIT_PER_IP_CAPACITY", "6
 RATE_LIMIT_PER_IP_WINDOW_SECONDS = int(os.environ.get("RATE_LIMIT_PER_IP_WINDOW_SECONDS", "60"))
 
 # ============================================================
+# GiST write throughput alert (Implementation Plan Phase 29; Rollout v1.0
+# §6's own "GiST write throughput on booking" row — left deliberately
+# unset in Phase 21: "Set from CONC-06's real characterization data — not
+# invented here")
+# ============================================================
+# CONC-06's real escalation data (docs/performance-baseline.md; N=200
+# non-conflicting writers on one resource) showed booking-write P95
+# climbing from ~666ms at N=50 (throughput still scaling) to ~1.76s at
+# N=100 (throughput already plateaued) — the observed transition from
+# "still absorbing more concurrent writers" to "saturated, adding writers
+# only adds queueing." 1500ms sits at that transition, not at either
+# endpoint: a genuinely healthy hot resource shouldn't cross it under
+# ordinary contention, and a resource that has crossed it is the "known
+# ceiling" Rollout's own table says is worth surfacing (SEV-3,
+# informational — a page-worthy incident is what schema_assertion/
+# reconciliation are for, not this). Explicitly a PROVISIONAL, synthetic-
+# data-derived number — Rollout v1.0 §9 itself says this threshold gets
+# "set... and validated or revised" against REAL production data at Stage
+# 2 onward, not treated as final the moment CI-scale synthetic data
+# produced it.
+BOOKING_WRITE_P95_ALERT_THRESHOLD_MS = int(
+    os.environ.get("BOOKING_WRITE_P95_ALERT_THRESHOLD_MS", "1500")
+)
+
+# ============================================================
 # Read-replica freshness routing (Implementation Plan Phase 28; Rollout
 # v1.0 §2.2; Test Plan FAIL-03; Spec v1.0 §5.7's `data_freshness` field)
 # ============================================================
