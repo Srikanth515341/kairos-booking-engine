@@ -186,7 +186,12 @@ or auto-acknowledged, and "Confirm" stays disabled until every single one has be
 checked off. The confirmation response is genuine HTTP 207 Multi-Status, and the frontend
 treats it as the success it is — per-occurrence detail, not a generic error page — with an
 occurrence that conflicted *while you were confirming* rendered visibly differently from one
-you already knew about going in.
+you already knew about going in. And when a slot is full, waitlisting it is real (Phase 26):
+the containment rule that decides who actually gets offered a freed slot is explained in plain
+language right where you're deciding whether to join, a live offer countdown is honest about
+being advisory rather than authoritative — the button never locks just because a timer hit
+zero — and confirming an offer a moment too late comes back as "this offer has expired," not
+an error page, exactly the way the server itself treats it.
 See
 [`CLAUDE.md`](CLAUDE.md) for exactly what is and isn't built, and
 [`docs/06-implementation-plan.md`](docs/06-implementation-plan.md) for the full 31-phase
@@ -260,7 +265,7 @@ DATABASE_URL=postgresql://kairos:kairos@localhost:5432/kairos_dev python manage.
 python manage.py runserver  # now connects as kairos_app by default
 ```
 
-**Frontend (Phase 23; Calendar & booking flow — Phase 24; Recurring flow — Phase 25):**
+**Frontend (Phase 23; Calendar & booking flow — Phase 24; Recurring flow — Phase 25; Waitlist & offers — Phase 26):**
 
 ```bash
 cd frontend
@@ -286,6 +291,9 @@ dev sign-in form) and try booking the exact same slot from both. **Recurring** w
 through defining a weekly series, previewing exactly what would (and wouldn't) be created —
 including any DST time adjustment, stated explicitly — checking off every conflict/adjustment
 individually, then confirming; the result page lets you cancel the whole series in one click.
+Click any full/busy slot on the calendar to **join its waitlist** — the eligibility rule is
+right there in the panel — or visit **Waitlist** to see your entries, queue positions, and act
+on any live offer (confirm or decline, with a live countdown).
 
 **Try it** — auth is real now (Phase 9): a session token, obtained via an OIDC login, on
 every request. Locally there's no real identity provider to log in against, so
@@ -399,9 +407,10 @@ curl -i -X POST http://127.0.0.1:8000/api/v1/resources/<resource-id-from-above>/
 ```
 
 A frontend now exists (Phase 23), the primary booking flow — calendar, booking,
-cancel/edit, My Bookings — is real (Phase 24), and so is the two-step recurring flow —
-preview, explicit acknowledgment, confirm, series cancellation (Phase 25) — see the
-**Frontend** step above. Resource CRUD and admin screens are still curl-only; see Status
+cancel/edit, My Bookings — is real (Phase 24), so is the two-step recurring flow —
+preview, explicit acknowledgment, confirm, series cancellation (Phase 25) — and so is the
+waitlist/offer flow — join, queue position, live countdown, confirm/decline (Phase 26) — see
+the **Frontend** step above. Resource CRUD and admin screens are still curl-only; see Status
 above and [`CLAUDE.md`](CLAUDE.md).
 
 ## Running the test suite
@@ -431,7 +440,7 @@ pytest
 
 `ruff check . && ruff format --check . && mypy kairos` also passes with zero findings.
 
-**Frontend (Phase 23; Calendar & booking flow — Phase 24; Recurring flow — Phase 25):**
+**Frontend (Phase 23; Calendar & booking flow — Phase 24; Recurring flow — Phase 25; Waitlist & offers — Phase 26):**
 
 ```bash
 cd frontend
@@ -467,6 +476,7 @@ npm run typecheck && npm run lint && npm run format:check && npm run test && npm
 | Frontend foundation | **Live** — React + TS SPA, OIDC/dev-mock login, protected routes, API client with idempotency-key retry semantics (Phase 23) |
 | Calendar & booking flow | **Live** — day/week/month calendar in the viewer's local timezone, optimistic booking creation, specific conflict messaging + nearest-open-slot suggestions, cancel/edit, My Bookings with cursor pagination 🏁 Milestone 4 (Phase 24) |
 | Recurring flow (frontend) | **Live** — series definition, mandatory preview with explicit per-item conflict/DST-adjustment acknowledgment, 207 rendered as success with per-occurrence detail, series cancellation (Phase 25) |
+| Waitlist & offers (frontend) | **Live** — join a full slot with the eligibility rule explained inline, queue position, live-but-advisory offer countdown, confirm/decline, 409 offer_expired handled as an expected outcome (Phase 26) |
 | Deployed / live | Not started (Phase 30) |
 
 ## Documentation

@@ -8,6 +8,11 @@ interface TimeGridProps {
   timeZone: string
   onSlotClick: (start: Date, end: Date) => void
   onBlockClick: (block: DisplayBlock) => void
+  /** Fired for an OPAQUE busy cell — another user's confirmed booking OR
+   * a held slot, structurally indistinguishable (see `cellClasses`
+   * below) — offering "join the waitlist for this time" (Phase 26 Scope
+   * IN: "Join waitlist from a full slot"). */
+  onBusyBlockClick: (start: Date, end: Date) => void
 }
 
 function blockCoveringSlot(
@@ -38,11 +43,19 @@ function cellClasses(block: DisplayBlock | undefined): string {
   // renders IDENTICALLY either way, on purpose (Phase 24 Scope IN: "Held
   // slots render as ordinary busy blocks with no indication they are
   // held"). There is no field on `block` that could tell them apart even
-  // if this code wanted to.
-  return 'cursor-not-allowed bg-gray-300'
+  // if this code wanted to. Still clickable (Phase 26) — to join the
+  // waitlist, never to reveal anything about who or what occupies it.
+  return 'cursor-pointer bg-gray-300 hover:bg-gray-400'
 }
 
-export function TimeGrid({ days, blocks, timeZone, onSlotClick, onBlockClick }: TimeGridProps) {
+export function TimeGrid({
+  days,
+  blocks,
+  timeZone,
+  onSlotClick,
+  onBlockClick,
+  onBusyBlockClick,
+}: TimeGridProps) {
   const slotsForFirstDay = halfHourSlotsForDay(days[0] ?? new Date())
 
   return (
@@ -75,7 +88,8 @@ export function TimeGrid({ days, blocks, timeZone, onSlotClick, onBlockClick }: 
               const isPastToday = isSameDay(day, new Date()) && slotEnd < new Date()
               const isManageable = covering?.booking_id !== undefined
               const isBookable = covering === undefined && !isPastToday
-              const isClickable = isManageable || isBookable
+              const isOpaqueBusy = covering !== undefined && !covering.pending && !isManageable
+              const isClickable = isManageable || isBookable || isOpaqueBusy
 
               return (
                 <button
@@ -87,15 +101,21 @@ export function TimeGrid({ days, blocks, timeZone, onSlotClick, onBlockClick }: 
                       onBlockClick(covering)
                     } else if (isBookable) {
                       onSlotClick(slotStart, slotEnd)
+                    } else if (isOpaqueBusy) {
+                      onBusyBlockClick(slotStart, slotEnd)
                     }
                   }}
                   className={`h-6 border-b border-gray-100 text-[10px] leading-6 ${cellClasses(
                     covering,
                   )} ${isPastToday && !covering ? 'cursor-not-allowed bg-gray-50' : ''}`}
                   aria-label={
-                    covering
-                      ? `Busy ${formatTimeOfDay(slotStart.toISOString(), timeZone)}`
-                      : `Book ${formatTimeOfDay(slotStart.toISOString(), timeZone)}`
+                    isManageable
+                      ? `Manage booking ${formatTimeOfDay(slotStart.toISOString(), timeZone)}`
+                      : isOpaqueBusy
+                        ? `Join waitlist for ${formatTimeOfDay(slotStart.toISOString(), timeZone)}`
+                        : covering
+                          ? `Busy ${formatTimeOfDay(slotStart.toISOString(), timeZone)}`
+                          : `Book ${formatTimeOfDay(slotStart.toISOString(), timeZone)}`
                   }
                 />
               )
