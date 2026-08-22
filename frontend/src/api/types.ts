@@ -214,3 +214,142 @@ export interface WaitlistOfferDeclineResponse {
   expires_at: string
   created_at: string
 }
+
+/**
+ * Admin/operations shapes — confirmed against the real backend source
+ * (kairos/resources/{serializers,views}.py, kairos/bookings/views.py,
+ * kairos/core/views.py, kairos/identity/{views,services}.py), not the
+ * API spec doc alone. NOTE (load-bearing for how the whole admin/
+ * surfaces are built): neither the session token JWT payload nor
+ * `POST /auth/token`'s response carries any role/permission claim, and
+ * no "who am I" endpoint exists anywhere in this backend — confirmed by
+ * reading `kairos.identity.oidc.issue_session_token` (payload is only
+ * `sub`/`iat`/`exp`) and every route in `kairos/identity/urls.py`. There
+ * is structurally no way for this frontend to know a priori whether the
+ * current user is `system_admin`/`operations`, or a resource admin of
+ * any given resource — see booking/CalendarPage-style precedent applied
+ * here: every admin page shows its controls to any authenticated user
+ * and lets the server's own 403 `permission_denied` be the actual
+ * source of truth, rendered as a specific, expected outcome rather than
+ * hidden or treated as a generic error.
+ */
+export interface ResourceCreateInput {
+  name: string
+  category?: string
+  timezone: string
+  bookable_start_time: string
+  bookable_end_time: string
+  max_booking_duration_minutes?: number | null
+  offboarding_policy?: ResourceOffboardingPolicy
+  restricted_group_id?: string | null
+}
+
+/** Every field optional — a real partial update, only present keys
+ * change. `restricted_group_id` is deliberately absent: Spec v1.0
+ * §5.14's own updatable-field list never names it (create-only). */
+export interface ResourceUpdateInput {
+  name?: string
+  bookable_start_time?: string
+  bookable_end_time?: string
+  max_booking_duration_minutes?: number | null
+  offboarding_policy?: ResourceOffboardingPolicy
+  status?: ResourceStatus
+}
+
+export interface ResourceAdminGrant {
+  resource_id: string
+  user_id: string
+  granted_at: string
+  granted_by: string
+}
+
+export type BookingHistoryActorType = 'user' | 'admin' | 'system' | 'unknown'
+
+export interface BookingHistoryActor {
+  id: string | null
+  display_name: string | null
+  type: BookingHistoryActorType
+}
+
+/** Each changed field maps to a `[before, after]` pair — a genuine
+ * before/after diff over every changed field, not just `status`
+ * (kairos.bookings.views._compute_changes diffs the full audit-trigger
+ * snapshot). */
+export interface BookingHistoryEvent {
+  occurred_at: string
+  action: 'insert' | 'update'
+  actor: BookingHistoryActor
+  reason: string | null
+  request_id: string
+  changes: Record<string, [unknown, unknown]>
+}
+
+export interface BookingHistoryResponse {
+  booking_id: string
+  events: BookingHistoryEvent[]
+}
+
+/** Exact order the backend itself reports these in — reproduced here so
+ * the dashboard's own row order matches Spec v1.0 §5.15's example
+ * verbatim, rather than whatever order the array happens to arrive in. */
+export const ADMIN_CHECK_NAMES = [
+  'schema_assertion',
+  'reconciliation',
+  'hold_reaper',
+  'offer_cascade',
+  'series_materialization',
+  'tzdata_rematerialization',
+] as const
+export type CheckName = (typeof ADMIN_CHECK_NAMES)[number]
+
+export type CheckStatus = 'pass' | 'fail' | null
+
+/** `message` is populated ONLY on a genuine reconciliation FAILURE
+ * (kairos/core/reconciliation.py) — carries the exact RUNBOOK-01 framing
+ * text explaining this is not a race detector. */
+export interface ReconciliationFindings {
+  overlaps_found?: number
+  flagged_booking_ids?: string[]
+  message?: string
+}
+
+export interface AdminCheck {
+  check_name: CheckName
+  /** `null` — never a faked pass — for a check that has genuinely never
+   * run. */
+  last_run_at: string | null
+  status: CheckStatus
+  findings: Record<string, unknown>
+}
+
+export interface AdminChecksLatestResponse {
+  checks: AdminCheck[]
+}
+
+export interface ResourceUtilization {
+  resource_id: string
+  range: { from: string; to: string }
+  total_bookings: number
+  total_booked_minutes: number
+  waitlist_joins: number
+  cancellation_count: number
+  offers_confirmed: number
+  offers_expired: number
+}
+
+export interface FlaggedSeries {
+  series_id: string
+  resource_id: string
+  occurrences_remaining: number
+}
+
+export interface DeactivateUserResponse {
+  user_id: string
+  status: 'deactivated'
+  bookings_transferred: number
+  bookings_cancelled: number
+  bookings_retained: number
+  waitlist_entries_cancelled: number
+  offers_released: number
+  series_flagged_for_admin: FlaggedSeries[]
+}
