@@ -8,6 +8,7 @@ import { AppLayout } from './layout/AppLayout'
 import { DashboardPage } from './pages/DashboardPage'
 import { MyBookingsPage } from './pages/MyBookingsPage'
 import { NotFoundPage } from './pages/NotFoundPage'
+import { RecurringSeriesPage } from './recurring/RecurringSeriesPage'
 
 export function App() {
   return (
@@ -22,6 +23,7 @@ export function App() {
               <Route path="/" element={<DashboardPage />} />
               <Route path="/calendar" element={<CalendarPage />} />
               <Route path="/bookings" element={<MyBookingsPage />} />
+              <Route path="/recurring" element={<RecurringSeriesPage />} />
             </Route>
           </Route>
 

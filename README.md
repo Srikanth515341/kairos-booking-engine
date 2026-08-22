@@ -179,7 +179,14 @@ trip completes), and a real, specific answer when someone else books the same sl
 booked this a moment ago. Here are the nearest open slots," never a bare "booking failed" — plus
 cancellation, editing, and a My Bookings list with real cursor pagination. A held slot and
 another user's confirmed booking render identically, on purpose — the same opacity the backend
-itself enforces, not a frontend rule.
+itself enforces, not a frontend rule. Recurring bookings now have a real two-step frontend too
+(Phase 25): define a series, preview it, and see exactly what will and won't be created before
+anything commits — conflicts and DST time adjustments are both shown explicitly, never hidden
+or auto-acknowledged, and "Confirm" stays disabled until every single one has been individually
+checked off. The confirmation response is genuine HTTP 207 Multi-Status, and the frontend
+treats it as the success it is — per-occurrence detail, not a generic error page — with an
+occurrence that conflicted *while you were confirming* rendered visibly differently from one
+you already knew about going in.
 See
 [`CLAUDE.md`](CLAUDE.md) for exactly what is and isn't built, and
 [`docs/06-implementation-plan.md`](docs/06-implementation-plan.md) for the full 31-phase
@@ -253,7 +260,7 @@ DATABASE_URL=postgresql://kairos:kairos@localhost:5432/kairos_dev python manage.
 python manage.py runserver  # now connects as kairos_app by default
 ```
 
-**Frontend (Phase 23; Calendar & booking flow — Phase 24):**
+**Frontend (Phase 23; Calendar & booking flow — Phase 24; Recurring flow — Phase 25):**
 
 ```bash
 cd frontend
@@ -275,7 +282,10 @@ resource in the database — the `POST /resources` curl example further below cr
 **My Bookings** lists your own bookings with cursor pagination; click an empty slot to book,
 a booked slot you own to cancel or edit. To see the conflict-handling behavior for real, open
 the app in two browser tabs signed in as two different users (two different emails at the
-dev sign-in form) and try booking the exact same slot from both.
+dev sign-in form) and try booking the exact same slot from both. **Recurring** walks you
+through defining a weekly series, previewing exactly what would (and wouldn't) be created —
+including any DST time adjustment, stated explicitly — checking off every conflict/adjustment
+individually, then confirming; the result page lets you cancel the whole series in one click.
 
 **Try it** — auth is real now (Phase 9): a session token, obtained via an OIDC login, on
 every request. Locally there's no real identity provider to log in against, so
@@ -388,9 +398,11 @@ curl -i -X POST http://127.0.0.1:8000/api/v1/resources/<resource-id-from-above>/
   -d '{"user_id": "<some-user-id>"}'
 ```
 
-A frontend now exists (Phase 23), and the primary booking flow — calendar, booking,
-cancel/edit, My Bookings — is real (Phase 24) — see the **Frontend** step above. Resource
-CRUD and admin screens are still curl-only; see Status above and [`CLAUDE.md`](CLAUDE.md).
+A frontend now exists (Phase 23), the primary booking flow — calendar, booking,
+cancel/edit, My Bookings — is real (Phase 24), and so is the two-step recurring flow —
+preview, explicit acknowledgment, confirm, series cancellation (Phase 25) — see the
+**Frontend** step above. Resource CRUD and admin screens are still curl-only; see Status
+above and [`CLAUDE.md`](CLAUDE.md).
 
 ## Running the test suite
 
@@ -419,7 +431,7 @@ pytest
 
 `ruff check . && ruff format --check . && mypy kairos` also passes with zero findings.
 
-**Frontend (Phase 23; Calendar & booking flow — Phase 24):**
+**Frontend (Phase 23; Calendar & booking flow — Phase 24; Recurring flow — Phase 25):**
 
 ```bash
 cd frontend
@@ -454,6 +466,7 @@ npm run typecheck && npm run lint && npm run format:check && npm run test && npm
 | Security hardening | **Live** — Redis token-bucket rate limiting, injection-resistance evidence (SEC-04), security headers, explicit CORS (SEC-01–07) (Phase 22) |
 | Frontend foundation | **Live** — React + TS SPA, OIDC/dev-mock login, protected routes, API client with idempotency-key retry semantics (Phase 23) |
 | Calendar & booking flow | **Live** — day/week/month calendar in the viewer's local timezone, optimistic booking creation, specific conflict messaging + nearest-open-slot suggestions, cancel/edit, My Bookings with cursor pagination 🏁 Milestone 4 (Phase 24) |
+| Recurring flow (frontend) | **Live** — series definition, mandatory preview with explicit per-item conflict/DST-adjustment acknowledgment, 207 rendered as success with per-occurrence detail, series cancellation (Phase 25) |
 | Deployed / live | Not started (Phase 30) |
 
 ## Documentation

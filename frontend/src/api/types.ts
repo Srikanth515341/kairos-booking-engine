@@ -69,3 +69,96 @@ export interface Paginated<T> {
   data: T[]
   next_cursor: string | null
 }
+
+/**
+ * Recurring-series preview/confirm shapes — confirmed against the real
+ * backend source (kairos/bookings/recurring_series.py, serializers.py,
+ * views.py), not the API spec doc alone. Preview's `conflicts[i]` and
+ * confirm's `conflicts[i]` are GENUINELY DIFFERENT shapes (preview's
+ * carries `start`/`end`, confirm's does not, but carries `acknowledged`
+ * instead) — kept as two distinct interfaces rather than one shared
+ * `Conflict` type, so a caller can't accidentally read a field that only
+ * exists on the other one.
+ */
+export interface RecurringPreviewRequest {
+  resource_id: string
+  timezone: string
+  /** "HH:MM:SS" */
+  local_start_time: string
+  /** "HH:MM:SS" */
+  local_end_time: string
+  /** 0 = Sunday … 6 = Saturday — the SAME convention `Date.getDay()` uses. */
+  weekday: number
+  /** "YYYY-MM-DD" */
+  series_start_date: string
+  occurrence_count: number
+}
+
+export interface WouldCreateItem {
+  occurrence_date: string
+  start: string
+  end: string
+}
+
+export interface PreviewConflictItem {
+  occurrence_date: string
+  start: string
+  end: string
+  reason: string
+}
+
+export type TimeAdjustmentIssue = 'nonexistent_local_time' | 'ambiguous_local_time'
+
+export interface TimeAdjustmentItem {
+  occurrence_date: string
+  issue: TimeAdjustmentIssue
+  /** "HH:MM:SS" local wall-clock time, in the series' own timezone. */
+  requested_local: string
+  /** "HH:MM:SS" local wall-clock time, in the series' own timezone. */
+  adjusted_local: string
+  explanation: string
+}
+
+export interface RecurringPreviewResponse {
+  preview_token: string
+  resource_id: string
+  tzdata_version: string
+  would_create: WouldCreateItem[]
+  conflicts: PreviewConflictItem[]
+  time_adjustments: TimeAdjustmentItem[]
+}
+
+export interface RecurringConfirmRequest {
+  preview_token: string
+  acknowledged_conflicts: string[]
+  acknowledged_adjustments: string[]
+}
+
+export interface CreatedOccurrenceItem {
+  booking_id: string
+  occurrence_date: string
+  start: string
+  end: string
+}
+
+export interface ConfirmConflictItem {
+  occurrence_date: string
+  reason: string
+  /** `false` means this occurrence conflicted BETWEEN preview and confirm
+   * — a genuinely different situation from a conflict the user already
+   * saw and acknowledged in preview, and must be rendered distinctly
+   * (Spec v1.0 §10, Phase 25 Scope IN). */
+  acknowledged: boolean
+}
+
+export interface RecurringConfirmResponse {
+  series_id: string
+  created: CreatedOccurrenceItem[]
+  conflicts: ConfirmConflictItem[]
+}
+
+export interface RecurringSeriesCancelResponse {
+  series_id: string
+  cancelled_booking_ids: string[]
+  occurrences_already_past: number
+}
