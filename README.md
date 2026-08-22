@@ -172,8 +172,14 @@ TypeScript SPA with real login (against the same dev-mock-login → token-exchan
 walkthrough below uses by hand), protected routes, and an API client that gets the two subtle
 contracts right on purpose — one idempotency key per user action, reused across every automatic
 retry, and a `503` treated as "retry, don't fail" rather than shown to the user as an error.
-Booking/resource/calendar screens are still ahead; this phase is the shell everything else
-plugs into.
+The primary user experience now exists on top of that shell (Phase 24): a day/week/month
+calendar rendered in the viewer's own local timezone (shown explicitly), booking creation with
+optimistic UI (a slot renders as taken the instant you click "Book," before the network round
+trip completes), and a real, specific answer when someone else books the same slot first — "Someone
+booked this a moment ago. Here are the nearest open slots," never a bare "booking failed" — plus
+cancellation, editing, and a My Bookings list with real cursor pagination. A held slot and
+another user's confirmed booking render identically, on purpose — the same opacity the backend
+itself enforces, not a frontend rule.
 See
 [`CLAUDE.md`](CLAUDE.md) for exactly what is and isn't built, and
 [`docs/06-implementation-plan.md`](docs/06-implementation-plan.md) for the full 31-phase
@@ -247,7 +253,7 @@ DATABASE_URL=postgresql://kairos:kairos@localhost:5432/kairos_dev python manage.
 python manage.py runserver  # now connects as kairos_app by default
 ```
 
-**Frontend (Phase 23):**
+**Frontend (Phase 23; Calendar & booking flow — Phase 24):**
 
 ```bash
 cd frontend
@@ -263,7 +269,13 @@ before `manage.py runserver`). Sign in at `http://localhost:5173/login` using th
 sign-in" form (any email — this calls the same `POST /auth/dev-mock-login` →
 `POST /auth/token` round trip the curl walkthrough below does by hand). "Sign in with SSO"
 is present but structurally untested against a live IdP — see `frontend/src/auth/oidc.ts`'s
-own docstring and CLAUDE.md's Open Questions.
+own docstring and CLAUDE.md's Open Questions. Once signed in, **Calendar** shows real
+availability for whichever resource is selected (needs at least one `status='active'`
+resource in the database — the `POST /resources` curl example further below creates one) and
+**My Bookings** lists your own bookings with cursor pagination; click an empty slot to book,
+a booked slot you own to cancel or edit. To see the conflict-handling behavior for real, open
+the app in two browser tabs signed in as two different users (two different emails at the
+dev sign-in form) and try booking the exact same slot from both.
 
 **Try it** — auth is real now (Phase 9): a session token, obtained via an OIDC login, on
 every request. Locally there's no real identity provider to log in against, so
@@ -376,8 +388,9 @@ curl -i -X POST http://127.0.0.1:8000/api/v1/resources/<resource-id-from-above>/
   -d '{"user_id": "<some-user-id>"}'
 ```
 
-A frontend now exists (Phase 23) — see the **Frontend** step above; booking/resource/
-calendar screens are a later phase, see Status above and [`CLAUDE.md`](CLAUDE.md).
+A frontend now exists (Phase 23), and the primary booking flow — calendar, booking,
+cancel/edit, My Bookings — is real (Phase 24) — see the **Frontend** step above. Resource
+CRUD and admin screens are still curl-only; see Status above and [`CLAUDE.md`](CLAUDE.md).
 
 ## Running the test suite
 
@@ -406,7 +419,7 @@ pytest
 
 `ruff check . && ruff format --check . && mypy kairos` also passes with zero findings.
 
-**Frontend (Phase 23):**
+**Frontend (Phase 23; Calendar & booking flow — Phase 24):**
 
 ```bash
 cd frontend
@@ -439,7 +452,8 @@ npm run typecheck && npm run lint && npm run format:check && npm run test && npm
 | Reconciliation & schema assertion | **Live** — both checks scheduled + on-deploy, `GET /admin/checks/latest`, RECON-01–08 (Phase 20) |
 | Alert routing, metrics dashboard | **Live** — `evaluate_alerts` fires/resolves real email alerts, `GET /admin/dashboard` + HTML page, RECON-07 (Phase 21) |
 | Security hardening | **Live** — Redis token-bucket rate limiting, injection-resistance evidence (SEC-04), security headers, explicit CORS (SEC-01–07) (Phase 22) |
-| Frontend foundation | **Live** — React + TS SPA, OIDC/dev-mock login, protected routes, API client with idempotency-key retry semantics (Phase 23); booking/resource/calendar screens are Phase 24+ |
+| Frontend foundation | **Live** — React + TS SPA, OIDC/dev-mock login, protected routes, API client with idempotency-key retry semantics (Phase 23) |
+| Calendar & booking flow | **Live** — day/week/month calendar in the viewer's local timezone, optimistic booking creation, specific conflict messaging + nearest-open-slot suggestions, cancel/edit, My Bookings with cursor pagination 🏁 Milestone 4 (Phase 24) |
 | Deployed / live | Not started (Phase 30) |
 
 ## Documentation
