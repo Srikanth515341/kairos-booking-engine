@@ -30,6 +30,9 @@ export function NavBar() {
             <NavLink to="/waitlist" className={linkClasses}>
               Waitlist
             </NavLink>
+            <NavLink to="/admin" className={linkClasses}>
+              Admin
+            </NavLink>
           </nav>
         </div>
         <div className="flex items-center gap-3 text-sm text-gray-600">

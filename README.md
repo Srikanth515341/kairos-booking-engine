@@ -191,7 +191,14 @@ the containment rule that decides who actually gets offered a freed slot is expl
 language right where you're deciding whether to join, a live offer countdown is honest about
 being advisory rather than authoritative — the button never locks just because a timer hit
 zero — and confirming an offer a moment too late comes back as "this offer has expired," not
-an error page, exactly the way the server itself treats it.
+an error page, exactly the way the server itself treats it. Resource administrators and
+operations get real surfaces too (Phase 27): create/edit resources and manage per-resource
+admin scope, a booking history viewer that reconstructs a full lifecycle with real actors and
+reasons, a correctness-check dashboard where the reconciliation alert's actual meaning — the
+guarantee was removed, not that a race occurred — is spelled out right on the page, a
+utilization view, and an offboarding flow. Since this backend has no way to tell the frontend
+a user's role in advance, every one of these pages is honest about that: it shows its controls
+to anyone signed in and lets the server's own permission check be the real gate.
 See
 [`CLAUDE.md`](CLAUDE.md) for exactly what is and isn't built, and
 [`docs/06-implementation-plan.md`](docs/06-implementation-plan.md) for the full 31-phase
@@ -265,7 +272,7 @@ DATABASE_URL=postgresql://kairos:kairos@localhost:5432/kairos_dev python manage.
 python manage.py runserver  # now connects as kairos_app by default
 ```
 
-**Frontend (Phase 23; Calendar & booking flow — Phase 24; Recurring flow — Phase 25; Waitlist & offers — Phase 26):**
+**Frontend (Phase 23; Calendar & booking flow — Phase 24; Recurring flow — Phase 25; Waitlist & offers — Phase 26; Admin & operations — Phase 27):**
 
 ```bash
 cd frontend
@@ -293,7 +300,12 @@ including any DST time adjustment, stated explicitly — checking off every conf
 individually, then confirming; the result page lets you cancel the whole series in one click.
 Click any full/busy slot on the calendar to **join its waitlist** — the eligibility rule is
 right there in the panel — or visit **Waitlist** to see your entries, queue positions, and act
-on any live offer (confirm or decline, with a live countdown).
+on any live offer (confirm or decline, with a live countdown). **Admin** links to resource
+management (create/edit/take offline/admin grants), the correctness-check dashboard, resource
+utilization, and user offboarding — every one of those pages is visible to anyone signed in
+(this backend can't tell the frontend your role in advance), so a permission-denied message
+there is the server's own real answer, not a bug. Any booking's **History** link (on My
+Bookings, or via a lookup box on the Admin page) reconstructs its full lifecycle.
 
 **Try it** — auth is real now (Phase 9): a session token, obtained via an OIDC login, on
 every request. Locally there's no real identity provider to log in against, so
@@ -408,10 +420,12 @@ curl -i -X POST http://127.0.0.1:8000/api/v1/resources/<resource-id-from-above>/
 
 A frontend now exists (Phase 23), the primary booking flow — calendar, booking,
 cancel/edit, My Bookings — is real (Phase 24), so is the two-step recurring flow —
-preview, explicit acknowledgment, confirm, series cancellation (Phase 25) — and so is the
-waitlist/offer flow — join, queue position, live countdown, confirm/decline (Phase 26) — see
-the **Frontend** step above. Resource CRUD and admin screens are still curl-only; see Status
-above and [`CLAUDE.md`](CLAUDE.md).
+preview, explicit acknowledgment, confirm, series cancellation (Phase 25) — so is the
+waitlist/offer flow — join, queue position, live countdown, confirm/decline (Phase 26) — and
+so are the resource-admin/operations surfaces — resource management, booking history,
+correctness checks, utilization, offboarding (Phase 27) — see the **Frontend** step above.
+The curl examples above still work exactly as shown; the frontend just gives them a UI now.
+See Status above and [`CLAUDE.md`](CLAUDE.md).
 
 ## Running the test suite
 
@@ -440,7 +454,7 @@ pytest
 
 `ruff check . && ruff format --check . && mypy kairos` also passes with zero findings.
 
-**Frontend (Phase 23; Calendar & booking flow — Phase 24; Recurring flow — Phase 25; Waitlist & offers — Phase 26):**
+**Frontend (Phase 23; Calendar & booking flow — Phase 24; Recurring flow — Phase 25; Waitlist & offers — Phase 26; Admin & operations — Phase 27):**
 
 ```bash
 cd frontend
@@ -477,6 +491,7 @@ npm run typecheck && npm run lint && npm run format:check && npm run test && npm
 | Calendar & booking flow | **Live** — day/week/month calendar in the viewer's local timezone, optimistic booking creation, specific conflict messaging + nearest-open-slot suggestions, cancel/edit, My Bookings with cursor pagination 🏁 Milestone 4 (Phase 24) |
 | Recurring flow (frontend) | **Live** — series definition, mandatory preview with explicit per-item conflict/DST-adjustment acknowledgment, 207 rendered as success with per-occurrence detail, series cancellation (Phase 25) |
 | Waitlist & offers (frontend) | **Live** — join a full slot with the eligibility rule explained inline, queue position, live-but-advisory offer countdown, confirm/decline, 409 offer_expired handled as an expected outcome (Phase 26) |
+| Admin & operations (frontend) | **Live** — resource management (create/edit/take offline/admin grants), booking history viewer, correctness-check dashboard with the reconciliation alert's meaning shown inline, utilization view, offboarding UI — every page gated by the server's own permission check, since the backend has no role-in-advance signal to build on (Phase 27) |
 | Deployed / live | Not started (Phase 30) |
 
 ## Documentation

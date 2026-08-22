@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
+import { Link } from 'react-router-dom'
 import { cancelBooking, editBooking, listBookings, type ListBookingsParams } from '../api/bookings'
 import { cancelRecurringSeries } from '../api/recurringBookings'
 import { ApiError } from '../api/errors'
@@ -220,6 +221,12 @@ export function MyBookingsPage() {
                       part of a recurring series
                     </span>
                   )}
+                  <Link
+                    to={`/bookings/${booking.id}/history`}
+                    className="mt-1 ml-2 text-xs text-kairos-primary hover:underline"
+                  >
+                    History
+                  </Link>
                 </div>
                 {canManage && !isEditing && (
                   <div className="flex gap-2">
