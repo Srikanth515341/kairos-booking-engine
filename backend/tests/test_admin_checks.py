@@ -111,6 +111,33 @@ def test_response_lists_all_six_checks_in_spec_order(
 
 
 @pytest.mark.django_db
+def test_operations_user_sees_all_six_checks_in_spec_order(
+    client: APIClient, operations_user: AppUser
+) -> None:
+    """§10 row 65 (Implementation Plan Phase 28 audit): the six-check,
+    spec-ordered content assertion above (`test_response_lists_all_six_
+    checks_in_spec_order`) only ever exercised the `system_admin` fixture
+    — no test previously proved an `operations`-role caller sees the same
+    full payload, only that they get a bare 200 (`test_operations_can_
+    read`). Both roles are named together everywhere else this endpoint's
+    permission gate is described (Spec v1.0 §5.15: "operations/
+    system_admin"), so both deserve the identical content proof.
+    """
+    response = client.get(CHECKS_URL, **_headers(operations_user))
+    assert response.status_code == 200
+    body = response.json()
+    names = [c["check_name"] for c in body["checks"]]
+    assert names == [
+        "schema_assertion",
+        "reconciliation",
+        "hold_reaper",
+        "offer_cascade",
+        "series_materialization",
+        "tzdata_rematerialization",
+    ]
+
+
+@pytest.mark.django_db
 def test_a_check_that_has_never_run_reports_null_not_a_fake_pass(
     client: APIClient, system_admin: AppUser
 ) -> None:

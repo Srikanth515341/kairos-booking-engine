@@ -454,6 +454,27 @@ pytest
 
 `ruff check . && ruff format --check . && mypy kairos` also passes with zero findings.
 
+Coverage (Phase 28), the same command CI's `test` job runs:
+
+```bash
+cd backend
+pytest --ignore=tests/concurrency --cov=kairos --cov-report=term-missing --cov-fail-under=90
+```
+
+Staging/pre-release tier — expensive enough that per-commit execution would make CI
+unusable, so these are run manually before a release, not on every PR (Test Plan v1.0
+§13):
+
+```bash
+cd backend
+pytest tests/concurrency/test_conc_01_full_scale.py -v -s   # CONC-01: 100 runs at N=200 + N=500
+pytest tests/concurrency/test_reclaim_04.py -v -s            # RECLAIM-04: 200 writers x 50 runs
+```
+
+See `docs/test-plan-compliance.md` for the full Test Plan v1.0 §14 release checklist —
+every hard blocker mapped to its exact test, including the one open item (RECLAIM-04's
+real, already-recorded deadlock count under the staging-tier run above).
+
 **Frontend (Phase 23; Calendar & booking flow — Phase 24; Recurring flow — Phase 25; Waitlist & offers — Phase 26; Admin & operations — Phase 27):**
 
 ```bash
@@ -492,6 +513,7 @@ npm run typecheck && npm run lint && npm run format:check && npm run test && npm
 | Recurring flow (frontend) | **Live** — series definition, mandatory preview with explicit per-item conflict/DST-adjustment acknowledgment, 207 rendered as success with per-occurrence detail, series cancellation (Phase 25) |
 | Waitlist & offers (frontend) | **Live** — join a full slot with the eligibility rule explained inline, queue position, live-but-advisory offer countdown, confirm/decline, 409 offer_expired handled as an expected outcome (Phase 26) |
 | Admin & operations (frontend) | **Live** — resource management (create/edit/take offline/admin grants), booking history viewer, correctness-check dashboard with the reconciliation alert's meaning shown inline, utilization view, offboarding UI — every page gated by the server's own permission check, since the backend has no role-in-advance signal to build on (Phase 27) |
+| Full test suite completion | **Live** — IDEM-07/08 (fault injection), FAIL-01/02 (real HTTP-level 503 proofs), FAIL-03 (replica-lag degradation logic, real infra deferred to Phase 30), CONC-01 full 100-run+N=500 exercise, §10 matrix closed, coverage gate in CI (90%) — see `docs/test-plan-compliance.md` (Phase 28) |
 | Deployed / live | Not started (Phase 30) |
 
 ## Documentation

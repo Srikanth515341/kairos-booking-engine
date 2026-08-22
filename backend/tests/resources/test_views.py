@@ -265,3 +265,68 @@ def test_availability_query_count_is_bounded(
         )
     assert response.status_code == 200
     assert len(response.json()["busy_blocks"]) == 10
+
+
+# --------------------------------------------------------------------
+# FAIL-03 (Implementation Plan Phase 28; Test Plan v1.0 §12) — simulated
+# replica-lag degradation through the REAL endpoint, not just the unit-
+# level kairos.core.replica proofs in tests/test_replica.py. No real
+# replica exists (Phase 30) — this monkeypatches the one seam Phase 28
+# built (kairos.resources.views.current_replica_lag_seconds) to report an
+# artificial lag, per that phase's own explicit instruction not to stand
+# up real infrastructure just for this test.
+# --------------------------------------------------------------------
+
+
+@pytest.mark.django_db
+def test_fail_03_stale_replica_lag_falls_back_to_primary_over_real_http(
+    client: APIClient,
+    app_user: AppUser,
+    active_resource: Resource,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import kairos.resources.views as resources_views
+
+    monkeypatch.setattr(resources_views, "current_replica_lag_seconds", lambda: 999.0)
+
+    from_dt = timezone.now().replace(microsecond=0) + timedelta(days=1)
+    to_dt = from_dt + timedelta(days=7)
+    response = client.get(
+        _availability_url(active_resource),
+        {"from": _iso(from_dt), "to": _iso(to_dt)},
+        **_headers(app_user),
+    )
+    assert response.status_code == 200
+    # Never silently stale (Spec v1.0 §5.7): a lag this far over threshold
+    # must fall back to "primary", explicitly, not a fabricated "replica".
+    assert response.json()["data_freshness"] == "primary"
+
+
+@pytest.mark.django_db
+def test_fail_03_fresh_simulated_replica_lag_would_be_used(
+    client: APIClient,
+    app_user: AppUser,
+    active_resource: Resource,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Companion to the test above: proves the fallback isn't unconditional
+    — a lag well under threshold routes to "replica", confirming the
+    degradation logic actually branches on the reported lag rather than
+    always returning "primary" regardless of input. No production code
+    path exercises this branch today (current_replica_lag_seconds always
+    returns None until Phase 30) — this monkeypatches the same seam to
+    prove the LOGIC, not the current deployment's behavior.
+    """
+    import kairos.resources.views as resources_views
+
+    monkeypatch.setattr(resources_views, "current_replica_lag_seconds", lambda: 0.5)
+
+    from_dt = timezone.now().replace(microsecond=0) + timedelta(days=1)
+    to_dt = from_dt + timedelta(days=7)
+    response = client.get(
+        _availability_url(active_resource),
+        {"from": _iso(from_dt), "to": _iso(to_dt)},
+        **_headers(app_user),
+    )
+    assert response.status_code == 200
+    assert response.json()["data_freshness"] == "replica"

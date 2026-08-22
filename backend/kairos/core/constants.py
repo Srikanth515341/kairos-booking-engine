@@ -224,3 +224,17 @@ RATE_LIMIT_BOOKING_CREATE_WINDOW_SECONDS = int(
 # own).
 RATE_LIMIT_PER_IP_CAPACITY = int(os.environ.get("RATE_LIMIT_PER_IP_CAPACITY", "60"))
 RATE_LIMIT_PER_IP_WINDOW_SECONDS = int(os.environ.get("RATE_LIMIT_PER_IP_WINDOW_SECONDS", "60"))
+
+# ============================================================
+# Read-replica freshness routing (Implementation Plan Phase 28; Rollout
+# v1.0 §2.2; Test Plan FAIL-03; Spec v1.0 §5.7's `data_freshness` field)
+# ============================================================
+# No replica exists yet — Phase 30 stands one up. This threshold governs
+# kairos.core.replica.select_read_source's degradation logic (lag over
+# this many seconds, or unknown entirely, means "fall back to primary,
+# report it honestly" — never silently serve stale data). Named here, not
+# hardcoded at the one call site, matching every other tunable in this
+# file, so the value Phase 30's real replica is measured against is
+# already a deliberate, documented decision rather than a number invented
+# when the infrastructure finally exists.
+REPLICA_LAG_THRESHOLD_SECONDS = int(os.environ.get("REPLICA_LAG_THRESHOLD_SECONDS", "10"))

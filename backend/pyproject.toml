@@ -31,6 +31,7 @@ dev = [
     "celery-types>=0.26,<1",
     "pytest>=9.1,<10",
     "pytest-django>=4.14,<5",
+    "pytest-cov>=7.0,<8",
 ]
 
 [build-system]
@@ -67,3 +68,27 @@ django_settings_module = "kairos.settings.test"
 DJANGO_SETTINGS_MODULE = "kairos.settings.test"
 python_files = ["test_*.py"]
 testpaths = ["tests"]
+
+# Coverage reporting (Implementation Plan Phase 28 Scope item 8: "wired
+# into CI, with a documented target"). CI's own `test` job (.github/
+# workflows/ci.yml) passes --cov explicitly rather than baking it into
+# addopts here, so ad-hoc local runs of a single test file aren't forced
+# through coverage instrumentation. The documented target itself —
+# --cov-fail-under's actual number — lives in docs/test-plan-compliance.md
+# alongside the measured baseline it was set from, not floated here.
+[tool.coverage.run]
+source = ["kairos"]
+omit = [
+    "*/migrations/*",
+    "kairos/manage.py",
+    "kairos/celery.py",
+    "kairos/wsgi.py",
+    "kairos/settings/*",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+]
