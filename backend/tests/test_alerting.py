@@ -368,6 +368,58 @@ def test_audit_actor_unknown_resolves_once_no_recent_row_remains() -> None:
     ).exists()
 
 
+@pytest.mark.django_db
+def test_gist_write_throughput_alert_fires_sev3_and_reaches_its_target() -> None:
+    """Implementation Plan Phase 29 — Rollout v1.0 §6's "GiST write
+    throughput on booking" row, given a real writer (and a real,
+    CONC-06-derived threshold) for the first time. Reads the SAME live
+    `p95_duration_ms(metric_type=BOOKING_WRITE)` the admin dashboard
+    already computes (Phase 21) — no second aggregation mechanism.
+    """
+    from kairos.core.constants import BOOKING_WRITE_P95_ALERT_THRESHOLD_MS
+    from kairos.core.models import RequestMetric, RequestMetricType
+
+    RequestMetric.objects.create(
+        metric_type=RequestMetricType.BOOKING_WRITE,
+        method="POST",
+        path="/api/v1/bookings",
+        status_code=201,
+        duration_ms=BOOKING_WRITE_P95_ALERT_THRESHOLD_MS + 500,
+    )
+    fired = evaluate_alerts()
+    assert AlertKey.GIST_WRITE_THROUGHPUT in [e.alert_key for e in fired]
+    event = AlertEvent.objects.get(
+        alert_key=AlertKey.GIST_WRITE_THROUGHPUT, resolved_at__isnull=True
+    )
+    assert event.severity == AlertSeverity.SEV_3
+    assert event.context["threshold_ms"] == BOOKING_WRITE_P95_ALERT_THRESHOLD_MS
+    assert any("gist_write_throughput" in m.subject for m in mail.outbox)
+
+
+@pytest.mark.django_db
+def test_gist_write_throughput_does_not_false_alarm_under_the_threshold() -> None:
+    """A booking-write P95 comfortably under threshold — PERF-01's own
+    steady-load target, in spirit — must never fire this alert. Proven
+    directly, the same "prove the negative, not just the positive"
+    discipline `test_offer_cascade_does_not_false_alarm_during_an_
+    ordinary_quiet_period` already established for this module.
+    """
+    from kairos.core.constants import BOOKING_WRITE_P95_ALERT_THRESHOLD_MS
+    from kairos.core.models import RequestMetric, RequestMetricType
+
+    RequestMetric.objects.create(
+        metric_type=RequestMetricType.BOOKING_WRITE,
+        method="POST",
+        path="/api/v1/bookings",
+        status_code=201,
+        duration_ms=BOOKING_WRITE_P95_ALERT_THRESHOLD_MS - 500,
+    )
+    evaluate_alerts()
+    assert not AlertEvent.objects.filter(
+        alert_key=AlertKey.GIST_WRITE_THROUGHPUT, resolved_at__isnull=True
+    ).exists()
+
+
 @pytest.mark.django_db(transaction=True)
 def test_recon05_narrowed_predicate_also_fires_schema_assertion_sev1() -> None:
     """RECON-05's second case (RUNBOOK-01 cause #1: the constraint still

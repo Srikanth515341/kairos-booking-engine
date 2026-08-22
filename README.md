@@ -472,8 +472,34 @@ pytest tests/concurrency/test_reclaim_04.py -v -s            # RECLAIM-04: 200 w
 ```
 
 See `docs/test-plan-compliance.md` for the full Test Plan v1.0 §14 release checklist —
-every hard blocker mapped to its exact test, including the one open item (RECLAIM-04's
-real, already-recorded deadlock count under the staging-tier run above).
+every hard blocker mapped to its exact test, including RECLAIM-04, re-run at full
+scale and given an explicit accept/reject decision by Phase 29 (`docs/performance-
+baseline.md`) rather than deferred again.
+
+**Performance & load testing (Phase 29)** — `docs/performance-baseline.md` has the full
+methodology and real numbers (PERF-01/02/03, CONC-06, RECLAIM-04's re-run and its
+explicit resolution). To reproduce: seed a PRD A1-scale dataset into `kairos_dev`, start
+a real server under `kairos.settings.perf`, then run the scripts under `scripts/perf/`
+(throwaway, like `scripts/spike/` — never becomes application code):
+
+```bash
+cd backend
+DATABASE_URL=postgresql://kairos:kairos@localhost:5432/kairos_dev \
+  python manage.py seed_perf_data --reset
+DJANGO_SETTINGS_MODULE=kairos.settings.perf python manage.py runserver 8000
+# in another shell:
+cd scripts/perf
+python perf_01_booking_write.py
+python perf_02_availability_read.py
+python perf_03_waitlist_dispatch.py
+python conc_06_escalation.py
+```
+
+See `docs/performance-baseline.md`'s own "Environment and methodology" section for why
+the real numbers in that document were captured against a throwaway Linux/`gunicorn`
+container rather than the command above's `manage.py runserver` directly — a genuine,
+diagnosed finding about this codebase's request-handling under concurrency, not a
+detail to skip past.
 
 **Frontend (Phase 23; Calendar & booking flow — Phase 24; Recurring flow — Phase 25; Waitlist & offers — Phase 26; Admin & operations — Phase 27):**
 
