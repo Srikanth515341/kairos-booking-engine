@@ -494,6 +494,39 @@ def test_recurring_series_cancel_only_cancels_future_confirmed_occurrences(
 
 
 @pytest.mark.django_db
+def test_recurring_series_cancel_with_no_future_occurrences_returns_200_and_empty_array(
+    client: APIClient, app_user: AppUser, active_resource: Resource
+) -> None:
+    """§10 row 48 (Implementation Plan Phase 28 audit): a series entirely
+    in the past — every occurrence already `starts_at < now()` — must
+    still be a real 200, with `cancelled_booking_ids == []` (nothing left
+    to cancel, not an error) and `occurrences_already_past` covering every
+    occurrence in the series. Every other series-cancel test has at least
+    one future/uncancelled occurrence; this is the zero-future case none
+    of them exercise.
+    """
+    start_date = (timezone.now() - timedelta(days=30)).date()
+    preview = client.post(
+        PREVIEW_URL,
+        _preview_body(active_resource, series_start_date=start_date, occurrence_count=3),
+        format="json",
+        **_headers(app_user),
+    ).json()
+    confirm = _confirm(client, app_user, preview["preview_token"]).json()
+    assert len(confirm["created"]) == 3
+    series_id = confirm["series_id"]
+
+    response = client.post(_cancel_url(series_id), {}, format="json", **_confirm_headers(app_user))
+    assert response.status_code == 200
+    body = response.json()
+    assert body["cancelled_booking_ids"] == []
+    assert body["occurrences_already_past"] == 3
+
+    # Ground truth: nothing changed status.
+    assert Booking.objects.filter(series_id=series_id, status="confirmed").count() == 3
+
+
+@pytest.mark.django_db
 def test_recurring_series_cancel_admin_override_without_reason_returns_400(
     client: APIClient, app_user: AppUser, active_resource: Resource
 ) -> None:

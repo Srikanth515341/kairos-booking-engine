@@ -299,6 +299,40 @@ class TestPolicyValidation:
         assert response.status_code == 201
 
     @pytest.mark.django_db
+    def test_exactly_at_the_365_day_horizon_boundary_succeeds(
+        self,
+        client: APIClient,
+        app_user: AppUser,
+        active_resource: Resource,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """§10 row 8 (Implementation Plan Phase 28 audit): the test above
+        stays 5 minutes inside the true edge, which never actually
+        exercises the validator's own boundary (`start > now + 365 days`
+        — kairos/bookings/serializers.py `_validate_range_policy`).
+        Freezing `timezone.now()` to a fixed value makes `start == now +
+        365 days` a byte-identical, deterministic equality — the real
+        edge, not a 5-minute-inside proxy for it.
+        """
+        import kairos.bookings.serializers as bookings_serializers
+
+        fixed_now = timezone.now().replace(microsecond=0)
+        monkeypatch.setattr(bookings_serializers.django_timezone, "now", lambda: fixed_now)
+
+        start = fixed_now + timedelta(days=365)
+        response = client.post(
+            BOOKINGS_URL,
+            data={
+                "resource_id": str(active_resource.id),
+                "start": _iso(start),
+                "end": _iso(start + timedelta(hours=1)),
+            },
+            format="json",
+            **_headers(app_user),
+        )
+        assert response.status_code == 201
+
+    @pytest.mark.django_db
     def test_outside_bookable_hours(self, client: APIClient, app_user: AppUser) -> None:
         resource = Resource.objects.create(
             name="9-to-5 Room",

@@ -1,8 +1,9 @@
 """Idempotency Test Suite (Test Plan v1.0 §7): IDEM-01 through IDEM-04,
 IDEM-06, IDEM-09, IDEM-10, IDEM-11 — the set Implementation Plan Phase 5
-scopes in. IDEM-05 (recurring replay) needs Phase 12's endpoint; IDEM-07
-(process-kill fault injection) and IDEM-08 (proxy-level response drop) need
-fault-injection tooling that arrives in Phase 28.
+scopes in. IDEM-05 (recurring replay) is tests/bookings/test_recurring_
+series.py (Phase 12). IDEM-07 (process-kill fault injection) and IDEM-08
+(proxy-level response drop) are the last two rows in this file
+(Implementation Plan Phase 28).
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ from datetime import datetime, time, timedelta
 import pytest
 from django.core.management import call_command
 from django.db import connection
+from django.db.models import QuerySet
 from django.utils import timezone
 from rest_framework.test import APIClient
 
@@ -550,6 +552,115 @@ def test_idem_11_missing_idempotency_key_returns_400(
     body = response.json()
     assert body["error"]["code"] == "validation_error"
     assert body["error"]["details"]["field"] == "Idempotency-Key"
+
+
+# --------------------------------------------------------------------
+# IDEM-07 — process kill mid-transaction (Implementation Plan Phase 28)
+# --------------------------------------------------------------------
+
+
+@pytest.mark.django_db
+def test_idem_07_process_kill_mid_transaction_never_leaves_a_booking_without_a_key(
+    client: APIClient,
+    app_user: AppUser,
+    active_resource: Resource,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """IDEM-07 (Test Plan v1.0 §7/§13; Implementation Plan Phase 28): "the
+    two writes are in separate transactions" would be a real bug, not a
+    test problem — `run_idempotent_write`'s own docstring (kairos/core/
+    idempotency.py) states the key claim, the write, and the outcome
+    record all share ONE outer `transaction.atomic()` for exactly this
+    reason. Postgres cannot distinguish a killed process from an
+    exception raised inside an open transaction — both trigger the
+    identical ROLLBACK of everything the transaction did, including
+    statements that already executed successfully. This forces a genuine
+    exception at the exact point a process kill mid-write would land:
+    after `perform_write()` has already run `Booking.objects.create(...)`
+    inside the still-open transaction, but before the outcome-record
+    UPDATE on `idempotency_key` completes. If the two writes were ever
+    accidentally split into separate transactions, this test would catch
+    it directly: the booking would survive the crash while the key
+    vanished, producing exactly the "booking with no key record" case
+    IDEM-07 exists to rule out.
+    """
+    original_update = QuerySet.update
+
+    def _crash_immediately_before_the_outcome_record_commits(
+        self: QuerySet[IdempotencyKey], *args: object, **kwargs: object
+    ) -> int:
+        if self.model is IdempotencyKey and kwargs.get("status") == IdempotencyKeyStatus.COMPLETED:
+            raise ConnectionError("simulated process kill mid-transaction")
+        return original_update(self, *args, **kwargs)  # type: ignore[no-any-return]
+
+    monkeypatch.setattr(QuerySet, "update", _crash_immediately_before_the_outcome_record_commits)
+
+    start = timezone.now() + timedelta(hours=1)
+    key = uuid.uuid4()
+
+    with pytest.raises(ConnectionError):
+        client.post(
+            BOOKINGS_URL,
+            data={
+                "resource_id": str(active_resource.id),
+                "start": _iso(start),
+                "end": _iso(start + timedelta(hours=1)),
+            },
+            format="json",
+            **_headers(app_user, key),
+        )
+
+    # Ground truth, checked with the real (unpatched) database state:
+    # EITHER both exist, or NEITHER does — never a booking with no key
+    # record. The booking's own INSERT already executed inside the same
+    # still-open transaction as the outcome UPDATE that then failed, so
+    # Postgres rolled the whole thing back together.
+    assert Booking.objects.filter(resource=active_resource).count() == 0
+    assert not IdempotencyKey.objects.filter(user=app_user, key=key).exists()
+
+
+# --------------------------------------------------------------------
+# IDEM-08 — lost-response simulation (Implementation Plan Phase 28)
+# --------------------------------------------------------------------
+
+
+@pytest.mark.django_db
+def test_idem_08_lost_response_retry_shows_the_users_own_existing_booking(
+    client: APIClient, app_user: AppUser, active_resource: Resource
+) -> None:
+    """IDEM-08 (Test Plan v1.0 §7/§13) — "the actual product requirement;
+    everything else in the idempotency suite is machinery." Simulates a
+    response dropped at the proxy level: the first request's response is
+    deliberately never inspected at all (as if a reverse proxy or a flaky
+    connection ate it before the client ever saw it) — only its SIDE
+    EFFECT, a committed booking read back through a completely independent
+    query, is used as ground truth. The retry, presented with the
+    identical Idempotency-Key and body, must show the user their OWN
+    existing confirmed booking — never a fresh 409 `slot_unavailable`,
+    which would incorrectly tell the user someone else took the exact
+    slot their own first (successful, merely unseen) request already
+    claimed.
+    """
+    start = timezone.now() + timedelta(hours=1)
+    key = uuid.uuid4()
+    payload = {
+        "resource_id": str(active_resource.id),
+        "start": _iso(start),
+        "end": _iso(start + timedelta(hours=1)),
+    }
+
+    client.post(BOOKINGS_URL, data=payload, format="json", **_headers(app_user, key))
+    # The response above is intentionally never inspected — this is the
+    # "lost at the proxy" simulation. Ground truth comes only from here:
+    committed = Booking.objects.get(resource=active_resource)
+
+    retry = client.post(BOOKINGS_URL, data=payload, format="json", **_headers(app_user, key))
+
+    assert retry.status_code == 201
+    assert retry.status_code != 409, "must never be told the slot is unavailable"
+    assert retry.headers["Idempotent-Replay"] == "true"
+    assert retry.json()["id"] == str(committed.id)
+    assert Booking.objects.filter(resource=active_resource).count() == 1
 
 
 # --------------------------------------------------------------------

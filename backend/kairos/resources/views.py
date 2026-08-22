@@ -16,6 +16,7 @@ from kairos.bookings.models import Booking, BookingStatus
 from kairos.core.constants import MAX_AVAILABILITY_QUERY_DAYS
 from kairos.core.exceptions import NotFoundError, PolicyValidationError
 from kairos.core.pagination import decode_cursor, encode_cursor, parse_limit
+from kairos.core.replica import current_replica_lag_seconds, select_read_source
 from kairos.core.views import KairosAPIView
 from kairos.core.views import request_id as _request_id
 from kairos.identity.authorization import AuthorizationService
@@ -269,8 +270,15 @@ class ResourceAvailabilityView(KairosAPIView):
                 "timezone": resource.timezone,
                 "range": {"from": _iso(from_dt), "to": _iso(to_dt)},
                 "as_of": _iso(django_timezone.now()),
-                # No replica exists yet (Phase 30) — always "primary".
-                "data_freshness": "primary",
+                # kairos.core.replica.select_read_source (Phase 28; Test
+                # Plan FAIL-03): no replica exists yet, so
+                # current_replica_lag_seconds() always returns None and
+                # this always evaluates to "primary" today — but the
+                # DEGRADATION LOGIC (unknown/over-threshold lag -> primary,
+                # never silently stale) is real and proven now, not
+                # invented under Phase 30's own time pressure once a real
+                # replica exists to route to.
+                "data_freshness": select_read_source(current_replica_lag_seconds()),
                 "busy_blocks": busy_blocks,
             }
         )

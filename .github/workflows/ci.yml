@@ -60,8 +60,20 @@ jobs:
           python-version: "3.12"
       - name: Install dependencies
         run: pip install -e ".[dev]"
-      - name: Run unit + integration tests
-        run: pytest --ignore=tests/concurrency -v
+      - name: Run unit + integration tests (with coverage)
+        # Coverage target (Implementation Plan Phase 28 Scope item 8): 90%,
+        # a few points below the 93% baseline measured when this was wired
+        # up — see docs/test-plan-compliance.md for why 90 (not 93, not
+        # 100) and why this job's own --ignore=tests/concurrency (already
+        # in place since Phase 3) is what's actually measured, not a gap
+        # introduced by adding coverage.
+        run: pytest --ignore=tests/concurrency --cov=kairos --cov-report=term-missing --cov-report=xml --cov-fail-under=90 -v
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-xml
+          path: backend/coverage.xml
 
   concurrency:
     name: concurrency
@@ -92,15 +104,17 @@ jobs:
       - name: Install dependencies
         run: pip install -e ".[dev]"
       - name: Run the concurrency proof suite (CI tier)
-        # RECLAIM-04 (Phase 17) is excluded deliberately, not forgotten:
-        # Test Plan v1.0 §13 places it in the STAGING/pre-release tier,
-        # not CI tier (RECLAIM-01-03 ARE CI tier and run here normally) —
-        # 200 writers x 50 runs is expensive enough that per-commit
-        # execution would make CI unusable, the identical reasoning behind
-        # CONC-01's own full 100-run+N=500 escalation living outside this
-        # job (deferred to Phase 28). Run it manually before a release:
+        # RECLAIM-04 (Phase 17) and CONC-01's own full-scale form (Phase
+        # 28, tests/concurrency/test_conc_01_full_scale.py — 100 runs at
+        # N=200 plus the N=500 escalation) are both excluded deliberately,
+        # not forgotten: Test Plan v1.0 §13 places both in the STAGING/
+        # pre-release tier, not CI tier (this job's own CONC-01 at N=200 x
+        # 10 runs, CONC-02-05, HOLD-01-03, WL-01-04, RECLAIM-01-03 ARE CI
+        # tier and run here normally) — expensive enough that per-commit
+        # execution would make CI unusable. Run manually before a release:
         # pytest tests/concurrency/test_reclaim_04.py -v -s
-        run: pytest tests/concurrency --ignore=tests/concurrency/test_reclaim_04.py -v
+        # pytest tests/concurrency/test_conc_01_full_scale.py -v -s
+        run: pytest tests/concurrency --ignore=tests/concurrency/test_reclaim_04.py --ignore=tests/concurrency/test_conc_01_full_scale.py -v
 
   frontend:
     name: frontend
