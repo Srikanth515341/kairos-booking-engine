@@ -24,6 +24,9 @@ export function NavBar() {
             <NavLink to="/bookings" className={linkClasses}>
               My Bookings
             </NavLink>
+            <NavLink to="/recurring" className={linkClasses}>
+              Recurring
+            </NavLink>
           </nav>
         </div>
         <div className="flex items-center gap-3 text-sm text-gray-600">

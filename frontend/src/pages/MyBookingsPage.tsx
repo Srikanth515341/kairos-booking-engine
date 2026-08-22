@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import { cancelBooking, editBooking, listBookings, type ListBookingsParams } from '../api/bookings'
+import { cancelRecurringSeries } from '../api/recurringBookings'
 import { ApiError } from '../api/errors'
 import type { Booking } from '../api/types'
 import { fromDatetimeLocalValue, toDatetimeLocalValue } from '../booking/dateGrid'
@@ -80,6 +81,27 @@ export function MyBookingsPage() {
       setRowError((current) => ({
         ...current,
         [bookingId]: caught instanceof ApiError ? caught.message : 'Could not cancel this booking.',
+      }))
+    } finally {
+      setRowBusy(null)
+    }
+  }
+
+  async function handleCancelSeries(booking: Booking) {
+    if (!booking.series_id) return
+    setRowBusy(booking.id)
+    setRowError((current) => ({ ...current, [booking.id]: '' }))
+    try {
+      // Cancels every still-CONFIRMED FUTURE occurrence under this
+      // series_id — past occurrences remain as historical records (Spec
+      // v1.0 §5.10, PRD FR15). Never touches the single-booking cancel
+      // endpoint for this.
+      await cancelRecurringSeries(booking.series_id)
+      loadPage()
+    } catch (caught) {
+      setRowError((current) => ({
+        ...current,
+        [booking.id]: caught instanceof ApiError ? caught.message : 'Could not cancel this series.',
       }))
     } finally {
       setRowBusy(null)
@@ -193,6 +215,11 @@ export function MyBookingsPage() {
                   >
                     {booking.status}
                   </span>
+                  {booking.series_id && (
+                    <span className="mt-1 ml-1 inline-block rounded-full bg-blue-100 px-2 py-0.5 text-xs text-blue-700">
+                      part of a recurring series
+                    </span>
+                  )}
                 </div>
                 {canManage && !isEditing && (
                   <div className="flex gap-2">
@@ -217,6 +244,19 @@ export function MyBookingsPage() {
                     >
                       Cancel
                     </button>
+                    {booking.series_id && (
+                      <button
+                        type="button"
+                        disabled={rowBusy === booking.id}
+                        onClick={() => {
+                          void handleCancelSeries(booking)
+                        }}
+                        className="rounded-md border border-kairos-danger px-3 py-1.5 text-sm
+                          text-kairos-danger hover:bg-red-50 disabled:opacity-50"
+                      >
+                        Cancel series
+                      </button>
+                    )}
                   </div>
                 )}
               </div>
