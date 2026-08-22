@@ -1,0 +1,13 @@
+@import 'tailwindcss';
+
+@theme {
+  --color-kairos-primary: #2563eb;
+  --color-kairos-primary-dark: #1d4ed8;
+  --color-kairos-danger: #dc2626;
+  --color-kairos-surface: #ffffff;
+  --color-kairos-muted: #6b7280;
+}
+
+body {
+  @apply bg-gray-50 text-gray-900;
+}

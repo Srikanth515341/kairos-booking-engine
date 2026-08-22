@@ -156,7 +156,24 @@ unrelated migration is caught before anyone is ever double-booked; a second, ind
 looks for the double-booking directly and is structurally incapable of finding one as long as
 the constraint holds. Both are readable through one endpoint, and neither check invented its own
 notion of "overlap" — the reconciliation query reuses the exact range operator the constraint
-itself is built on.
+itself is built on. Every one of those checks now actually pages someone, too (Phase 21): a
+failing or stale check fires a real alert email, once per incident rather than once per poll,
+and a live operations dashboard — one JSON endpoint plus one self-contained HTML page, no
+Grafana required — shows all six checks, every open alert, and request-level metrics (P95
+latency, 503s split by cause, auth failures by shape) computed live from real traffic. And the
+one endpoint most exposed to abuse is rate-limited now (Phase 22): a Redis-backed token bucket
+per authenticated user, deliberately a fairness policy and not a correctness guarantee — it
+fails open if Redis is unavailable, because an infrastructure hiccup in a rate limiter must
+never block a real booking. Injection resistance is proven, not assumed: a static scan confirms
+every raw SQL statement in the codebase is parameterized, and security headers plus an explicit,
+no-wildcard-ever CORS allowlist are real response headers, verified as such, not just settings
+that look right. And there's finally something to point a browser at (Phase 23): a React +
+TypeScript SPA with real login (against the same dev-mock-login → token-exchange flow the curl
+walkthrough below uses by hand), protected routes, and an API client that gets the two subtle
+contracts right on purpose — one idempotency key per user action, reused across every automatic
+retry, and a `503` treated as "retry, don't fail" rather than shown to the user as an error.
+Booking/resource/calendar screens are still ahead; this phase is the shell everything else
+plugs into.
 See
 [`CLAUDE.md`](CLAUDE.md) for exactly what is and isn't built, and
 [`docs/06-implementation-plan.md`](docs/06-implementation-plan.md) for the full 31-phase
@@ -229,6 +246,24 @@ DATABASE_URL=postgresql://kairos:kairos@localhost:5432/kairos_dev python manage.
 
 python manage.py runserver  # now connects as kairos_app by default
 ```
+
+**Frontend (Phase 23):**
+
+```bash
+cd frontend
+npm install
+cp .env.example .env       # defaults already point at http://127.0.0.1:8000/api/v1
+npm run dev                # http://localhost:5173
+```
+
+The backend must allow the frontend's origin explicitly (`kairos.core.middleware.
+CorsMiddleware` — Phase 22, no wildcard, ever): run the backend with
+`CORS_ALLOWED_ORIGINS=http://localhost:5173` set (add it to `backend/.env`, or export it
+before `manage.py runserver`). Sign in at `http://localhost:5173/login` using the "dev
+sign-in" form (any email — this calls the same `POST /auth/dev-mock-login` →
+`POST /auth/token` round trip the curl walkthrough below does by hand). "Sign in with SSO"
+is present but structurally untested against a live IdP — see `frontend/src/auth/oidc.ts`'s
+own docstring and CLAUDE.md's Open Questions.
 
 **Try it** — auth is real now (Phase 9): a session token, obtained via an OIDC login, on
 every request. Locally there's no real identity provider to log in against, so
@@ -341,7 +376,8 @@ curl -i -X POST http://127.0.0.1:8000/api/v1/resources/<resource-id-from-above>/
   -d '{"user_id": "<some-user-id>"}'
 ```
 
-No frontend yet — see Status above and [`CLAUDE.md`](CLAUDE.md).
+A frontend now exists (Phase 23) — see the **Frontend** step above; booking/resource/
+calendar screens are a later phase, see Status above and [`CLAUDE.md`](CLAUDE.md).
 
 ## Running the test suite
 
@@ -370,6 +406,13 @@ pytest
 
 `ruff check . && ruff format --check . && mypy kairos` also passes with zero findings.
 
+**Frontend (Phase 23):**
+
+```bash
+cd frontend
+npm run typecheck && npm run lint && npm run format:check && npm run test && npm run build
+```
+
 ## Feature status
 
 | Feature | Status |
@@ -394,8 +437,9 @@ pytest
 | Notifications | **Live** — offer/admin-cancellation/re-materialization dispatch, async-only, retried with backoff and recorded (PRD FR52–55) (Phase 18) |
 | Resource admin & offboarding | **Live** — resource CRUD, admin-scope grants, utilization, per-resource-policy user deactivation (OFF-01/02) (Phase 19) |
 | Reconciliation & schema assertion | **Live** — both checks scheduled + on-deploy, `GET /admin/checks/latest`, RECON-01–08 (Phase 20) |
-| Alert routing (paging) | Not started (Phase 21) |
-| Frontend | Not started (Phase 23–27) |
+| Alert routing, metrics dashboard | **Live** — `evaluate_alerts` fires/resolves real email alerts, `GET /admin/dashboard` + HTML page, RECON-07 (Phase 21) |
+| Security hardening | **Live** — Redis token-bucket rate limiting, injection-resistance evidence (SEC-04), security headers, explicit CORS (SEC-01–07) (Phase 22) |
+| Frontend foundation | **Live** — React + TS SPA, OIDC/dev-mock login, protected routes, API client with idempotency-key retry semantics (Phase 23); booking/resource/calendar screens are Phase 24+ |
 | Deployed / live | Not started (Phase 30) |
 
 ## Documentation
